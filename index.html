@@ -1677,7 +1677,7 @@ let uploadLog=[];
 
 /* ── 수요 입력(S&OP형) ── */
 // 배포 후 이 값을 채워두면 다른 팀원은 URL 설정 없이 바로 입력 가능
-const DEFAULT_DEMAND_API_URL="https://script.google.com/macros/s/AKfycbzI7UX3TO1HhnaG6s03Xtw5GVql2qHZH-e_ol8JX9K_R-4UosqReiHhehXLrrAaPbldXQ/exec";   // [S&OP 로그용] — 수요입력 + 관리자 인증 통합본
+const DEFAULT_DEMAND_API_URL="https://script.google.com/macros/s/AKfycbz7lROf-Q-d_FSQRhWsM5icIhAGnADdMaTnM_MfUWpcDNlkbuwwJuRlFoVAeAmpLemKIQ/exec";   // [S&OP 로그용] 로지킴 계정 사본 — 수요입력 + 관리자 인증 통합본
 /* 배포를 다시 만들면 …/exec 의 AKfycb… 부분이 통째로 바뀌고, 옛 주소는 죽는다.
    그런데 demandApiUrl 은 localStorage 에 저장돼 있어서, 한 번이라도 설정칸에 값을
    넣었던 브라우저는 죽은 주소를 계속 붙들고 있게 된다(아래 fallback 은 "비어 있을 때"만
@@ -1687,6 +1687,7 @@ const DEFAULT_DEMAND_API_URL="https://script.google.com/macros/s/AKfycbzI7UX3TO1
 const DEAD_DEMAND_API_URLS=[
   "https://script.google.com/macros/s/AKfycbzmCKAy-ap9tjCjoTFsFN-hoP5GoGCdWTQvnboG8PnSmV5Y8LxURLrAk7XYHGrmA4yBoQ/exec",   // 옛 [SCM 수요입력 백엔드] — 배포 삭제됨
   "https://script.google.com/macros/s/AKfycbwqqjEZWCc-1Ejn8TfrNAYjM-TaO-v6ZsESyP0zsW3cK1UPV2qjcn2QWwihDFFn7vVwqA/exec",   // [SCM 수요입력 백엔드] 재배포본 — 2026-08-28 [S&OP 로그용]로 통합, 폐기 예정
+  "https://script.google.com/macros/s/AKfycbzI7UX3TO1HhnaG6s03Xtw5GVql2qHZH-e_ol8JX9K_R-4UosqReiHhehXLrrAaPbldXQ/exec",   // [S&OP 로그용] 개인 계정 원본 — 2026-09-28 로지킴 계정으로 이전
 ];
 let demandApiUrl="", demandSubmitter="";
 let demandEntries=[];      // 캐시: [{submitter,channel,sku,name,month,qty,ts}]
@@ -1705,7 +1706,11 @@ let _demandLoaded=false;
    ※ 이 파일은 공개 정적 페이지라 여기 적은 키는 비밀이 아니다 — 페이지 소스를 보면
      누구나 읽을 수 있다. 특정 인원만 접근시켜야 한다면 여기를 비워두고 각자
      관리자 화면에서 개인 키를 입력하게 하면 된다(SCM접근허용 탭에서 개인별 발급). */
-const DEFAULT_LEDGER_API_URL="https://script.google.com/macros/s/AKfycbwTZKx6ZZ0ZWqIX8aOnjeLNwDATgxjSMNvX_Ay_SUir6bv1y_TV-f-a7xb_PA0j5BVrTA/exec";
+const DEFAULT_LEDGER_API_URL="https://script.google.com/macros/s/AKfycbxCnrbrA0bND8zLkSL7GEI0zmdmwf9X6MSoFAHFgZOMFPzItWnmK8GctZ_Q4rNrC8OTDg/exec";   // [재고수불부_저장소] 로지킴 계정 사본
+// 위 DEAD_DEMAND_API_URLS 와 같은 이유 — 저장된 값이 옛 주소면 기본값으로 갈아끼운다.
+const DEAD_LEDGER_API_URLS=[
+  "https://script.google.com/macros/s/AKfycbwTZKx6ZZ0ZWqIX8aOnjeLNwDATgxjSMNvX_Ay_SUir6bv1y_TV-f-a7xb_PA0j5BVrTA/exec",   // 개인 계정 원본 — 2026-09-28 로지킴 계정으로 이전
+];
 /* ★ 비워둡니다 (2026-08 보안 변경).
    예전에는 여기에 접근 키가 박혀 있었는데, 이 파일은 공개 정적 페이지라 소스 보기 한 번에
    누구나 읽을 수 있었습니다. 게다가 서버(WebApp.gs doGet)가 그 키를 검사하지도 않아서
@@ -1726,7 +1731,10 @@ var lgTransitRows = [];  // 재고수불부에서 가져온 창고이동 거래
 var lgTransitBySku = {}; // {sku: 이동중수량} — 재발주 계산에서 입고예정으로 쓴다
 
 /* ── 발주 진행(발주내역 시트 연동) ── */
-const DEFAULT_ORDER_API_URL="https://script.google.com/macros/s/AKfycbw-6fA3ILIMNibECDBeOelvVc9Ax9jIhDOQet4FskBNfDtSlWLsbGhQZYwF2D0ahC9w/exec";
+const DEFAULT_ORDER_API_URL="https://script.google.com/macros/s/AKfycbwF8tEAe_akSyJlhd4x1qoDb5BtEeYeot04RE3upH5AVey1qEgPZF6J7wMZzb-7Vzw_dQ/exec";   // [00. 발주내역_관리시트] 로지킴 계정 사본
+const DEAD_ORDER_API_URLS=[
+  "https://script.google.com/macros/s/AKfycbw-6fA3ILIMNibECDBeOelvVc9Ax9jIhDOQet4FskBNfDtSlWLsbGhQZYwF2D0ahC9w/exec",   // 개인 계정 원본 — 2026-09-28 로지킴 계정으로 이전
+];
 let orderApiUrl="", orderSubmitter="";
 let orderVendorsCache=[]; // 발주내역 시트에서 가져온 거래처명 목록
 let orderItemsCache={};   // { 품목코드(sku): 품목명 } — 발주내역에 이미 등록된 정확한 품목명 캐시
@@ -1850,6 +1858,8 @@ function load(){
   if(demandApiUrl && DEAD_DEMAND_API_URLS.indexOf(demandApiUrl)>=0){
     demandApiUrl="";   // 죽은 주소를 물고 있으면 버리고 아래 기본값으로 되돌린다
   }
+  if(orderApiUrl && DEAD_ORDER_API_URLS.indexOf(orderApiUrl)>=0) orderApiUrl="";
+  if(ledgerApiUrl && DEAD_LEDGER_API_URLS.indexOf(ledgerApiUrl)>=0) ledgerApiUrl="";
   if(!demandApiUrl && DEFAULT_DEMAND_API_URL) demandApiUrl=DEFAULT_DEMAND_API_URL;
   if(!orderApiUrl && DEFAULT_ORDER_API_URL) orderApiUrl=DEFAULT_ORDER_API_URL;
   if(!ledgerApiUrl && DEFAULT_LEDGER_API_URL) ledgerApiUrl=DEFAULT_LEDGER_API_URL;
