@@ -701,8 +701,27 @@ function senderAllowed_(from) {
   return CONFIG.SENDER_FILTER.some(function (s) { return f.indexOf(s.toLowerCase()) >= 0; });
 }
 
-/** 엑셀 첨부 → PO 탭(없으면 첫 탭)의 2차원 배열. 임시 구글 시트로 변환해 수식 값까지 읽은 뒤 삭제. */
+/**
+ * 엑셀 첨부 → PO 탭(없으면 첫 탭)의 2차원 배열.
+ * xlsx 는 압축을 풀어 직접 읽는다 (Drive API 권한 불필요, 수식은 엑셀에 저장된 계산값 사용).
+ * 직접 읽기에 실패한 경우(.xls 등)에만 임시 구글 시트로 변환해 읽는다.
+ */
 function attachmentToGrid_(att) {
+  var grids = null;
+  try {
+    var blob = att.copyBlob().setContentType('application/zip');
+    var parts = {};
+    Utilities.unzip(blob).forEach(function (f) {
+      if (/\.(xml|rels)$/.test(f.getName())) parts[f.getName().replace(/^\//, '')] = f.getDataAsString('UTF-8');
+    });
+    grids = xlsxGrids(parts);
+  } catch (e) {
+    grids = null;
+  }
+  if (grids && grids.length) {
+    for (var g = 0; g < grids.length; g++) if (parsePurchaseOrder(grids[g])) return grids[g];
+    return grids[0];
+  }
   var fileId = convertToSheet_(att);
   try {
     var tmp = SpreadsheetApp.openById(fileId);
@@ -715,6 +734,76 @@ function attachmentToGrid_(att) {
   } finally {
     DriveApp.getFileById(fileId).setTrashed(true);
   }
+}
+
+/**
+ * xlsx 내부 XML({경로: 내용}) → 시트 순서대로 2차원 배열 목록 (순수 함수).
+ * 문자열(공유/인라인), 숫자, 불리언, 수식 계산값을 읽는다. 날짜는 엑셀 시리얼 숫자로 남는다(toDate_ 가 처리).
+ */
+function xlsxGrids(parts) {
+  var decode = function (t) {
+    return t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+      .replace(/&#(\d+);/g, function (_, n) { return String.fromCharCode(+n); }).replace(/&amp;/g, '&');
+  };
+  var texts = function (xml) {
+    var out = '', m, re = /<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/g;
+    xml = xml.replace(/<rPh[\s\S]*?<\/rPh>/g, '');
+    while ((m = re.exec(xml))) out += m[1];
+    return decode(out);
+  };
+  var shared = [];
+  var sst = parts['xl/sharedStrings.xml'] || '';
+  var sm, sre = /<si>([\s\S]*?)<\/si>/g;
+  while ((sm = sre.exec(sst))) shared.push(texts(sm[1]));
+
+  var rels = {}, rm, rre = /<Relationship\s[^>]*?Id="([^"]+)"[^>]*?Target="([^"]+)"/g;
+  var relXml = parts['xl/_rels/workbook.xml.rels'] || '';
+  while ((rm = rre.exec(relXml))) rels[rm[1]] = rm[2];
+  // Id/Target 순서가 반대인 경우도 처리
+  rre = /<Relationship\s[^>]*?Target="([^"]+)"[^>]*?Id="([^"]+)"/g;
+  while ((rm = rre.exec(relXml))) if (!rels[rm[2]]) rels[rm[2]] = rm[1];
+
+  var sheetPaths = [], wm, wre = /<sheet\s[^>]*?r:id="([^"]+)"/g;
+  var wb = parts['xl/workbook.xml'] || '';
+  while ((wm = wre.exec(wb))) {
+    var t = rels[wm[1]];
+    if (t) sheetPaths.push(t.charAt(0) === '/' ? t.slice(1) : 'xl/' + t);
+  }
+  if (!sheetPaths.length) throw new Error('xlsx 구조를 읽지 못함');
+
+  var colIdx = function (ref) {
+    var letters = ref.replace(/[0-9]/g, ''), n = 0;
+    for (var i = 0; i < letters.length; i++) n = n * 26 + (letters.charCodeAt(i) - 64);
+    return n - 1;
+  };
+  return sheetPaths.map(function (path) {
+    var xml = parts[path] || '';
+    var grid = [];
+    var cm, cre = /<c\s([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
+    while ((cm = cre.exec(xml))) {
+      var attrs = cm[1], body = cm[2] || '';
+      var ref = (attrs.match(/\br="([A-Z]+[0-9]+)"/) || [])[1];
+      if (!ref) continue;
+      var type = (attrs.match(/\bt="([^"]+)"/) || [])[1] || 'n';
+      var vRaw = (body.match(/<v>([\s\S]*?)<\/v>/) || [])[1];
+      var val;
+      if (type === 's') val = vRaw != null ? shared[+vRaw] : '';
+      else if (type === 'inlineStr') val = texts(body);
+      else if (type === 'b') val = vRaw === '1';
+      else if (type === 'str' || type === 'e') val = vRaw != null ? decode(vRaw) : '';
+      else val = vRaw != null && vRaw !== '' ? Number(vRaw) : '';
+      if (val === '' || val == null) continue;
+      var r = +ref.replace(/[A-Z]/g, '') - 1, c = colIdx(ref);
+      while (grid.length <= r) grid.push([]);
+      grid[r][c] = val;
+    }
+    var width = grid.reduce(function (w, row) { return Math.max(w, row.length); }, 0);
+    return grid.map(function (row) {
+      var out = [];
+      for (var i = 0; i < width; i++) out.push(row[i] === undefined ? '' : row[i]);
+      return out;
+    });
+  });
 }
 
 /** 엑셀 첨부를 임시 구글 시트로 변환하고 ID 반환. Drive 고급 서비스가 없으면 Drive API 를 직접 호출. */
@@ -920,5 +1009,5 @@ function fmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { columnLetter_: columnLetter_, allocate: allocate, parsePurchaseOrder: parsePurchaseOrder, resolveProduct: resolveProduct, toDate_: toDate_, CONFIG: CONFIG };
+  module.exports = { columnLetter_: columnLetter_, allocate: allocate, parsePurchaseOrder: parsePurchaseOrder, xlsxGrids: xlsxGrids, resolveProduct: resolveProduct, toDate_: toDate_, CONFIG: CONFIG };
 }
