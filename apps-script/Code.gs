@@ -28,7 +28,7 @@ var CONFIG = {
   STATUS_HOLD: '홀딩재고(추가발주 제외)',
   STATUS_DONE: '출고 완료',
 
-  // 올리브영 판정: 입고처(D) 값 또는 업체명(M)에 포함된 키워드
+  // 올리브영 판정: 입고처(D) 값 또는 업체명(E)에 포함된 키워드
   OLIVEYOUNG_CHANNEL: '올리브영',
   OLIVEYOUNG_COMPANY_KEYWORDS: ['올리브영', 'oliveyoung', 'olive young', 'cj올리브영'],
 
@@ -828,7 +828,7 @@ function toast_(msg) {
   try { SpreadsheetApp.getActive().toast(msg, '예약재고 자동화', 5); } catch (e) { /* 트리거 실행 시 무시 */ }
 }
 
-/** G(상품명) 또는 H(수량)가 있는 마지막 행 */
+/** 상품명(H) 또는 수량(I)이 있는 마지막 행 */
 function lastDataRow_(sh) {
   var last = sh.getLastRow();
   if (last < CONFIG.FIRST_ROW) return CONFIG.FIRST_ROW - 1;
