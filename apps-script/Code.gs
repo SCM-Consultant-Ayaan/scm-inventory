@@ -52,9 +52,9 @@ var CONFIG = {
   MAIL_QUERY: 'has:attachment newer_than:14d',
   // 이 날짜 이후 받은 메일만 처리 (이전 메일은 이미 수기 등록된 것으로 간주). 'YYYY/MM/DD', 비우면 제한 없음
   MAIL_AFTER: '2026/10/01',
-  // 첨부파일명 정규식: "[로지킴]업체명_PO No._날짜(표준양식).xlsx" 형식만 처리.
+  // 첨부파일명 정규식: "[로지킴]업체명_PO No._날짜.xlsx" 형식만 처리. 예: [로지킴]플루고_PO 26100101_261001.xlsx
   // 이름이 맞아도 내용이 PURCHASE ORDER 양식이 아니면 건너뛴다.
-  ATTACHMENT_NAME_PATTERN: /^\s*\[로지킴\].*표준양식/,
+  ATTACHMENT_NAME_PATTERN: /^\s*\[로지킴\]/,
   // 보낸 사람 필터 (비우면 전체). 예: ['@followmecorp.com']
   SENDER_FILTER: [],
   DONE_LABEL: '예약재고_등록완료',
@@ -585,7 +585,9 @@ function importMail_() {
   if (!layoutOk_(sh)) return 0;
   var label = GmailApp.getUserLabelByName(CONFIG.DONE_LABEL) || GmailApp.createLabel(CONFIG.DONE_LABEL);
   var failLabel = GmailApp.getUserLabelByName(CONFIG.FAIL_LABEL) || GmailApp.createLabel(CONFIG.FAIL_LABEL);
-  var q = CONFIG.MAIL_QUERY + (CONFIG.MAIL_AFTER ? ' after:' + CONFIG.MAIL_AFTER : '') +
+  // Gmail 의 after:YYYY/MM/DD 는 미국 태평양 시간 기준이라 한국 오전 메일이 빠질 수 있음 → 한국 시간 자정의 초 단위로 검색
+  var after = CONFIG.MAIL_AFTER ? toDate_(CONFIG.MAIL_AFTER, null) : null;
+  var q = CONFIG.MAIL_QUERY + (after ? ' after:' + Math.floor(after.getTime() / 1000) : '') +
     ' -label:' + CONFIG.DONE_LABEL + ' -label:' + CONFIG.FAIL_LABEL;
   var threads = GmailApp.search(q, 0, 30);
   if (!threads.length) return 0;
@@ -604,13 +606,14 @@ function importMail_() {
   var added = 0;
 
   threads.forEach(function (th) {
-    var threadOk = true;
+    var threadOk = true, touched = false;
     th.getMessages().forEach(function (msg) {
       if (!senderAllowed_(msg.getFrom())) return;
       msg.getAttachments().forEach(function (att) {
         var fname = att.getName();
         if (!CONFIG.ATTACHMENT_NAME_PATTERN.test(fname)) return;
         if (!/\.(xlsx|xls|xlsm)$/i.test(fname)) return;
+        touched = true;
         try {
           var po = parsePurchaseOrder(attachmentToGrid_(att));
           if (!po) return; // PURCHASE ORDER 양식이 아님 → 건너뜀
@@ -649,8 +652,8 @@ function importMail_() {
         }
       });
     });
-    // 실패한 메일은 실패 라벨로 빼서 10분마다 반복 시도하지 않음 (라벨을 지우면 다시 시도)
-    th.addLabel(threadOk ? label : failLabel);
+    // 대상 첨부가 있었던 메일만 라벨 (실패는 실패 라벨 → 반복 시도 안 함, 라벨을 지우면 다시 시도)
+    if (touched) th.addLabel(threadOk ? label : failLabel);
   });
 
   if (added && CONFIG.NOTIFY_TO) {
