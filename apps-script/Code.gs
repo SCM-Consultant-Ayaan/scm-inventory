@@ -52,26 +52,16 @@ var CONFIG = {
   MAIL_QUERY: 'has:attachment newer_than:14d',
   // 이 날짜 이후 받은 메일만 처리 (이전 메일은 이미 수기 등록된 것으로 간주). 'YYYY/MM/DD', 비우면 제한 없음
   MAIL_AFTER: '2026/10/01',
-  // 첨부파일명 정규식 (이 패턴과 맞는 첨부만 처리). 예: /발주서/ , /BURIDGE.*발주서/
-  ATTACHMENT_NAME_PATTERN: /발주서/,
-  // 제외할 첨부파일명 (우리가 제조사에 보내는 생산·용기 발주서 등)
-  EXCLUDE_ATTACHMENT_PATTERN: /팔로우미코스메틱/,
-  // 보낸 사람 필터 (비우면 전체). 예: ['@buridge.com', '@oliveyoung.co.kr']
+  // 첨부파일명 정규식. 회사 표준 PURCHASE ORDER 양식(PO No. 포함)만 읽으므로 이름은 넓게 거른다.
+  // 양식이 아닌 엑셀(제조사 생산·용기 발주서 등)은 내용 확인 후 건너뛴다.
+  ATTACHMENT_NAME_PATTERN: /PO|발주/i,
+  // 보낸 사람 필터 (비우면 전체). 예: ['@followmecorp.com']
   SENDER_FILTER: [],
   DONE_LABEL: '예약재고_등록완료',
   FAIL_LABEL: '예약재고_등록실패',
   MAIL_REGISTRANT: '메일자동',
-
-  // 발주서 헤더 인식용 별칭 (공백 무시, 포함 여부로 매칭)
-  HEADER_ALIASES: {
-    barcode: ['바코드', '제품코드', '상품코드', 'ean', 'barcode'],
-    name: ['상품명', '제품명', '품목명', '품명', '품목'],
-    qty: ['발주수량', '주문수량', '요청수량', '수량', 'qty'],
-    date: ['사용예정일', '입고요청일', '입고예정일', '납품요청일', '납품일', '납기일', '납기', '출고요청일', '희망입고일'],
-    company: ['업체명', '거래처명', '거래처', '발주처', '고객사', '업체'],
-    channel: ['입고처', '납품처', '배송처'],
-    memo: ['비고', '메모'],
-  },
+  // PO 로 등록하는 건의 입고처(D)
+  PO_CHANNEL: '수출',
 
   // 알림 받을 메일 (비우면 알림 없음). 홀딩→예약 전환, 메일 등록 결과를 보냄.
   NOTIFY_TO: '',
@@ -607,7 +597,7 @@ function importMail_() {
       .forEach(function (v) {
         if (!v[0]) return;
         existingKeys[v[0]] = true;
-        existingKeys[String(v[0]).split('|')[0]] = true; // 파일 단위 키
+        existingKeys[String(v[0]).split('|')[0]] = true; // PO 단위 키
       });
   }
   var products = readProducts_(ss);
@@ -620,46 +610,39 @@ function importMail_() {
       msg.getAttachments().forEach(function (att) {
         var fname = att.getName();
         if (!CONFIG.ATTACHMENT_NAME_PATTERN.test(fname)) return;
-        if (CONFIG.EXCLUDE_ATTACHMENT_PATTERN && CONFIG.EXCLUDE_ATTACHMENT_PATTERN.test(fname)) return;
-        // 같은 파일이 회신/전달로 여러 번 와도 한 번만 등록 (파일 내용 기준)
-        var hash = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, att.getBytes()));
-        if (existingKeys['h:' + hash]) return;
+        if (!/\.(xlsx|xls|xlsm)$/i.test(fname)) return;
         try {
-          var grid = attachmentToGrid_(att);
-          var parsed = parseOrderGrid(grid, CONFIG.HEADER_ALIASES);
-          if (!parsed.lines.length) throw new Error('헤더(상품명/바코드 + 수량)를 찾지 못함');
-          var company = parsed.company || senderName_(msg.getFrom());
-          var newRows = [];
-          parsed.lines.forEach(function (ln) {
-            var key = 'h:' + hash + '|' + ln.sourceRow;
-            if (existingKeys[key]) return;
+          var po = parsePurchaseOrder(attachmentToGrid_(att));
+          if (!po) return; // PURCHASE ORDER 양식이 아님 → 건너뜀
+          if (!po.lines.length) throw new Error('PO ' + po.poNo + ': 품목(품목명 + 총 수량)이 없음');
+          var poKey = 'po:' + po.poNo;
+          if (existingKeys[poKey]) { writeLog_(msg, fname, '건너뜀: 이미 등록된 PO ' + po.poNo); return; }
+          var newRows = po.lines.map(function (ln) {
             var prod = resolveProduct(ln, products);
             var row = new Array(LAST_COL);
             for (var c = 0; c < LAST_COL; c++) row[c] = '';
             row[COL.created - 1] = startOfDay_(msg.getDate());
             row[COL.registrant - 1] = CONFIG.MAIL_REGISTRANT;
-            row[COL.useDate - 1] = toDate_(ln.date || parsed.date, msg.getDate()) || '';
-            row[COL.channel - 1] = ln.channel || (isOliveYoung_({ channel: '', company: company }, CONFIG) ? CONFIG.OLIVEYOUNG_CHANNEL : '');
-            row[COL.purpose - 1] = '메일 발주서: ' + msg.getSubject();
-            row[COL.code - 1] = prod.barcode || ln.barcode || '';
-            row[COL.name - 1] = prod.name || ln.name || ln.barcode;
+            row[COL.channel - 1] = CONFIG.PO_CHANNEL;
+            row[COL.company - 1] = po.company;
+            row[COL.purpose - 1] = po.purpose;
+            row[COL.code - 1] = prod.barcode || '';
+            row[COL.name - 1] = prod.name || ln.name;
             row[COL.qty - 1] = ln.qty;
-            row[COL.memo - 1] = [fname, ln.memo].filter(String).join(' / ');
-            row[COL.company - 1] = company;
-            row[COL.mailKey - 1] = key;
-            newRows.push(row);
-            existingKeys[key] = true;
+            row[COL.memo - 1] = ['PO ' + po.poNo, ln.memo].filter(String).join(' / ');
+            row[COL.mailKey - 1] = poKey + '|' + ln.sourceRow;
+            return row;
           });
-          existingKeys['h:' + hash] = true;
-          if (newRows.length) {
-            var at = lastDataRow_(sh) + 1;
-            if (at + newRows.length - 1 > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), newRows.length + 50);
-            // A~N, U 만 기록 (O~T 는 재계산이 채움)
-            sh.getRange(at, 1, newRows.length, COL.priority).setValues(newRows.map(function (r) { return r.slice(0, COL.priority); }));
-            sh.getRange(at, COL.mailKey, newRows.length, 1).setValues(newRows.map(function (r) { return [r[COL.mailKey - 1]]; }));
-            added += newRows.length;
-          }
-          writeLog_(msg, fname, '등록 ' + newRows.length + '행' + (parsed.company ? '' : ' (업체명: 보낸사람으로 대체)'));
+          existingKeys[poKey] = true;
+          var at = lastDataRow_(sh) + 1;
+          if (at + newRows.length - 1 > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), newRows.length + 50);
+          // A~N, U 만 기록 (O~T 는 재계산이 채움)
+          sh.getRange(at, 1, newRows.length, COL.priority).setValues(newRows.map(function (r) { return r.slice(0, COL.priority); }));
+          sh.getRange(at, COL.mailKey, newRows.length, 1).setValues(newRows.map(function (r) { return [r[COL.mailKey - 1]]; }));
+          added += newRows.length;
+          var unmatched = po.lines.filter(function (ln) { return !resolveProduct(ln, products).name; }).length;
+          writeLog_(msg, fname, '등록 ' + newRows.length + '행 · PO ' + po.poNo + ' · ' + po.purpose +
+            (unmatched ? ' · ⚠ 상품명 매칭 실패 ' + unmatched + '건' : ''));
         } catch (err) {
           threadOk = false;
           writeLog_(msg, fname, '⚠ 실패: ' + err.message);
@@ -682,24 +665,15 @@ function senderAllowed_(from) {
   return CONFIG.SENDER_FILTER.some(function (s) { return f.indexOf(s.toLowerCase()) >= 0; });
 }
 
-function senderName_(from) {
-  var m = String(from).match(/^\s*"?([^"<]+?)"?\s*</);
-  return m ? m[1].trim() : String(from).replace(/[<>]/g, '').trim();
-}
-
-/** 첨부 → 2차원 배열. xlsx/xls 는 Drive 고급 서비스로 임시 변환 후 삭제. */
+/** 엑셀 첨부 → PO 탭(없으면 첫 탭)의 2차원 배열. 임시 구글 시트로 변환해 수식 값까지 읽은 뒤 삭제. */
 function attachmentToGrid_(att) {
-  var name = att.getName().toLowerCase();
-  if (/\.csv$/.test(name)) return Utilities.parseCsv(att.getDataAsString('UTF-8'));
-  if (!/\.(xlsx|xls|xlsm)$/.test(name)) throw new Error('지원하지 않는 형식(엑셀/CSV만 가능)');
   var fileId = convertToSheet_(att);
   try {
     var tmp = SpreadsheetApp.openById(fileId);
     var sheets = tmp.getSheets();
-    // 헤더가 인식되는 첫 번째 탭 사용
     for (var i = 0; i < sheets.length; i++) {
       var grid = sheets[i].getDataRange().getValues();
-      if (parseOrderGrid(grid, CONFIG.HEADER_ALIASES).lines.length) return grid;
+      if (parsePurchaseOrder(grid)) return grid;
     }
     return sheets[0].getDataRange().getValues();
   } finally {
@@ -731,74 +705,66 @@ function convertToSheet_(att) {
 }
 
 /**
- * 발주서 표 파싱 (순수 함수).
- * 상단 30행 안에서 (상품명 또는 바코드) + 수량 헤더가 있는 행을 찾고 그 아래 품목을 읽는다.
- * 업체명/납기가 열이 아니라 "발주처: OO" 같은 라벨 셀로 있으면 그 오른쪽 값을 사용.
+ * 회사 표준 PURCHASE ORDER 양식 파싱 (순수 함수). 양식이 아니면 null.
+ *  상단: PO No. / 발주일 (PO Date) / 발주 차수 / 업체명 (Vendor) / 유통국가(Country) → "(주)뷰릿지코퍼레이션/중국"
+ *  품목: No. | 품목코드 | 품목명 | 입수량 | 주문 박스 수량 | 총 수량 | 단가 | 규격 | 공급가액 | 비고
  */
-function parseOrderGrid(grid, aliases) {
-  var norm = function (s) { return String(s == null ? '' : s).toLowerCase().replace(/[\s:：*()\[\]]/g, ''); };
-  var findCol = function (row, keys) {
-    for (var k = 0; k < keys.length; k++) {
-      for (var c = 0; c < row.length; c++) {
-        if (norm(row[c]) && norm(row[c]).indexOf(norm(keys[k])) >= 0) return c;
-      }
-    }
-    return -1;
-  };
-  var hdrRow = -1, cols = {};
-  for (var r = 0; r < Math.min(grid.length, 30); r++) {
-    var row = grid[r];
-    var cName = findCol(row, aliases.name), cBar = findCol(row, aliases.barcode), cQty = findCol(row, aliases.qty);
-    if ((cName >= 0 || cBar >= 0) && cQty >= 0 && cQty !== cName && cQty !== cBar) {
-      hdrRow = r;
-      cols = { name: cName, barcode: cBar, qty: cQty,
-        date: findCol(row, aliases.date), company: findCol(row, aliases.company),
-        channel: findCol(row, aliases.channel), memo: findCol(row, aliases.memo) };
-      break;
-    }
-  }
-  var labelValue = function (keys) {
-    var lim = hdrRow >= 0 ? hdrRow : Math.min(grid.length, 30);
-    for (var r2 = 0; r2 < lim; r2++) {
-      for (var c2 = 0; c2 < grid[r2].length; c2++) {
-        var cell = String(grid[r2][c2] == null ? '' : grid[r2][c2]);
-        for (var k = 0; k < keys.length; k++) {
-          if (norm(cell).indexOf(norm(keys[k])) !== 0) continue;
-          var inline = cell.split(/[:：]/);
-          if (inline.length > 1 && inline[1].trim()) return inline.slice(1).join(':').trim();
-          for (var c3 = c2 + 1; c3 < grid[r2].length; c3++) {
-            if (String(grid[r2][c3]).trim() !== '') return grid[r2][c3];
-          }
+function parsePurchaseOrder(grid) {
+  var norm = function (v) { return String(v == null ? '' : v).toLowerCase().replace(/[\s:：().]/g, ''); };
+  var top = grid.slice(0, 5).map(function (r) { return r.map(norm).join(' '); }).join(' ');
+  if (top.indexOf('purchaseorder') < 0) return null;
+
+  // 라벨 오른쪽 첫 값
+  var label = function (key) {
+    for (var r = 0; r < Math.min(grid.length, 15); r++) {
+      for (var c = 0; c < grid[r].length; c++) {
+        if (norm(grid[r][c]).indexOf(key) !== 0) continue;
+        for (var c2 = c + 1; c2 < grid[r].length; c2++) {
+          if (String(grid[r][c2]).trim() !== '') return grid[r][c2];
         }
       }
     }
     return '';
   };
-  var out = { lines: [], company: '', date: '' };
-  out.company = String(labelValue(aliases.company) || '').trim();
-  out.date = labelValue(aliases.date) || '';
-  if (hdrRow < 0) return out;
+  var poNo = String(label('pono')).trim();
+  if (!poNo) return null;
+  var poDate = toDate_(label('발주일'), new Date());
+  var round = String(label('발주차수')).replace(/[^0-9]/g, '');
+  var vendor = String(label('업체명')).trim();
+  var company = vendor.split('/')[0].trim();
+  var country = (vendor.split('/')[1] || '').trim();
 
-  var blanks = 0;
-  for (var i = hdrRow + 1; i < grid.length; i++) {
+  // 품목 헤더
+  var hdr = -1, col = {};
+  for (var r = 0; r < Math.min(grid.length, 40) && hdr < 0; r++) {
+    var row = grid[r].map(norm);
+    var find = function (key) { for (var c = 0; c < row.length; c++) if (row[c].indexOf(key) === 0) return c; return -1; };
+    var cName = find('품목명'), cQty = find('총수량');
+    if (cName >= 0 && cQty >= 0) {
+      hdr = r;
+      col = { code: find('품목코드'), name: cName, qty: cQty, perBox: find('입수량'), box: find('주문박스수량'), memo: find('비고') };
+    }
+  }
+  var yy = poDate ? String(poDate.getFullYear()).slice(2) : (poNo.match(/_(\d{2})\d{4}_/) || [])[1] || '';
+  var out = {
+    poNo: poNo, poDate: poDate, round: round, company: company, country: country, lines: [],
+    purpose: [country ? country + ' 수출' : '수출', yy && round ? yy + '-' + Number(round) + '차' : ''].filter(String).join(' '),
+  };
+  if (hdr < 0) return out;
+
+  for (var i = hdr + 1; i < grid.length; i++) {
     var g = grid[i];
     var get = function (c) { return c >= 0 && c < g.length ? g[c] : ''; };
-    var name = String(get(cols.name) || '').trim();
-    var bar = String(get(cols.barcode) || '').trim().replace(/\.0+$/, '');
-    if (!name && !bar) { if (++blanks >= 3) break; continue; }
-    blanks = 0;
-    if (/합계|총계|소계|total/i.test(name + bar)) continue;
-    var qty = toNum_(get(cols.qty));
+    if (/소계|subtotal|합계|total/i.test(g.map(String).join(' '))) break;
+    var name = String(get(col.name) || '').trim();
+    if (!name) continue;
+    var qty = toNum_(get(col.qty));
+    if (!(qty > 0)) qty = toNum_(get(col.perBox)) * toNum_(get(col.box));
     if (!(qty > 0)) continue;
     out.lines.push({
-      sourceRow: i + 1, name: name, barcode: bar, qty: qty,
-      date: get(cols.date) || '', company: String(get(cols.company) || '').trim(),
-      channel: String(get(cols.channel) || '').trim(), memo: String(get(cols.memo) || '').trim(),
+      sourceRow: i + 1, code: String(get(col.code) || '').trim(), barcode: '', name: name, qty: qty,
+      memo: String(get(col.memo) || '').trim(),
     });
-  }
-  if (!out.company) {
-    var cs = out.lines.map(function (l) { return l.company; }).filter(String);
-    if (cs.length) out.company = cs[0];
   }
   return out;
 }
@@ -918,5 +884,5 @@ function fmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { columnLetter_: columnLetter_, allocate: allocate, parseOrderGrid: parseOrderGrid, resolveProduct: resolveProduct, toDate_: toDate_, CONFIG: CONFIG };
+  module.exports = { columnLetter_: columnLetter_, allocate: allocate, parsePurchaseOrder: parsePurchaseOrder, resolveProduct: resolveProduct, toDate_: toDate_, CONFIG: CONFIG };
 }
