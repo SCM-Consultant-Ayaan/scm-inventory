@@ -610,13 +610,14 @@ function importMail_() {
     th.getMessages().forEach(function (msg) {
       if (!senderAllowed_(msg.getFrom())) return;
       msg.getAttachments().forEach(function (att) {
-        var fname = att.getName();
+        // 맥에서 보낸 파일은 한글이 자모 분리(NFD)돼 있어 "[로지킴]"과 안 맞음 → NFC 로 정규화
+        var fname = String(att.getName()).normalize('NFC');
         if (!CONFIG.ATTACHMENT_NAME_PATTERN.test(fname)) return;
         if (!/\.(xlsx|xls|xlsm)$/i.test(fname)) return;
         touched = true;
         try {
           var po = parsePurchaseOrder(attachmentToGrid_(att));
-          if (!po) return; // PURCHASE ORDER 양식이 아님 → 건너뜀
+          if (!po) { writeLog_(msg, fname, '건너뜀: PURCHASE ORDER 양식이 아님 (상단 PURCHASE ORDER / PO No. 확인)'); return; }
           if (!po.lines.length) throw new Error('PO ' + po.poNo + ': 품목(품목명 + 총 수량)이 없음');
           var poKey = 'po:' + po.poNo;
           if (existingKeys[poKey]) { writeLog_(msg, fname, '건너뜀: 이미 등록된 PO ' + po.poNo); return; }
@@ -660,6 +661,38 @@ function importMail_() {
     MailApp.sendEmail(CONFIG.NOTIFY_TO, '[예약재고] 메일 발주서 ' + added + '행 등록', ss.getUrl());
   }
   return added;
+}
+
+/**
+ * 메일이 안 쌓일 때 원인 확인용: 최근 3일 첨부 메일을 라벨 조건 없이 훑어서
+ * 검색 조건·파일명 규칙에 걸리는지 [메일수신로그]에 기록한다. (시트에는 등록하지 않음)
+ */
+function diagnoseMail() {
+  assertAllowed_();
+  var after = CONFIG.MAIL_AFTER ? toDate_(CONFIG.MAIL_AFTER, null) : null;
+  var q = CONFIG.MAIL_QUERY + (after ? ' after:' + Math.floor(after.getTime() / 1000) : '') +
+    ' -label:' + CONFIG.DONE_LABEL + ' -label:' + CONFIG.FAIL_LABEL;
+  var inQuery = {};
+  GmailApp.search(q, 0, 50).forEach(function (t) { inQuery[t.getId()] = true; });
+  var log = logSheet_();
+  log.appendRow([new Date(), '', '[진단]', '검색어: ' + q, '', '검색된 스레드 ' + Object.keys(inQuery).length + '개']);
+  GmailApp.search('has:attachment newer_than:3d', 0, 30).forEach(function (t) {
+    var labels = t.getLabels().map(function (l) { return l.getName(); }).join(',');
+    t.getMessages().forEach(function (msg) {
+      msg.getAttachments().forEach(function (att) {
+        var raw = att.getName(), fname = String(raw).normalize('NFC');
+        var notes = [
+          inQuery[t.getId()] ? '검색 포함' : '검색 제외(날짜/라벨)',
+          CONFIG.ATTACHMENT_NAME_PATTERN.test(fname) ? '파일명 OK' : '파일명 규칙 불일치',
+          raw !== fname ? '한글 자모분리(NFD) 파일명' : '',
+          senderAllowed_(msg.getFrom()) ? '' : '보낸사람 필터 제외',
+          labels ? '라벨: ' + labels : '',
+        ].filter(String).join(' · ');
+        log.appendRow([new Date(), msg.getDate(), msg.getFrom(), '[진단] ' + msg.getSubject(), fname, notes]);
+      });
+    });
+  });
+  toast_('진단 완료: [메일수신로그] 시트를 확인하세요');
 }
 
 function senderAllowed_(from) {
