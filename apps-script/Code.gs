@@ -1,0 +1,828 @@
+/**
+ * 로지킴 예약재고 자동화 (Google Apps Script, 시트 바인딩용)
+ *
+ *  - [예약 재고 관리] 우선순위 자동 계산
+ *  - 신규 요청 → 예약재고 / 홀딩재고 자동 판정 (현재고·확정예약·앞순위 홀딩·입고예정 반영)
+ *  - 홀딩재고 → 예약재고 자동 전환 (가용재고만으로 출고 가능해졌을 때)
+ *  - Gmail 발주서 첨부(엑셀/CSV) → [예약 재고 관리] 자동 등록
+ *
+ * 설치 방법은 apps-script/README.md 참고.
+ * CONFIG.ALLOWED_SPREADSHEET_IDS 에 있는 시트에서만 동작한다 (본 시트 보호).
+ */
+
+var CONFIG = {
+  // 이 스크립트가 동작해도 되는 스프레드시트 ID. 본 시트 적용 시 여기에 본 시트 ID를 추가.
+  ALLOWED_SPREADSHEET_IDS: [
+    '18E5ikb8UmjBJgdgAU2ezfIwc-MqmgqSGp48AwOkD79I', // 테스트 시트
+  ],
+
+  RES_SHEET: '예약 재고 관리',
+  INV_SHEET: '재고관리',
+  MASTER_SHEET: '상품 마스터 시트(수기)',
+  LOG_SHEET: '메일수신로그',
+  MEMO_SHEET: '예약관리_참고메모',
+  HEADER_ROW: 2,
+  FIRST_ROW: 3,
+
+  STATUS_RES: '예약재고(현재고 제외)',
+  STATUS_HOLD: '홀딩재고(추가발주 제외)',
+  STATUS_DONE: '출고 완료',
+
+  // 올리브영 판정: 입고처(D) 값 또는 업체명(M)에 포함된 키워드
+  OLIVEYOUNG_CHANNEL: '올리브영',
+  OLIVEYOUNG_COMPANY_KEYWORDS: ['올리브영', 'oliveyoung', 'olive young', 'cj올리브영'],
+
+  // 우선순위 키 순서 (앞일수록 강함). 순서를 바꾸면 정렬 기준이 바뀐다.
+  //  urgent   : 우선순위 열에 "긴급" 또는 "0순위" → 올리브영보다 앞
+  //  oliveyoung
+  //  manual   : 우선순위 열 1순위 → 2순위 → 미기재
+  //  created  : 작성일자 빠른 순
+  //  useDate  : 사용 예정일 빠른 순
+  //  volume   : 업체 누적 출고량 많은 순
+  PRIORITY_ORDER: ['urgent', 'oliveyoung', 'manual', 'created', 'useDate', 'volume'],
+
+  // 홀딩 대기열을 순위대로 엄격하게 처리 (앞 순위 홀딩이 전환되기 전에는 뒷 순위가 먼저 전환되지 않음)
+  STRICT_QUEUE: true,
+  // 홀딩 장기 경고 일수
+  HOLD_WARN_DAYS: 80,
+
+  // ---- 메일 발주서 자동 등록 ----
+  MAIL_ENABLED: true,
+  // Gmail 검색어. 처리 완료 라벨이 붙은 메일은 제외된다.
+  MAIL_QUERY: 'has:attachment newer_than:14d',
+  // 첨부파일명 정규식 (이 패턴과 맞는 첨부만 처리). 예: /발주서/ , /^\[로지킴\].*발주/
+  ATTACHMENT_NAME_PATTERN: /발주서/,
+  // 보낸 사람 필터 (비우면 전체). 예: ['@oliveyoung.co.kr', 'buyer@abc.com']
+  SENDER_FILTER: [],
+  DONE_LABEL: '예약재고_등록완료',
+  MAIL_REGISTRANT: '메일자동',
+
+  // 발주서 헤더 인식용 별칭 (공백 무시, 포함 여부로 매칭)
+  HEADER_ALIASES: {
+    barcode: ['바코드', '제품코드', '상품코드', 'ean', 'barcode'],
+    name: ['상품명', '제품명', '품목명', '품명', '품목'],
+    qty: ['발주수량', '주문수량', '요청수량', '수량', 'qty'],
+    date: ['사용예정일', '입고요청일', '입고예정일', '납품요청일', '납품일', '납기일', '납기', '출고요청일', '희망입고일'],
+    company: ['업체명', '거래처명', '거래처', '발주처', '고객사', '업체'],
+    channel: ['입고처', '납품처', '배송처'],
+    memo: ['비고', '메모'],
+  },
+
+  // 알림 받을 메일 (비우면 알림 없음). 홀딩→예약 전환, 메일 등록 결과를 보냄.
+  NOTIFY_TO: '',
+};
+
+// [예약 재고 관리] 열 번호 (1-based). A~L 은 기존 구조 유지 (다른 시트 수식이 참조).
+var COL = {
+  created: 1,   // A 작성 일자
+  registrant: 2,// B 등록자
+  useDate: 3,   // C 사용 예정일
+  channel: 4,   // D 입고처
+  purpose: 5,   // E 용도
+  code: 6,      // F 제품코드
+  name: 7,      // G 상품명
+  qty: 8,       // H 예약 재고 수량
+  status: 9,    // I 재고 분류
+  applied: 10,  // J 실재고 반영일
+  shipped: 11,  // K 최종 출고 여부
+  memo: 12,     // L 비고
+  company: 13,  // M 업체명            (입력)
+  priority: 14, // N 우선순위(수동)    (입력)
+  order: 15,    // O 처리 순번         (자동)
+  verdict: 16,  // P 판정              (자동)
+  freeNow: 17,  // Q 지금 가용재고     (자동)
+  supply: 18,   // R 사용예정일까지 확보가능 (자동)
+  volume: 19,   // S 업체 누적 출고량  (자동)
+  log: 20,      // T 자동 처리 이력    (자동)
+  mailKey: 21,  // U 메일 키 (숨김)
+};
+var LAST_COL = 21;
+
+var NEW_HEADERS = {
+  13: '업체명',
+  14: '우선순위\n(긴급/0순위/1순위/2순위)',
+  15: '처리 순번\n(상품별, 자동)',
+  16: '판정 (자동)',
+  17: '지금 가용재고\n(앞 순위 차감 후)',
+  18: '사용예정일까지\n확보 가능 수량',
+  19: '업체 누적\n출고량',
+  20: '자동 처리 이력',
+  21: '메일키',
+};
+
+// =====================================================================
+// 메뉴 / 트리거
+// =====================================================================
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('📦 예약재고 자동화')
+    .addItem('지금 재계산', 'runAllocation')
+    .addItem('메일 발주서 가져오기', 'runMailImport')
+    .addSeparator()
+    .addItem('초기 설정 (구조 변경 + 트리거 설치)', 'setup')
+    .addItem('트리거만 다시 설치', 'installTriggers')
+    .addItem('자동화 중지 (트리거 삭제)', 'removeTriggers')
+    .addToUi();
+}
+
+function installTriggers() {
+  assertAllowed_();
+  removeTriggers();
+  var ss = SpreadsheetApp.getActive();
+  ScriptApp.newTrigger('onEditTrigger').forSpreadsheet(ss).onEdit().create();
+  ScriptApp.newTrigger('runScheduled').timeBased().everyMinutes(10).create();
+}
+
+function removeTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    var fn = t.getHandlerFunction();
+    if (fn === 'onEditTrigger' || fn === 'runScheduled') ScriptApp.deleteTrigger(t);
+  });
+}
+
+/** 설치형 onEdit: [예약 재고 관리] A~N 수정 시 재계산 */
+function onEditTrigger(e) {
+  try {
+    if (!e || !e.range) return;
+    var sh = e.range.getSheet();
+    if (sh.getName() !== CONFIG.RES_SHEET) return;
+    if (e.range.getLastRow() < CONFIG.FIRST_ROW) return;
+    if (e.range.getColumn() > COL.priority) return;
+    runAllocation();
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+/** 10분마다: 메일 확인 → 재계산 (입고되어 현재고가 바뀐 것도 여기서 반영) */
+function runScheduled() {
+  if (!isAllowed_()) return;
+  if (CONFIG.MAIL_ENABLED) {
+    try { importMail_(); } catch (err) { console.error('메일 처리 오류', err); }
+  }
+  runAllocation();
+}
+
+function runMailImport() {
+  assertAllowed_();
+  var n = importMail_();
+  runAllocation();
+  toast_('메일 발주서 ' + n + '건(행) 등록');
+}
+
+// =====================================================================
+// 초기 설정 (구조 변경)
+// =====================================================================
+
+function setup() {
+  assertAllowed_();
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(CONFIG.RES_SHEET);
+  if (!sh) throw new Error('시트 없음: ' + CONFIG.RES_SHEET);
+  var maxRows = sh.getMaxRows();
+  var maxCols = sh.getMaxColumns();
+  if (maxCols < 31) sh.insertColumnsAfter(maxCols, 31 - maxCols);
+
+  // 1) 기존 M~T 참고 메모(리드타임 표 등)를 별도 시트로 보관
+  if (!ss.getSheetByName(CONFIG.MEMO_SHEET)) {
+    var memo = ss.insertSheet(CONFIG.MEMO_SHEET);
+    var src = sh.getRange(1, 13, 15, 8).getValues();
+    memo.getRange(1, 1, 15, 8).setValues(src);
+    memo.getRange(1, 10).setValue('※ [예약 재고 관리] M:T 에 있던 메모를 구조 변경 시 옮겨둔 것');
+  }
+
+  // 2) 기존 M~AE (보조 수식 V~AA, AC1 FILTER, 조건부서식 등) 정리
+  var clearRange = sh.getRange(1, 13, maxRows, 31 - 12);
+  clearRange.clearContent().clearDataValidations().clearNote();
+  clearRange.setBackground(null).setFontColor(null).setFontWeight('normal');
+  var keepRules = sh.getConditionalFormatRules().filter(function (r) {
+    return r.getRanges().every(function (rg) { return rg.getColumn() < 13; });
+  });
+
+  // 3) 새 헤더
+  Object.keys(NEW_HEADERS).forEach(function (c) {
+    sh.getRange(CONFIG.HEADER_ROW, Number(c)).setValue(NEW_HEADERS[c]);
+  });
+  sh.getRange(1, COL.company).setValue('▼ 입력: 업체명 / 우선순위(긴급·0순위는 올리브영보다 우선)');
+  sh.getRange(1, COL.order).setValue('▼ 자동 계산 (직접 수정 금지) · 재고 분류(I) 비워두면 자동 판정');
+  var hdr = sh.getRange(CONFIG.HEADER_ROW, COL.company, 1, LAST_COL - COL.company + 1);
+  hdr.setFontWeight('bold').setWrap(true).setVerticalAlignment('middle').setHorizontalAlignment('center');
+  sh.getRange(CONFIG.HEADER_ROW, COL.company, 1, 2).setBackground('#fff2cc');
+  sh.getRange(CONFIG.HEADER_ROW, COL.order, 1, COL.log - COL.order + 1).setBackground('#d9d9d9');
+  sh.getRange(1, COL.company, 1, 2).setFontColor('#7f6000');
+  sh.getRange(1, COL.order, 1, 6).setFontColor('#595959');
+  sh.getRange(CONFIG.FIRST_ROW, COL.order, maxRows - CONFIG.FIRST_ROW + 1, COL.log - COL.order + 1)
+    .setBackground('#f3f3f3');
+  sh.setColumnWidth(COL.company, 120);
+  sh.setColumnWidth(COL.priority, 110);
+  sh.setColumnWidth(COL.order, 80);
+  sh.setColumnWidth(COL.verdict, 320);
+  sh.setColumnWidth(COL.freeNow, 100);
+  sh.setColumnWidth(COL.supply, 110);
+  sh.setColumnWidth(COL.volume, 90);
+  sh.setColumnWidth(COL.log, 260);
+  sh.hideColumns(COL.mailKey);
+  sh.getRange(CONFIG.FIRST_ROW, COL.freeNow, maxRows - CONFIG.FIRST_ROW + 1, 3).setNumberFormat('#,##0');
+
+  // 4) 입력 규칙: 우선순위 드롭다운, 재고 분류 드롭다운(빈칸 허용 = 자동 판정)
+  var dataRows = maxRows - CONFIG.FIRST_ROW + 1;
+  sh.getRange(CONFIG.FIRST_ROW, COL.priority, dataRows, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList(['긴급', '0순위', '1순위', '2순위'], true)
+      .setAllowInvalid(false).build());
+  sh.getRange(CONFIG.FIRST_ROW, COL.status, dataRows, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList([CONFIG.STATUS_RES, CONFIG.STATUS_HOLD, CONFIG.STATUS_DONE], true)
+      .setAllowInvalid(false)
+      .setHelpText('비워두면 스크립트가 예약/홀딩을 자동 판정합니다.').build());
+
+  // 5) 판정(P) 조건부 서식
+  var pRange = sh.getRange(CONFIG.FIRST_ROW, COL.verdict, dataRows, 1);
+  var rowRange = sh.getRange(CONFIG.FIRST_ROW, 1, dataRows, COL.memo);
+  var rules = keepRules.concat([
+    rule_(pRange, '⚠', '#f4cccc', '#990000'),
+    rule_(pRange, '🔄', '#cfe2f3', '#073763'),
+    rule_(pRange, '⏳', '#fff2cc', '#7f6000'),
+    rule_(pRange, '✅', '#d9ead3', '#274e13'),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=OR($N3="긴급",$N3="0순위")')
+      .setFontColor('#cc0000').setBold(true).setRanges([rowRange]).build(),
+  ]);
+  sh.setConditionalFormatRules(rules);
+
+  // 6) 필터 / 고정
+  var f = sh.getFilter();
+  if (f) f.remove();
+  sh.getRange(CONFIG.HEADER_ROW, 1, Math.max(lastDataRow_(sh), CONFIG.FIRST_ROW) - CONFIG.HEADER_ROW + 1, LAST_COL - 1)
+    .createFilter();
+  sh.setFrozenRows(CONFIG.HEADER_ROW);
+
+  // 7) 메일 로그 시트
+  logSheet_();
+
+  // 8) 트리거 + 첫 계산
+  installTriggers();
+  runAllocation();
+  toast_('초기 설정 완료: 트리거 설치 + 첫 계산');
+}
+
+function rule_(range, text, bg, fg) {
+  return SpreadsheetApp.newConditionalFormatRule()
+    .whenTextContains(text).setBackground(bg).setFontColor(fg).setRanges([range]).build();
+}
+
+// =====================================================================
+// 배분 (우선순위 + 예약/홀딩 판정 + 자동 전환)
+// =====================================================================
+
+function runAllocation() {
+  assertAllowed_();
+  var lock = LockService.getDocumentLock();
+  if (!lock.tryLock(30000)) return;
+  try {
+    var ss = SpreadsheetApp.getActive();
+    var sh = ss.getSheetByName(CONFIG.RES_SHEET);
+    var last = lastDataRow_(sh);
+    if (last < CONFIG.FIRST_ROW) return;
+    var n = last - CONFIG.FIRST_ROW + 1;
+    var values = sh.getRange(CONFIG.FIRST_ROW, 1, n, LAST_COL).getValues();
+    var inventory = readInventory_(ss);
+    var now = new Date();
+
+    var rows = values.map(function (v, i) { return rowFromValues_(v, CONFIG.FIRST_ROW + i); });
+    var result = allocate(rows, inventory, now, CONFIG);
+
+    // 재고 분류(I) 변경분만 개별 기록 (사용자 입력과 충돌 최소화)
+    var conversions = [];
+    result.forEach(function (r) {
+      if (r.newStatus) {
+        sh.getRange(r.row, COL.status).setValue(r.newStatus);
+        if (r.converted) conversions.push(r);
+      }
+    });
+
+    // O~T 일괄 기록
+    var out = values.map(function (v, i) {
+      var r = result[i];
+      var log = String(v[COL.log - 1] || '');
+      if (r.logAppend) log = (log ? log + '\n' : '') + r.logAppend;
+      return [r.order, r.verdict, r.freeNow, r.supply, r.volume, log];
+    });
+    sh.getRange(CONFIG.FIRST_ROW, COL.order, n, 6).setValues(out);
+    SpreadsheetApp.flush();
+
+    if (conversions.length && CONFIG.NOTIFY_TO) {
+      MailApp.sendEmail(CONFIG.NOTIFY_TO, '[예약재고] 홀딩→예약 자동 전환 ' + conversions.length + '건',
+        conversions.map(function (r) {
+          return '- ' + r.row + '행 ' + r.name + ' ' + r.qty + '개 (' + (r.company || r.channel) + ')';
+        }).join('\n') + '\n\n' + ss.getUrl());
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function rowFromValues_(v, rowNum) {
+  return {
+    row: rowNum,
+    created: v[COL.created - 1],
+    useDate: v[COL.useDate - 1],
+    channel: String(v[COL.channel - 1] || '').trim(),
+    name: String(v[COL.name - 1] || '').trim(),
+    qty: v[COL.qty - 1],
+    status: String(v[COL.status - 1] || '').trim(),
+    shipped: String(v[COL.shipped - 1] || '').trim(),
+    company: String(v[COL.company - 1] || '').trim(),
+    priority: String(v[COL.priority - 1] || '').trim(),
+  };
+}
+
+/** [재고관리] → { 상품명: {barcode, stock, inbound:[{date, qty}]} } */
+function readInventory_(ss) {
+  var sh = ss.getSheetByName(CONFIG.INV_SHEET);
+  var last = sh.getLastRow();
+  var v = sh.getRange(4, 1, Math.max(last - 3, 1), 16).getValues(); // A~P
+  var map = {};
+  v.forEach(function (r) {
+    var name = String(r[4] || '').trim(); // E
+    if (!name || map[name]) return;
+    var inbound = [];
+    [[10, 11], [12, 13], [14, 15]].forEach(function (p) { // K/L, M/N, O/P
+      var d = toDate_(r[p[0]], null), q = toNum_(r[p[1]]);
+      if (d && q > 0) inbound.push({ date: d, qty: q });
+    });
+    map[name] = { barcode: String(r[0] || '').trim(), stock: toNum_(r[5]), inbound: inbound };
+  });
+  return map;
+}
+
+/**
+ * 핵심 배분 로직 (순수 함수, 시트 접근 없음).
+ * rows: rowFromValues_ 결과 배열. inventory: readInventory_ 결과.
+ * 반환: rows 와 같은 순서의 결과 배열.
+ */
+function allocate(rows, inventory, now, cfg) {
+  var today = startOfDay_(now);
+  var stamp = fmtDateTime_(now);
+
+  // 업체 누적 출고량 (출고 완료 기준, 업체명 없으면 입고처로 집계)
+  var volume = {};
+  rows.forEach(function (r) {
+    if (!r.name) return;
+    if (r.status === cfg.STATUS_DONE || isShipped_(r)) {
+      var k = companyKey_(r);
+      if (k) volume[k] = (volume[k] || 0) + toNum_(r.qty);
+    }
+  });
+
+  var results = rows.map(function (r) {
+    var k = companyKey_(r);
+    return {
+      row: r.row, name: r.name, qty: toNum_(r.qty), company: r.company, channel: r.channel,
+      order: '', verdict: '', freeNow: '', supply: '',
+      volume: r.name && k ? (volume[k] || 0) : '', newStatus: null, converted: false, logAppend: '',
+    };
+  });
+
+  // 활성 건 (출고 전, 예약/홀딩/미판정)
+  var groups = {};
+  rows.forEach(function (r, i) {
+    if (!r.name) return;
+    if (r.status === cfg.STATUS_DONE || isShipped_(r)) {
+      results[i].verdict = '출고 완료';
+      return;
+    }
+    var kind = r.status.indexOf('예약재고') === 0 ? 'res'
+      : r.status.indexOf('홀딩재고') === 0 ? 'hold'
+      : r.status === '' ? 'new' : 'other';
+    if (kind === 'other') { results[i].verdict = '⚠ 재고 분류 값 확인 필요'; return; }
+    if (!(toNum_(r.qty) > 0)) { results[i].verdict = '⚠ 수량 입력 필요'; return; }
+    if (!inventory[r.name]) { results[i].verdict = '⚠ [재고관리]에 없는 상품명 (상품명 확인)'; return; }
+    (groups[r.name] = groups[r.name] || []).push({ i: i, r: r, kind: kind, key: priorityKey_(r, volume, today, cfg) });
+  });
+
+  Object.keys(groups).forEach(function (name) {
+    var list = groups[name].sort(function (a, b) { return cmpKey_(a.key, b.key); });
+    var inv = inventory[name];
+    var stock = inv.stock;
+    var inbound = inv.inbound.slice().sort(function (a, b) { return a.date - b.date; });
+
+    list.forEach(function (x, idx) { results[x.i].order = idx + 1; });
+
+    // 1) 확정 예약: 순위대로 현재고 점유. 초과분 경고.
+    var firm = 0;
+    list.forEach(function (x) {
+      if (x.kind !== 'res') return;
+      var q = toNum_(x.r.qty);
+      firm += q;
+      var res = results[x.i];
+      res.freeNow = stock - firm;
+      res.verdict = firm <= stock
+        ? '✅ 예약 확정'
+        : '⚠ 확정 예약이 현재고 초과 (' + fmtNum_(Math.min(firm - stock, q)) + '개 부족)';
+    });
+
+    // 2) 홀딩 + 신규: 순위대로 지금 가용재고로 출고 가능하면 예약으로
+    var freeNow = stock - firm;
+    var blocked = false;
+    var aheadHold = 0;
+    list.forEach(function (x) {
+      if (x.kind === 'res') return;
+      var q = toNum_(x.r.qty);
+      var res = results[x.i];
+      res.freeNow = freeNow;
+
+      if (!blocked && freeNow >= q) {
+        freeNow -= q;
+        res.newStatus = cfg.STATUS_RES;
+        if (x.kind === 'hold') {
+          res.converted = true;
+          res.verdict = '🔄 홀딩→예약 자동 전환 (' + stamp + ')';
+          res.logAppend = stamp + ' 홀딩→예약 자동 전환 (가용 ' + fmtNum_(freeNow + q) + ' ≥ ' + fmtNum_(q) + ')';
+        } else {
+          res.verdict = '✅ 예약 확정 (자동 판정)';
+          res.logAppend = stamp + ' 신규 → 예약재고 자동 판정';
+        }
+        return;
+      }
+
+      // 홀딩 유지/지정
+      if (x.kind === 'new') {
+        res.newStatus = cfg.STATUS_HOLD;
+        res.logAppend = stamp + ' 신규 → 홀딩재고 자동 판정 (지금 가용 ' + fmtNum_(Math.max(freeNow, 0)) + ' < ' + fmtNum_(q) + ')';
+      }
+      if (cfg.STRICT_QUEUE) blocked = true;
+
+      var useDate = toDate_(x.r.useDate, today);
+      // 지금 가용에서 앞 순위 홀딩분을 뺀 뒤, 입고예정을 날짜순으로 더해 확보 시점 계산
+      var base = freeNow - aheadHold;
+      var cum = base, okDate = base >= q ? today : null;
+      var supplyByUse = base;
+      inbound.forEach(function (b) {
+        cum += b.qty;
+        if (!okDate && cum >= q) okDate = b.date;
+        if (!useDate || b.date <= useDate) supplyByUse += b.qty;
+      });
+      res.supply = supplyByUse;
+
+      var why = freeNow >= q ? '앞 순위 홀딩 대기 중' : '지금 가용 ' + fmtNum_(Math.max(freeNow, 0)) + '개';
+      if (supplyByUse >= q) {
+        res.verdict = '⏳ 홀딩 · ' + why + ' · 입고 후 출고 가능 (예상 ' + fmtMD_(okDate) + ')';
+      } else if (okDate) {
+        res.verdict = '⚠ 홀딩 · 사용예정일까지 ' + fmtNum_(q - supplyByUse) + '개 부족 · 입고 후 ' + fmtMD_(okDate) + ' 가능';
+      } else {
+        res.verdict = '⚠ 홀딩 · 입고예정 포함 ' + fmtNum_(q - cum) + '개 부족 · 추가 발주 필요';
+      }
+      var lowerFirm = list.filter(function (y) {
+        return y.kind === 'res' && cmpKey_(y.key, x.key) > 0;
+      }).reduce(function (s, y) { return s + toNum_(y.r.qty); }, 0);
+      if (lowerFirm > 0) res.verdict += ' · 하위 순위 확정예약 ' + fmtNum_(lowerFirm) + '개 점유 중';
+      var created = toDate_(x.r.created, today);
+      if (created && (today - created) / 86400000 >= cfg.HOLD_WARN_DAYS) {
+        res.verdict += ' · ⚠ 홀딩 ' + Math.floor((today - created) / 86400000) + '일 경과';
+      }
+      aheadHold += q;
+    });
+  });
+
+  return results;
+}
+
+function priorityKey_(r, volume, today, cfg) {
+  var p = r.priority.replace(/\s/g, '');
+  var urgent = /긴급|0순위/.test(p) ? 0 : 1;
+  var oy = isOliveYoung_(r, cfg) ? 0 : 1;
+  var manual = /1순위/.test(p) ? 1 : /2순위/.test(p) ? 2 : 3;
+  var created = toDate_(r.created, today);
+  var useDate = toDate_(r.useDate, today);
+  var parts = {
+    urgent: urgent,
+    oliveyoung: oy,
+    manual: manual,
+    created: created ? created.getTime() : Infinity,
+    useDate: useDate ? useDate.getTime() : Infinity,
+    volume: -(volume[companyKey_(r)] || 0),
+  };
+  var key = cfg.PRIORITY_ORDER.map(function (k) { return parts[k]; });
+  key.push(r.row);
+  return key;
+}
+
+function cmpKey_(a, b) {
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] < b[i]) return -1;
+    if (a[i] > b[i]) return 1;
+  }
+  return 0;
+}
+
+function isOliveYoung_(r, cfg) {
+  if (r.channel === cfg.OLIVEYOUNG_CHANNEL) return true;
+  var c = r.company.toLowerCase().replace(/\s/g, '');
+  return cfg.OLIVEYOUNG_COMPANY_KEYWORDS.some(function (k) { return c.indexOf(k.replace(/\s/g, '')) >= 0; });
+}
+
+function isShipped_(r) { return /^o$/i.test(r.shipped); }
+function companyKey_(r) { return r.company || r.channel || ''; }
+
+// =====================================================================
+// 메일 발주서 자동 등록
+// =====================================================================
+
+function importMail_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(CONFIG.RES_SHEET);
+  var label = GmailApp.getUserLabelByName(CONFIG.DONE_LABEL) || GmailApp.createLabel(CONFIG.DONE_LABEL);
+  var threads = GmailApp.search(CONFIG.MAIL_QUERY + ' -label:' + CONFIG.DONE_LABEL, 0, 30);
+  if (!threads.length) return 0;
+
+  var existingKeys = {};
+  var last = lastDataRow_(sh);
+  if (last >= CONFIG.FIRST_ROW) {
+    sh.getRange(CONFIG.FIRST_ROW, COL.mailKey, last - CONFIG.FIRST_ROW + 1, 1).getValues()
+      .forEach(function (v) { if (v[0]) existingKeys[v[0]] = true; });
+  }
+  var products = readProducts_(ss);
+  var added = 0;
+
+  threads.forEach(function (th) {
+    var threadOk = true;
+    th.getMessages().forEach(function (msg) {
+      if (!senderAllowed_(msg.getFrom())) return;
+      msg.getAttachments().forEach(function (att) {
+        var fname = att.getName();
+        if (!CONFIG.ATTACHMENT_NAME_PATTERN.test(fname)) return;
+        try {
+          var grid = attachmentToGrid_(att);
+          var parsed = parseOrderGrid(grid, CONFIG.HEADER_ALIASES);
+          if (!parsed.lines.length) throw new Error('헤더(상품명/바코드 + 수량)를 찾지 못함');
+          var company = parsed.company || senderName_(msg.getFrom());
+          var newRows = [];
+          parsed.lines.forEach(function (ln) {
+            var key = msg.getId() + '|' + fname + '|' + ln.sourceRow;
+            if (existingKeys[key]) return;
+            var prod = resolveProduct(ln, products);
+            var row = new Array(LAST_COL);
+            for (var c = 0; c < LAST_COL; c++) row[c] = '';
+            row[COL.created - 1] = startOfDay_(msg.getDate());
+            row[COL.registrant - 1] = CONFIG.MAIL_REGISTRANT;
+            row[COL.useDate - 1] = toDate_(ln.date || parsed.date, msg.getDate()) || '';
+            row[COL.channel - 1] = ln.channel || (isOliveYoung_({ channel: '', company: company }, CONFIG) ? CONFIG.OLIVEYOUNG_CHANNEL : '');
+            row[COL.purpose - 1] = '메일 발주서: ' + msg.getSubject();
+            row[COL.code - 1] = prod.barcode || ln.barcode || '';
+            row[COL.name - 1] = prod.name || ln.name || ln.barcode;
+            row[COL.qty - 1] = ln.qty;
+            row[COL.memo - 1] = [fname, ln.memo].filter(String).join(' / ');
+            row[COL.company - 1] = company;
+            row[COL.mailKey - 1] = key;
+            newRows.push(row);
+            existingKeys[key] = true;
+          });
+          if (newRows.length) {
+            var at = lastDataRow_(sh) + 1;
+            if (at + newRows.length - 1 > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), newRows.length + 50);
+            // A~N, U 만 기록 (O~T 는 재계산이 채움)
+            sh.getRange(at, 1, newRows.length, COL.priority).setValues(newRows.map(function (r) { return r.slice(0, COL.priority); }));
+            sh.getRange(at, COL.mailKey, newRows.length, 1).setValues(newRows.map(function (r) { return [r[COL.mailKey - 1]]; }));
+            added += newRows.length;
+          }
+          writeLog_(msg, fname, '등록 ' + newRows.length + '행' + (parsed.company ? '' : ' (업체명: 보낸사람으로 대체)'));
+        } catch (err) {
+          threadOk = false;
+          writeLog_(msg, fname, '⚠ 실패: ' + err.message);
+        }
+      });
+    });
+    if (threadOk) th.addLabel(label);
+  });
+
+  if (added && CONFIG.NOTIFY_TO) {
+    MailApp.sendEmail(CONFIG.NOTIFY_TO, '[예약재고] 메일 발주서 ' + added + '행 등록', ss.getUrl());
+  }
+  return added;
+}
+
+function senderAllowed_(from) {
+  if (!CONFIG.SENDER_FILTER.length) return true;
+  var f = String(from).toLowerCase();
+  return CONFIG.SENDER_FILTER.some(function (s) { return f.indexOf(s.toLowerCase()) >= 0; });
+}
+
+function senderName_(from) {
+  var m = String(from).match(/^\s*"?([^"<]+?)"?\s*</);
+  return m ? m[1].trim() : String(from).replace(/[<>]/g, '').trim();
+}
+
+/** 첨부 → 2차원 배열. xlsx/xls 는 Drive 고급 서비스로 임시 변환 후 삭제. */
+function attachmentToGrid_(att) {
+  var name = att.getName().toLowerCase();
+  if (/\.csv$/.test(name)) return Utilities.parseCsv(att.getDataAsString('UTF-8'));
+  if (!/\.(xlsx|xls|xlsm)$/.test(name)) throw new Error('지원하지 않는 형식(엑셀/CSV만 가능)');
+  var file = Drive.Files.create(
+    { name: '[임시] ' + att.getName(), mimeType: MimeType.GOOGLE_SHEETS },
+    att.copyBlob());
+  try {
+    var tmp = SpreadsheetApp.openById(file.id);
+    var sheets = tmp.getSheets();
+    // 헤더가 인식되는 첫 번째 탭 사용
+    for (var i = 0; i < sheets.length; i++) {
+      var grid = sheets[i].getDataRange().getValues();
+      if (parseOrderGrid(grid, CONFIG.HEADER_ALIASES).lines.length) return grid;
+    }
+    return sheets[0].getDataRange().getValues();
+  } finally {
+    DriveApp.getFileById(file.id).setTrashed(true);
+  }
+}
+
+/**
+ * 발주서 표 파싱 (순수 함수).
+ * 상단 30행 안에서 (상품명 또는 바코드) + 수량 헤더가 있는 행을 찾고 그 아래 품목을 읽는다.
+ * 업체명/납기가 열이 아니라 "발주처: OO" 같은 라벨 셀로 있으면 그 오른쪽 값을 사용.
+ */
+function parseOrderGrid(grid, aliases) {
+  var norm = function (s) { return String(s == null ? '' : s).toLowerCase().replace(/[\s:：*()\[\]]/g, ''); };
+  var findCol = function (row, keys) {
+    for (var k = 0; k < keys.length; k++) {
+      for (var c = 0; c < row.length; c++) {
+        if (norm(row[c]) && norm(row[c]).indexOf(norm(keys[k])) >= 0) return c;
+      }
+    }
+    return -1;
+  };
+  var hdrRow = -1, cols = {};
+  for (var r = 0; r < Math.min(grid.length, 30); r++) {
+    var row = grid[r];
+    var cName = findCol(row, aliases.name), cBar = findCol(row, aliases.barcode), cQty = findCol(row, aliases.qty);
+    if ((cName >= 0 || cBar >= 0) && cQty >= 0 && cQty !== cName && cQty !== cBar) {
+      hdrRow = r;
+      cols = { name: cName, barcode: cBar, qty: cQty,
+        date: findCol(row, aliases.date), company: findCol(row, aliases.company),
+        channel: findCol(row, aliases.channel), memo: findCol(row, aliases.memo) };
+      break;
+    }
+  }
+  var labelValue = function (keys) {
+    var lim = hdrRow >= 0 ? hdrRow : Math.min(grid.length, 30);
+    for (var r2 = 0; r2 < lim; r2++) {
+      for (var c2 = 0; c2 < grid[r2].length; c2++) {
+        var cell = String(grid[r2][c2] == null ? '' : grid[r2][c2]);
+        for (var k = 0; k < keys.length; k++) {
+          if (norm(cell).indexOf(norm(keys[k])) !== 0) continue;
+          var inline = cell.split(/[:：]/);
+          if (inline.length > 1 && inline[1].trim()) return inline.slice(1).join(':').trim();
+          for (var c3 = c2 + 1; c3 < grid[r2].length; c3++) {
+            if (String(grid[r2][c3]).trim() !== '') return grid[r2][c3];
+          }
+        }
+      }
+    }
+    return '';
+  };
+  var out = { lines: [], company: '', date: '' };
+  out.company = String(labelValue(aliases.company) || '').trim();
+  out.date = labelValue(aliases.date) || '';
+  if (hdrRow < 0) return out;
+
+  var blanks = 0;
+  for (var i = hdrRow + 1; i < grid.length; i++) {
+    var g = grid[i];
+    var get = function (c) { return c >= 0 && c < g.length ? g[c] : ''; };
+    var name = String(get(cols.name) || '').trim();
+    var bar = String(get(cols.barcode) || '').trim().replace(/\.0+$/, '');
+    if (!name && !bar) { if (++blanks >= 3) break; continue; }
+    blanks = 0;
+    if (/합계|총계|소계|total/i.test(name + bar)) continue;
+    var qty = toNum_(get(cols.qty));
+    if (!(qty > 0)) continue;
+    out.lines.push({
+      sourceRow: i + 1, name: name, barcode: bar, qty: qty,
+      date: get(cols.date) || '', company: String(get(cols.company) || '').trim(),
+      channel: String(get(cols.channel) || '').trim(), memo: String(get(cols.memo) || '').trim(),
+    });
+  }
+  if (!out.company) {
+    var cs = out.lines.map(function (l) { return l.company; }).filter(String);
+    if (cs.length) out.company = cs[0];
+  }
+  return out;
+}
+
+/** 상품 목록: [재고관리] A/E + [상품 마스터] E/F */
+function readProducts_(ss) {
+  var list = [];
+  var inv = ss.getSheetByName(CONFIG.INV_SHEET);
+  inv.getRange(4, 1, Math.max(inv.getLastRow() - 3, 1), 5).getValues().forEach(function (r) {
+    if (r[4]) list.push({ barcode: String(r[0]).trim(), name: String(r[4]).trim() });
+  });
+  var ms = ss.getSheetByName(CONFIG.MASTER_SHEET);
+  if (ms) {
+    ms.getRange(3, 5, Math.max(ms.getLastRow() - 2, 1), 2).getValues().forEach(function (r) {
+      if (r[0] && r[1]) list.push({ barcode: String(r[0]).trim(), name: String(r[1]).trim() });
+    });
+  }
+  return list;
+}
+
+/** 바코드 우선, 없으면 상품명(공백 무시 일치 → 포함)으로 [재고관리] 상품명 찾기 */
+function resolveProduct(line, products) {
+  var n = function (s) { return String(s || '').replace(/\s/g, '').toLowerCase(); };
+  if (line.barcode) {
+    var b = products.filter(function (p) { return p.barcode === line.barcode; })[0];
+    if (b) return b;
+  }
+  if (line.name) {
+    var exact = products.filter(function (p) { return n(p.name) === n(line.name); })[0];
+    if (exact) return exact;
+    var part = products.filter(function (p) { return n(p.name).indexOf(n(line.name)) >= 0 || n(line.name).indexOf(n(p.name)) >= 0; });
+    if (part.length === 1) return part[0];
+  }
+  return { barcode: line.barcode || '', name: '' };
+}
+
+function logSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(CONFIG.LOG_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(CONFIG.LOG_SHEET);
+    sh.appendRow(['처리시각', '수신일', '보낸사람', '제목', '첨부파일', '결과']);
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, 6).setFontWeight('bold');
+  }
+  return sh;
+}
+
+function writeLog_(msg, fname, result) {
+  logSheet_().appendRow([new Date(), msg.getDate(), msg.getFrom(), msg.getSubject(), fname, result]);
+}
+
+// =====================================================================
+// 유틸
+// =====================================================================
+
+function isAllowed_() {
+  return CONFIG.ALLOWED_SPREADSHEET_IDS.indexOf(SpreadsheetApp.getActive().getId()) >= 0;
+}
+
+function assertAllowed_() {
+  if (!isAllowed_()) throw new Error('이 스프레드시트는 CONFIG.ALLOWED_SPREADSHEET_IDS 에 없습니다 (본 시트 보호).');
+}
+
+function toast_(msg) {
+  try { SpreadsheetApp.getActive().toast(msg, '예약재고 자동화', 5); } catch (e) { /* 트리거 실행 시 무시 */ }
+}
+
+/** G(상품명) 또는 H(수량)가 있는 마지막 행 */
+function lastDataRow_(sh) {
+  var last = sh.getLastRow();
+  if (last < CONFIG.FIRST_ROW) return CONFIG.FIRST_ROW - 1;
+  var v = sh.getRange(CONFIG.FIRST_ROW, COL.name, last - CONFIG.FIRST_ROW + 1, 2).getValues();
+  for (var i = v.length - 1; i >= 0; i--) {
+    if (String(v[i][0]).trim() !== '' || String(v[i][1]).trim() !== '') return CONFIG.FIRST_ROW + i;
+  }
+  return CONFIG.FIRST_ROW - 1;
+}
+
+function toNum_(v) {
+  if (typeof v === 'number') return v;
+  var s = String(v == null ? '' : v).replace(/[,\s개ea]/gi, '');
+  var n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+function startOfDay_(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+
+/**
+ * 날짜 해석: Date, 시리얼 숫자, "2026-10-15", "10/15", "9/14~9/16"(시작일), "09월 16일".
+ * 연도가 없으면 ref(기준일) 기준 ±6개월 안의 연도로 추정.
+ */
+function toDate_(v, ref) {
+  if (v instanceof Date && !isNaN(v)) return startOfDay_(v);
+  if (typeof v === 'number' && v > 30000 && v < 80000) return new Date(Math.round((v - 25569) * 86400000) + new Date().getTimezoneOffset() * 60000);
+  var s = String(v == null ? '' : v).trim();
+  if (!s) return null;
+  var m = s.match(/(\d{4})[.\-\/년]\s*(\d{1,2})[.\-\/월]\s*(\d{1,2})/);
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+  m = s.match(/(\d{1,2})\s*[\/.월]\s*(\d{1,2})/);
+  if (m) {
+    var base = ref ? startOfDay_(ref) : startOfDay_(new Date());
+    var d = new Date(base.getFullYear(), +m[1] - 1, +m[2]);
+    if (d - base > 183 * 86400000) d.setFullYear(d.getFullYear() - 1);
+    else if (base - d > 183 * 86400000) d.setFullYear(d.getFullYear() + 1);
+    return d;
+  }
+  return null;
+}
+
+function pad_(n) { return (n < 10 ? '0' : '') + n; }
+function fmtMD_(d) { return d ? (d.getMonth() + 1) + '/' + d.getDate() : '-'; }
+function fmtDateTime_(d) {
+  return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad_(d.getHours()) + ':' + pad_(d.getMinutes());
+}
+function fmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+
+// 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
+if (typeof module !== 'undefined') {
+  module.exports = { allocate: allocate, parseOrderGrid: parseOrderGrid, resolveProduct: resolveProduct, toDate_: toDate_, CONFIG: CONFIG };
+}
