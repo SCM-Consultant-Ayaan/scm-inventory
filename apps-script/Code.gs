@@ -65,6 +65,13 @@ var CONFIG = {
 
   // 알림 받을 메일 (비우면 알림 없음). 홀딩→예약 전환, 메일 등록 결과를 보냄.
   NOTIFY_TO: '',
+
+  // ---- 슬랙 알림 ----
+  // 메일 PO 로 신규 예약 건이 등록되면 이 채널로 보낸다.
+  // 토큰은 코드에 넣지 말고 [프로젝트 설정 → 스크립트 속성]에 SLACK_BOT_TOKEN(xoxb-…) 또는 SLACK_WEBHOOK_URL 로 저장.
+  SLACK_CHANNEL: 'C08MB21A4DD',
+  // true 면 홀딩→예약 자동 전환도 알림
+  SLACK_NOTIFY_CONVERSIONS: false,
 };
 
 // [예약 재고 관리] 열 번호 (1-based).
@@ -117,6 +124,7 @@ function onOpen() {
     .addItem('지금 재계산', 'runAllocation')
     .addItem('메일 발주서 가져오기', 'runMailImport')
     .addItem('실패한 메일 다시 시도', 'retryFailedMail')
+    .addItem('슬랙 알림 테스트', 'testSlack')
     .addSeparator()
     .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'setup')
     .addItem('트리거만 다시 설치', 'installTriggers')
@@ -156,10 +164,12 @@ function onEditTrigger(e) {
 /** 10분마다: 메일 확인 → 재계산 (입고되어 현재고가 바뀐 것도 여기서 반영) */
 function runScheduled() {
   if (!isAllowed_()) return;
+  var res = { added: 0, pos: [] };
   if (CONFIG.MAIL_ENABLED) {
-    try { importMail_(); } catch (err) { console.error('메일 처리 오류', err); }
+    try { res = importMail_(); } catch (err) { console.error('메일 처리 오류', err); }
   }
-  runAllocation();
+  var conversions = runAllocation();
+  notifySlack_(res.pos, conversions);
 }
 
 /** [예약재고_등록실패] 라벨을 모두 떼고 다시 가져오기 */
@@ -170,16 +180,16 @@ function retryFailedMail() {
   if (failLabel) {
     failLabel.getThreads(0, 100).forEach(function (t) { t.removeLabel(failLabel); n++; });
   }
-  var added = importMail_();
-  runAllocation();
-  toast_('실패 메일 ' + n + '건 재시도 → ' + added + '행 등록');
+  var res = importMail_();
+  notifySlack_(res.pos, runAllocation());
+  toast_('실패 메일 ' + n + '건 재시도 → ' + res.added + '행 등록');
 }
 
 function runMailImport() {
   assertAllowed_();
-  var n = importMail_();
-  runAllocation();
-  toast_('메일 발주서 ' + n + '건(행) 등록');
+  var res = importMail_();
+  notifySlack_(res.pos, runAllocation());
+  toast_('메일 발주서 ' + res.added + '건(행) 등록');
 }
 
 // =====================================================================
@@ -341,13 +351,13 @@ function rule_(range, text, bg, fg) {
 function runAllocation() {
   assertAllowed_();
   var lock = LockService.getDocumentLock();
-  if (!lock.tryLock(30000)) return;
+  if (!lock.tryLock(30000)) return [];
   try {
     var ss = SpreadsheetApp.getActive();
     var sh = ss.getSheetByName(CONFIG.RES_SHEET);
-    if (!layoutOk_(sh)) { toast_('구조가 최신이 아닙니다. 메뉴에서 "초기 설정"을 먼저 실행하세요.'); return; }
+    if (!layoutOk_(sh)) { toast_('구조가 최신이 아닙니다. 메뉴에서 "초기 설정"을 먼저 실행하세요.'); return []; }
     var last = lastDataRow_(sh);
-    if (last < CONFIG.FIRST_ROW) return;
+    if (last < CONFIG.FIRST_ROW) return [];
     var n = last - CONFIG.FIRST_ROW + 1;
     var values = sh.getRange(CONFIG.FIRST_ROW, 1, n, LAST_COL).getValues();
     var inventory = readInventory_(ss);
@@ -381,6 +391,7 @@ function runAllocation() {
           return '- ' + r.row + '행 ' + r.name + ' ' + r.qty + '개 (' + (r.company || r.channel) + ')';
         }).join('\n') + '\n\n' + ss.getUrl());
     }
+    return conversions;
   } finally {
     lock.releaseLock();
   }
@@ -596,7 +607,8 @@ function companyKey_(r) { return r.company || r.channel || ''; }
 function importMail_() {
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(CONFIG.RES_SHEET);
-  if (!layoutOk_(sh)) return 0;
+  var none = { added: 0, pos: [] };
+  if (!layoutOk_(sh)) return none;
   var label = GmailApp.getUserLabelByName(CONFIG.DONE_LABEL) || GmailApp.createLabel(CONFIG.DONE_LABEL);
   var failLabel = GmailApp.getUserLabelByName(CONFIG.FAIL_LABEL) || GmailApp.createLabel(CONFIG.FAIL_LABEL);
   // Gmail 의 after:YYYY/MM/DD 는 미국 태평양 시간 기준이라 한국 오전 메일이 빠질 수 있음 → 한국 시간 자정의 초 단위로 검색
@@ -604,7 +616,7 @@ function importMail_() {
   var q = CONFIG.MAIL_QUERY + (after ? ' after:' + Math.floor(after.getTime() / 1000) : '') +
     ' -label:' + CONFIG.DONE_LABEL + ' -label:' + CONFIG.FAIL_LABEL;
   var threads = GmailApp.search(q, 0, 30);
-  if (!threads.length) return 0;
+  if (!threads.length) return none;
 
   var existingKeys = {};
   var last = lastDataRow_(sh);
@@ -617,7 +629,7 @@ function importMail_() {
       });
   }
   var products = readProducts_(ss);
-  var added = 0;
+  var added = 0, pos = [];
 
   threads.forEach(function (th) {
     var threadOk = true, touched = false;
@@ -658,6 +670,8 @@ function importMail_() {
           sh.getRange(at, 1, newRows.length, COL.priority).setValues(newRows.map(function (r) { return r.slice(0, COL.priority); }));
           sh.getRange(at, COL.mailKey, newRows.length, 1).setValues(newRows.map(function (r) { return [r[COL.mailKey - 1]]; }));
           added += newRows.length;
+          pos.push({ poNo: po.poNo, company: po.company, purpose: po.purpose, fname: fname,
+            from: msg.getFrom(), firstRow: at, count: newRows.length });
           var unmatched = po.lines.filter(function (ln) { return !resolveProduct(ln, products).name; }).length;
           writeLog_(msg, fname, '등록 ' + newRows.length + '행 · PO ' + po.poNo + ' · ' + po.purpose +
             (unmatched ? ' · ⚠ 상품명 매칭 실패 ' + unmatched + '건' : ''));
@@ -674,7 +688,80 @@ function importMail_() {
   if (added && CONFIG.NOTIFY_TO) {
     MailApp.sendEmail(CONFIG.NOTIFY_TO, '[예약재고] 메일 발주서 ' + added + '행 등록', ss.getUrl());
   }
-  return added;
+  return { added: added, pos: pos };
+}
+
+// =====================================================================
+// 슬랙 알림
+// =====================================================================
+
+/** 신규 등록 PO(판정 결과 포함)와, 설정 시 홀딩→예약 자동 전환을 슬랙으로 보낸다. 실패해도 다른 처리는 계속. */
+function notifySlack_(pos, conversions) {
+  try {
+    pos = pos || [];
+    conversions = CONFIG.SLACK_NOTIFY_CONVERSIONS ? (conversions || []) : [];
+    if (!pos.length && !conversions.length) return;
+    var ss = SpreadsheetApp.getActive();
+    var sh = ss.getSheetByName(CONFIG.RES_SHEET);
+    var base = ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=';
+
+    pos.forEach(function (p) {
+      var rows = sh.getRange(p.firstRow, 1, p.count, LAST_COL).getValues();
+      var lines = rows.map(function (v) {
+        return '• ' + v[COL.name - 1] + ' — *' + fmtNum_(toNum_(v[COL.qty - 1])) + '개* → ' + (v[COL.verdict - 1] || v[COL.status - 1] || '판정 대기');
+      });
+      var text = ':package: *신규 예약 등록 (메일 PO)*\n' +
+        '*PO* ' + p.poNo + '  ·  *업체* ' + (p.company || '-') + '  ·  ' + p.purpose + '\n' +
+        lines.join('\n') + '\n' +
+        '<' + base + 'A' + p.firstRow + '|시트에서 보기 (' + p.firstRow + '행~)>  ·  보낸사람 ' + String(p.from).replace(/[<>]/g, '');
+      postSlack_(text);
+    });
+
+    if (conversions.length) {
+      postSlack_(':arrows_counterclockwise: *홀딩 → 예약 자동 전환 ' + conversions.length + '건*\n' +
+        conversions.map(function (r) {
+          return '• <' + base + 'A' + r.row + '|' + r.row + '행> ' + r.name + ' ' + fmtNum_(r.qty) + '개 (' + (r.company || r.channel || '-') + ')';
+        }).join('\n'));
+    }
+  } catch (err) {
+    console.error('슬랙 알림 실패', err);
+    try { logSheet_().appendRow([new Date(), '', '[슬랙]', '', '', '⚠ 슬랙 알림 실패: ' + err.message]); } catch (e) { /* 무시 */ }
+  }
+}
+
+/** 스크립트 속성의 SLACK_BOT_TOKEN(chat.postMessage) 또는 SLACK_WEBHOOK_URL 로 전송 */
+function postSlack_(text) {
+  var props = PropertiesService.getScriptProperties();
+  var token = props.getProperty('SLACK_BOT_TOKEN');
+  var hook = props.getProperty('SLACK_WEBHOOK_URL');
+  if (token) {
+    var res = UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
+      method: 'post',
+      contentType: 'application/json; charset=utf-8',
+      headers: { Authorization: 'Bearer ' + token },
+      payload: JSON.stringify({ channel: CONFIG.SLACK_CHANNEL, text: text, unfurl_links: false }),
+      muteHttpExceptions: true,
+    });
+    var body = JSON.parse(res.getContentText() || '{}');
+    if (!body.ok) throw new Error('chat.postMessage: ' + (body.error || res.getResponseCode()));
+    return;
+  }
+  if (hook) {
+    var r = UrlFetchApp.fetch(hook, {
+      method: 'post', contentType: 'application/json; charset=utf-8',
+      payload: JSON.stringify({ text: text }), muteHttpExceptions: true,
+    });
+    if (r.getResponseCode() >= 300) throw new Error('webhook ' + r.getResponseCode() + ': ' + r.getContentText());
+    return;
+  }
+  throw new Error('스크립트 속성에 SLACK_BOT_TOKEN 또는 SLACK_WEBHOOK_URL 이 없습니다');
+}
+
+/** 메뉴: 슬랙 연결 확인용 테스트 메시지 */
+function testSlack() {
+  assertAllowed_();
+  postSlack_(':white_check_mark: 예약재고 자동화 슬랙 알림 테스트입니다. 신규 PO 가 등록되면 이 채널로 알려드립니다.');
+  toast_('슬랙 테스트 메시지 전송 완료');
 }
 
 /**
