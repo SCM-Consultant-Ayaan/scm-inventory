@@ -52,9 +52,9 @@ var CONFIG = {
   MAIL_QUERY: 'has:attachment newer_than:14d',
   // 이 날짜 이후 받은 메일만 처리 (이전 메일은 이미 수기 등록된 것으로 간주). 'YYYY/MM/DD', 비우면 제한 없음
   MAIL_AFTER: '2026/10/01',
-  // 첨부파일명 정규식. 회사 표준 PURCHASE ORDER 양식(PO No. 포함)만 읽으므로 이름은 넓게 거른다.
-  // 양식이 아닌 엑셀(제조사 생산·용기 발주서 등)은 내용 확인 후 건너뛴다.
-  ATTACHMENT_NAME_PATTERN: /PO|발주/i,
+  // 첨부파일명 정규식: "[로지킴]업체명_PO No._날짜(표준양식).xlsx" 형식만 처리.
+  // 이름이 맞아도 내용이 PURCHASE ORDER 양식이 아니면 건너뛴다.
+  ATTACHMENT_NAME_PATTERN: /^\s*\[로지킴\].*표준양식/,
   // 보낸 사람 필터 (비우면 전체). 예: ['@followmecorp.com']
   SENDER_FILTER: [],
   DONE_LABEL: '예약재고_등록완료',
