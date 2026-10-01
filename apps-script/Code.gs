@@ -48,13 +48,18 @@ var CONFIG = {
 
   // ---- 메일 발주서 자동 등록 ----
   MAIL_ENABLED: true,
-  // Gmail 검색어. 처리 완료 라벨이 붙은 메일은 제외된다.
+  // Gmail 검색어. 처리 완료/실패 라벨이 붙은 메일은 제외된다.
   MAIL_QUERY: 'has:attachment newer_than:14d',
-  // 첨부파일명 정규식 (이 패턴과 맞는 첨부만 처리). 예: /발주서/ , /^\[로지킴\].*발주/
+  // 이 날짜 이후 받은 메일만 처리 (이전 메일은 이미 수기 등록된 것으로 간주). 'YYYY/MM/DD', 비우면 제한 없음
+  MAIL_AFTER: '2026/10/01',
+  // 첨부파일명 정규식 (이 패턴과 맞는 첨부만 처리). 예: /발주서/ , /BURIDGE.*발주서/
   ATTACHMENT_NAME_PATTERN: /발주서/,
-  // 보낸 사람 필터 (비우면 전체). 예: ['@oliveyoung.co.kr', 'buyer@abc.com']
+  // 제외할 첨부파일명 (우리가 제조사에 보내는 생산·용기 발주서 등)
+  EXCLUDE_ATTACHMENT_PATTERN: /팔로우미코스메틱/,
+  // 보낸 사람 필터 (비우면 전체). 예: ['@buridge.com', '@oliveyoung.co.kr']
   SENDER_FILTER: [],
   DONE_LABEL: '예약재고_등록완료',
+  FAIL_LABEL: '예약재고_등록실패',
   MAIL_REGISTRANT: '메일자동',
 
   // 발주서 헤더 인식용 별칭 (공백 무시, 포함 여부로 매칭)
@@ -589,14 +594,21 @@ function importMail_() {
   var sh = ss.getSheetByName(CONFIG.RES_SHEET);
   if (!layoutOk_(sh)) return 0;
   var label = GmailApp.getUserLabelByName(CONFIG.DONE_LABEL) || GmailApp.createLabel(CONFIG.DONE_LABEL);
-  var threads = GmailApp.search(CONFIG.MAIL_QUERY + ' -label:' + CONFIG.DONE_LABEL, 0, 30);
+  var failLabel = GmailApp.getUserLabelByName(CONFIG.FAIL_LABEL) || GmailApp.createLabel(CONFIG.FAIL_LABEL);
+  var q = CONFIG.MAIL_QUERY + (CONFIG.MAIL_AFTER ? ' after:' + CONFIG.MAIL_AFTER : '') +
+    ' -label:' + CONFIG.DONE_LABEL + ' -label:' + CONFIG.FAIL_LABEL;
+  var threads = GmailApp.search(q, 0, 30);
   if (!threads.length) return 0;
 
   var existingKeys = {};
   var last = lastDataRow_(sh);
   if (last >= CONFIG.FIRST_ROW) {
     sh.getRange(CONFIG.FIRST_ROW, COL.mailKey, last - CONFIG.FIRST_ROW + 1, 1).getValues()
-      .forEach(function (v) { if (v[0]) existingKeys[v[0]] = true; });
+      .forEach(function (v) {
+        if (!v[0]) return;
+        existingKeys[v[0]] = true;
+        existingKeys[String(v[0]).split('|')[0]] = true; // 파일 단위 키
+      });
   }
   var products = readProducts_(ss);
   var added = 0;
@@ -608,6 +620,10 @@ function importMail_() {
       msg.getAttachments().forEach(function (att) {
         var fname = att.getName();
         if (!CONFIG.ATTACHMENT_NAME_PATTERN.test(fname)) return;
+        if (CONFIG.EXCLUDE_ATTACHMENT_PATTERN && CONFIG.EXCLUDE_ATTACHMENT_PATTERN.test(fname)) return;
+        // 같은 파일이 회신/전달로 여러 번 와도 한 번만 등록 (파일 내용 기준)
+        var hash = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, att.getBytes()));
+        if (existingKeys['h:' + hash]) return;
         try {
           var grid = attachmentToGrid_(att);
           var parsed = parseOrderGrid(grid, CONFIG.HEADER_ALIASES);
@@ -615,7 +631,7 @@ function importMail_() {
           var company = parsed.company || senderName_(msg.getFrom());
           var newRows = [];
           parsed.lines.forEach(function (ln) {
-            var key = msg.getId() + '|' + fname + '|' + ln.sourceRow;
+            var key = 'h:' + hash + '|' + ln.sourceRow;
             if (existingKeys[key]) return;
             var prod = resolveProduct(ln, products);
             var row = new Array(LAST_COL);
@@ -634,6 +650,7 @@ function importMail_() {
             newRows.push(row);
             existingKeys[key] = true;
           });
+          existingKeys['h:' + hash] = true;
           if (newRows.length) {
             var at = lastDataRow_(sh) + 1;
             if (at + newRows.length - 1 > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), newRows.length + 50);
@@ -649,7 +666,8 @@ function importMail_() {
         }
       });
     });
-    if (threadOk) th.addLabel(label);
+    // 실패한 메일은 실패 라벨로 빼서 10분마다 반복 시도하지 않음 (라벨을 지우면 다시 시도)
+    th.addLabel(threadOk ? label : failLabel);
   });
 
   if (added && CONFIG.NOTIFY_TO) {
@@ -674,11 +692,9 @@ function attachmentToGrid_(att) {
   var name = att.getName().toLowerCase();
   if (/\.csv$/.test(name)) return Utilities.parseCsv(att.getDataAsString('UTF-8'));
   if (!/\.(xlsx|xls|xlsm)$/.test(name)) throw new Error('지원하지 않는 형식(엑셀/CSV만 가능)');
-  var file = Drive.Files.create(
-    { name: '[임시] ' + att.getName(), mimeType: MimeType.GOOGLE_SHEETS },
-    att.copyBlob());
+  var fileId = convertToSheet_(att);
   try {
-    var tmp = SpreadsheetApp.openById(file.id);
+    var tmp = SpreadsheetApp.openById(fileId);
     var sheets = tmp.getSheets();
     // 헤더가 인식되는 첫 번째 탭 사용
     for (var i = 0; i < sheets.length; i++) {
@@ -687,8 +703,31 @@ function attachmentToGrid_(att) {
     }
     return sheets[0].getDataRange().getValues();
   } finally {
-    DriveApp.getFileById(file.id).setTrashed(true);
+    DriveApp.getFileById(fileId).setTrashed(true);
   }
+}
+
+/** 엑셀 첨부를 임시 구글 시트로 변환하고 ID 반환. Drive 고급 서비스가 없으면 Drive API 를 직접 호출. */
+function convertToSheet_(att) {
+  var meta = { name: '[임시] ' + att.getName(), mimeType: MimeType.GOOGLE_SHEETS };
+  if (typeof Drive !== 'undefined' && Drive.Files && Drive.Files.create) {
+    return Drive.Files.create(meta, att.copyBlob()).id;
+  }
+  var boundary = 'rsv' + Date.now();
+  var head = '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + JSON.stringify(meta) +
+    '\r\n--' + boundary + '\r\nContent-Type: ' + (att.getContentType() || 'application/octet-stream') + '\r\n\r\n';
+  var body = Utilities.newBlob(head).getBytes()
+    .concat(att.getBytes())
+    .concat(Utilities.newBlob('\r\n--' + boundary + '--').getBytes());
+  var res = UrlFetchApp.fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+    method: 'post',
+    contentType: 'multipart/related; boundary=' + boundary,
+    payload: body,
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() >= 300) throw new Error('엑셀 변환 실패 (' + res.getResponseCode() + ')');
+  return JSON.parse(res.getContentText()).id;
 }
 
 /**
