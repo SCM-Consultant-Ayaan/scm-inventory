@@ -72,21 +72,23 @@ var CONFIG = {
   NOTIFY_TO: '',
 };
 
-// [예약 재고 관리] 열 번호 (1-based). A~L 은 기존 구조 유지 (다른 시트 수식이 참조).
+// [예약 재고 관리] 열 번호 (1-based).
+// 다른 시트 수식이 작성일자·사용예정일·제품코드·상품명·수량·재고분류·출고여부 열을 참조하지만,
+// 열 삽입/삭제는 시트가 참조를 자동으로 옮겨주므로 setup 으로만 구조를 바꾼다.
 var COL = {
   created: 1,   // A 작성 일자
   registrant: 2,// B 등록자
   useDate: 3,   // C 사용 예정일
   channel: 4,   // D 입고처
-  purpose: 5,   // E 용도
-  code: 6,      // F 제품코드
-  name: 7,      // G 상품명
-  qty: 8,       // H 예약 재고 수량
-  status: 9,    // I 재고 분류
-  applied: 10,  // J 실재고 반영일
-  shipped: 11,  // K 최종 출고 여부
-  memo: 12,     // L 비고
-  company: 13,  // M 업체명            (입력)
+  company: 5,   // E 업체명            (입력)
+  purpose: 6,   // F 용도
+  code: 7,      // G 제품코드
+  name: 8,      // H 상품명
+  qty: 9,       // I 예약 재고 수량
+  status: 10,   // J 재고 분류
+  applied: 11,  // K 실재고 반영일
+  shipped: 12,  // L 최종 출고 여부
+  memo: 13,     // M 비고
   priority: 14, // N 우선순위(수동)    (입력)
   order: 15,    // O 처리 순번         (자동)
   verdict: 16,  // P 판정              (자동)
@@ -99,7 +101,7 @@ var COL = {
 var LAST_COL = 21;
 
 var NEW_HEADERS = {
-  13: '업체명',
+  5: '업체명',
   14: '우선순위\n(긴급/0순위/1순위/2순위)',
   15: '처리 순번\n(상품별, 자동)',
   16: '판정 (자동)',
@@ -120,7 +122,7 @@ function onOpen() {
     .addItem('지금 재계산', 'runAllocation')
     .addItem('메일 발주서 가져오기', 'runMailImport')
     .addSeparator()
-    .addItem('초기 설정 (구조 변경 + 트리거 설치)', 'setup')
+    .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'setup')
     .addItem('트리거만 다시 설치', 'installTriggers')
     .addItem('자동화 중지 (트리거 삭제)', 'removeTriggers')
     .addToUi();
@@ -172,48 +174,97 @@ function runMailImport() {
 }
 
 // =====================================================================
-// 초기 설정 (구조 변경)
+// 초기 설정 (구조 변경) — 여러 번 실행해도 안전
 // =====================================================================
+
+/**
+ * 시트 구조 상태
+ *  original : 처음 상태 (E=용도, M~AE 에 예전 보조 수식/메모)
+ *  v1       : 1차 setup 후 (E=용도, M=업체명, N~U 자동 열)
+ *  final    : 현재 구조 (E=업체명, F=용도, N~U)
+ */
+function layoutState_(sh) {
+  var h = sh.getRange(CONFIG.HEADER_ROW, 1, 1, 13).getValues()[0].map(function (v) { return String(v).trim(); });
+  if (h[4] === '업체명' && h[5] === '용도') return 'final';
+  if (h[4] === '용도' && h[12] === '업체명') return 'v1';
+  if (h[4] === '용도') return 'original';
+  return 'unknown';
+}
+
+function layoutOk_(sh) { return layoutState_(sh) === 'final'; }
 
 function setup() {
   assertAllowed_();
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(CONFIG.RES_SHEET);
   if (!sh) throw new Error('시트 없음: ' + CONFIG.RES_SHEET);
-  var maxRows = sh.getMaxRows();
-  var maxCols = sh.getMaxColumns();
-  if (maxCols < 31) sh.insertColumnsAfter(maxCols, 31 - maxCols);
+  var lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    var state = layoutState_(sh);
+    if (state === 'unknown') throw new Error('[예약 재고 관리] 2행 헤더를 인식하지 못했습니다 (E2 가 용도/업체명이어야 함).');
+    var maxRows = sh.getMaxRows();
 
-  // 1) 기존 M~T 참고 메모(리드타임 표 등)를 별도 시트로 보관
-  if (!ss.getSheetByName(CONFIG.MEMO_SHEET)) {
-    var memo = ss.insertSheet(CONFIG.MEMO_SHEET);
-    var src = sh.getRange(1, 13, 15, 8).getValues();
-    memo.getRange(1, 1, 15, 8).setValues(src);
-    memo.getRange(1, 10).setValue('※ [예약 재고 관리] M:T 에 있던 메모를 구조 변경 시 옮겨둔 것');
+    if (state === 'original') {
+      // 기존 M~T 참고 메모(리드타임 표 등)를 별도 시트로 보관
+      if (!ss.getSheetByName(CONFIG.MEMO_SHEET)) {
+        var memo = ss.insertSheet(CONFIG.MEMO_SHEET);
+        memo.getRange(1, 1, 15, 8).setValues(sh.getRange(1, 13, 15, 8).getValues());
+        memo.getRange(1, 10).setValue('※ [예약 재고 관리] M:T 에 있던 메모를 구조 변경 시 옮겨둔 것');
+      }
+      // 예전 보조 열(M~AE) 정리 후, 용도 왼쪽에 업체명 열 삽입
+      if (sh.getMaxColumns() < 31) sh.insertColumnsAfter(sh.getMaxColumns(), 31 - sh.getMaxColumns());
+      clearCols_(sh, 13, 31 - 12);
+      sh.insertColumnBefore(5);
+      clearCols_(sh, 5, 1);
+    } else if (state === 'v1') {
+      // M(업체명)을 E 로 이동: E 앞에 빈 열 삽입 → 업체명(N 으로 밀림) 복사 → 원래 열 삭제
+      sh.insertColumnBefore(5);
+      clearCols_(sh, 5, 1);
+      sh.getRange(1, 14, maxRows, 1).copyTo(sh.getRange(1, 5, maxRows, 1));
+      sh.deleteColumn(14);
+    }
+    applyLayout_(sh);
+  } finally {
+    lock.releaseLock();
+  }
+  logSheet_();
+  installTriggers();
+  runAllocation();
+  toast_('설정 완료: 구조 확인 + 트리거 설치 + 재계산');
+}
+
+function clearCols_(sh, col, n) {
+  var rg = sh.getRange(1, col, sh.getMaxRows(), n);
+  rg.clearContent().clearDataValidations().clearNote();
+  rg.setBackground(null).setFontColor(null).setFontWeight('normal');
+}
+
+/** 헤더·서식·입력 규칙·조건부 서식·필터 적용 (입력값/자동값은 지우지 않음) */
+function applyLayout_(sh) {
+  var maxRows = sh.getMaxRows();
+  var dataRows = maxRows - CONFIG.FIRST_ROW + 1;
+  if (sh.getMaxColumns() > LAST_COL) {
+    sh.getRange(1, LAST_COL + 1, maxRows, sh.getMaxColumns() - LAST_COL).clearContent().clearDataValidations();
   }
 
-  // 2) 기존 M~AE (보조 수식 V~AA, AC1 FILTER, 조건부서식 등) 정리
-  var clearRange = sh.getRange(1, 13, maxRows, 31 - 12);
-  clearRange.clearContent().clearDataValidations().clearNote();
-  clearRange.setBackground(null).setFontColor(null).setFontWeight('normal');
-  var keepRules = sh.getConditionalFormatRules().filter(function (r) {
-    return r.getRanges().every(function (rg) { return rg.getColumn() < 13; });
-  });
-
-  // 3) 새 헤더
   Object.keys(NEW_HEADERS).forEach(function (c) {
     sh.getRange(CONFIG.HEADER_ROW, Number(c)).setValue(NEW_HEADERS[c]);
   });
-  sh.getRange(1, COL.company).setValue('▼ 입력: 업체명 / 우선순위(긴급·0순위는 올리브영보다 우선)');
-  sh.getRange(1, COL.order).setValue('▼ 자동 계산 (직접 수정 금지) · 재고 분류(I) 비워두면 자동 판정');
-  var hdr = sh.getRange(CONFIG.HEADER_ROW, COL.company, 1, LAST_COL - COL.company + 1);
+  sh.getRange(1, COL.company).setValue('▼ 입력 (누적 출고량 기준)');
+  sh.getRange(1, COL.priority).setValue('▼ 입력: 긴급·0순위는 올리브영보다 우선');
+  sh.getRange(1, COL.order).setValue('▼ 자동 계산 (직접 수정 금지) · 재고 분류 비워두면 자동 판정');
+  [COL.company, COL.priority].forEach(function (c) {
+    sh.getRange(CONFIG.HEADER_ROW, c).setBackground('#fff2cc');
+    sh.getRange(1, c).setFontColor('#7f6000');
+  });
+  sh.getRange(1, COL.order).setFontColor('#595959');
+  var hdr = sh.getRange(CONFIG.HEADER_ROW, COL.priority, 1, LAST_COL - COL.priority + 1);
   hdr.setFontWeight('bold').setWrap(true).setVerticalAlignment('middle').setHorizontalAlignment('center');
-  sh.getRange(CONFIG.HEADER_ROW, COL.company, 1, 2).setBackground('#fff2cc');
+  sh.getRange(CONFIG.HEADER_ROW, COL.company).setFontWeight('bold').setWrap(true)
+    .setVerticalAlignment('middle').setHorizontalAlignment('center');
   sh.getRange(CONFIG.HEADER_ROW, COL.order, 1, COL.log - COL.order + 1).setBackground('#d9d9d9');
-  sh.getRange(1, COL.company, 1, 2).setFontColor('#7f6000');
-  sh.getRange(1, COL.order, 1, 6).setFontColor('#595959');
-  sh.getRange(CONFIG.FIRST_ROW, COL.order, maxRows - CONFIG.FIRST_ROW + 1, COL.log - COL.order + 1)
-    .setBackground('#f3f3f3');
+  sh.getRange(CONFIG.FIRST_ROW, COL.order, dataRows, COL.log - COL.order + 1).setBackground('#f3f3f3');
   sh.setColumnWidth(COL.company, 120);
   sh.setColumnWidth(COL.priority, 110);
   sh.setColumnWidth(COL.order, 80);
@@ -223,10 +274,9 @@ function setup() {
   sh.setColumnWidth(COL.volume, 90);
   sh.setColumnWidth(COL.log, 260);
   sh.hideColumns(COL.mailKey);
-  sh.getRange(CONFIG.FIRST_ROW, COL.freeNow, maxRows - CONFIG.FIRST_ROW + 1, 3).setNumberFormat('#,##0');
+  sh.getRange(CONFIG.FIRST_ROW, COL.freeNow, dataRows, 3).setNumberFormat('#,##0');
 
-  // 4) 입력 규칙: 우선순위 드롭다운, 재고 분류 드롭다운(빈칸 허용 = 자동 판정)
-  var dataRows = maxRows - CONFIG.FIRST_ROW + 1;
+  // 입력 규칙: 우선순위 드롭다운, 재고 분류 드롭다운(빈칸 허용 = 자동 판정)
   sh.getRange(CONFIG.FIRST_ROW, COL.priority, dataRows, 1).setDataValidation(
     SpreadsheetApp.newDataValidation()
       .requireValueInList(['긴급', '0순위', '1순위', '2순위'], true)
@@ -237,34 +287,37 @@ function setup() {
       .setAllowInvalid(false)
       .setHelpText('비워두면 스크립트가 예약/홀딩을 자동 판정합니다.').build());
 
-  // 5) 판정(P) 조건부 서식
+  // 조건부 서식: 사용자 규칙(A~M, 자동화 규칙 아님)은 유지하고 자동화 규칙은 다시 생성
   var pRange = sh.getRange(CONFIG.FIRST_ROW, COL.verdict, dataRows, 1);
   var rowRange = sh.getRange(CONFIG.FIRST_ROW, 1, dataRows, COL.memo);
-  var rules = keepRules.concat([
+  var pr = columnLetter_(COL.priority);
+  var keep = sh.getConditionalFormatRules().filter(function (r) {
+    var bc = r.getBooleanCondition();
+    var vals = bc ? bc.getCriteriaValues().join(' ') : '';
+    if (/긴급/.test(vals)) return false;
+    return r.getRanges().every(function (rg) { return rg.getLastColumn() < COL.priority; });
+  });
+  sh.setConditionalFormatRules(keep.concat([
     rule_(pRange, '⚠', '#f4cccc', '#990000'),
     rule_(pRange, '🔄', '#cfe2f3', '#073763'),
     rule_(pRange, '⏳', '#fff2cc', '#7f6000'),
     rule_(pRange, '✅', '#d9ead3', '#274e13'),
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=OR($N3="긴급",$N3="0순위")')
+      .whenFormulaSatisfied('=OR($' + pr + CONFIG.FIRST_ROW + '="긴급",$' + pr + CONFIG.FIRST_ROW + '="0순위")')
       .setFontColor('#cc0000').setBold(true).setRanges([rowRange]).build(),
-  ]);
-  sh.setConditionalFormatRules(rules);
+  ]));
 
-  // 6) 필터 / 고정
   var f = sh.getFilter();
   if (f) f.remove();
-  sh.getRange(CONFIG.HEADER_ROW, 1, Math.max(lastDataRow_(sh), CONFIG.FIRST_ROW) - CONFIG.HEADER_ROW + 1, LAST_COL - 1)
+  sh.getRange(CONFIG.HEADER_ROW, 1, Math.max(lastDataRow_(sh), CONFIG.FIRST_ROW) - CONFIG.HEADER_ROW + 1, COL.log)
     .createFilter();
   sh.setFrozenRows(CONFIG.HEADER_ROW);
+}
 
-  // 7) 메일 로그 시트
-  logSheet_();
-
-  // 8) 트리거 + 첫 계산
-  installTriggers();
-  runAllocation();
-  toast_('초기 설정 완료: 트리거 설치 + 첫 계산');
+function columnLetter_(c) {
+  var s = '';
+  while (c > 0) { var m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); }
+  return s;
 }
 
 function rule_(range, text, bg, fg) {
@@ -283,6 +336,7 @@ function runAllocation() {
   try {
     var ss = SpreadsheetApp.getActive();
     var sh = ss.getSheetByName(CONFIG.RES_SHEET);
+    if (!layoutOk_(sh)) { toast_('구조가 최신이 아닙니다. 메뉴에서 "초기 설정"을 먼저 실행하세요.'); return; }
     var last = lastDataRow_(sh);
     if (last < CONFIG.FIRST_ROW) return;
     var n = last - CONFIG.FIRST_ROW + 1;
@@ -293,7 +347,7 @@ function runAllocation() {
     var rows = values.map(function (v, i) { return rowFromValues_(v, CONFIG.FIRST_ROW + i); });
     var result = allocate(rows, inventory, now, CONFIG);
 
-    // 재고 분류(I) 변경분만 개별 기록 (사용자 입력과 충돌 최소화)
+    // 재고 분류(J) 변경분만 개별 기록 (사용자 입력과 충돌 최소화)
     var conversions = [];
     result.forEach(function (r) {
       if (r.newStatus) {
@@ -533,6 +587,7 @@ function companyKey_(r) { return r.company || r.channel || ''; }
 function importMail_() {
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(CONFIG.RES_SHEET);
+  if (!layoutOk_(sh)) return 0;
   var label = GmailApp.getUserLabelByName(CONFIG.DONE_LABEL) || GmailApp.createLabel(CONFIG.DONE_LABEL);
   var threads = GmailApp.search(CONFIG.MAIL_QUERY + ' -label:' + CONFIG.DONE_LABEL, 0, 30);
   if (!threads.length) return 0;
@@ -824,5 +879,5 @@ function fmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { allocate: allocate, parseOrderGrid: parseOrderGrid, resolveProduct: resolveProduct, toDate_: toDate_, CONFIG: CONFIG };
+  module.exports = { columnLetter_: columnLetter_, allocate: allocate, parseOrderGrid: parseOrderGrid, resolveProduct: resolveProduct, toDate_: toDate_, CONFIG: CONFIG };
 }
