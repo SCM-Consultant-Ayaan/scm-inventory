@@ -116,6 +116,7 @@ function onOpen() {
     .createMenu('📦 예약재고 자동화')
     .addItem('지금 재계산', 'runAllocation')
     .addItem('메일 발주서 가져오기', 'runMailImport')
+    .addItem('실패한 메일 다시 시도', 'retryFailedMail')
     .addSeparator()
     .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'setup')
     .addItem('트리거만 다시 설치', 'installTriggers')
@@ -159,6 +160,19 @@ function runScheduled() {
     try { importMail_(); } catch (err) { console.error('메일 처리 오류', err); }
   }
   runAllocation();
+}
+
+/** [예약재고_등록실패] 라벨을 모두 떼고 다시 가져오기 */
+function retryFailedMail() {
+  assertAllowed_();
+  var failLabel = GmailApp.getUserLabelByName(CONFIG.FAIL_LABEL);
+  var n = 0;
+  if (failLabel) {
+    failLabel.getThreads(0, 100).forEach(function (t) { t.removeLabel(failLabel); n++; });
+  }
+  var added = importMail_();
+  runAllocation();
+  toast_('실패 메일 ' + n + '건 재시도 → ' + added + '행 등록');
 }
 
 function runMailImport() {
@@ -707,7 +721,7 @@ function senderAllowed_(from) {
  * 직접 읽기에 실패한 경우(.xls 등)에만 임시 구글 시트로 변환해 읽는다.
  */
 function attachmentToGrid_(att) {
-  var grids = null;
+  var grids = null, directErr = '';
   try {
     var blob = att.copyBlob().setContentType('application/zip');
     var parts = {};
@@ -717,12 +731,18 @@ function attachmentToGrid_(att) {
     grids = xlsxGrids(parts);
   } catch (e) {
     grids = null;
+    directErr = e.message;
   }
   if (grids && grids.length) {
     for (var g = 0; g < grids.length; g++) if (parsePurchaseOrder(grids[g])) return grids[g];
     return grids[0];
   }
-  var fileId = convertToSheet_(att);
+  var fileId;
+  try {
+    fileId = convertToSheet_(att);
+  } catch (e) {
+    throw new Error('엑셀 직접 읽기 실패(' + (directErr || '구조 인식 불가') + ') · 구글 시트 변환도 실패(' + e.message + ')');
+  }
   try {
     var tmp = SpreadsheetApp.openById(fileId);
     var sheets = tmp.getSheets();
