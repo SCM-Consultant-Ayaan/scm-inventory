@@ -4,7 +4,8 @@
  *  - [예약 재고 관리] 우선순위 자동 계산
  *  - 신규 요청 → 예약재고 / 홀딩재고 자동 판정 (현재고·확정예약·앞순위 홀딩·입고예정 반영)
  *  - 홀딩재고 → 예약재고 자동 전환 (가용재고만으로 출고 가능해졌을 때)
- *  - Gmail 발주서 첨부(엑셀/CSV) → [예약 재고 관리] 자동 등록
+ *  - Gmail 발주서 첨부(회사 표준 PURCHASE ORDER 엑셀) → [예약 재고 관리] 자동 등록 + 슬랙 알림
+ *  - 업체별 묶음 출고 계획(14일 단위) + 출고 D-5 / D-3 / 당일 슬랙 알림
  *
  * 설치 방법은 apps-script/README.md 참고.
  * CONFIG.ALLOWED_SPREADSHEET_IDS 에 있는 시트에서만 동작한다 (본 시트 보호).
@@ -396,7 +397,7 @@ function runAllocation() {
       return [r.order, verdict, r.freeNow, r.supply, r.volume, log];
     });
     sh.getRange(CONFIG.FIRST_ROW, COL.order, n, 6).setValues(out);
-    writeBundleSheet_(ss, sh, bundles, now);
+    writeBundleSheet_(ss, bundles, now);
     SpreadsheetApp.flush();
 
     if (conversions.length && CONFIG.NOTIFY_TO) {
@@ -789,10 +790,9 @@ function bundleKey_(r) {
 }
 
 /** [묶음출고계획] 시트를 다시 그린다 */
-function writeBundleSheet_(ss, resSheet, bundles, now) {
+function writeBundleSheet_(ss, bundles, now) {
   var sh = ss.getSheetByName(CONFIG.BUNDLE_SHEET) || ss.insertSheet(CONFIG.BUNDLE_SHEET);
-  var base = ss.getUrl() + '#gid=' + resSheet.getSheetId() + '&range=';
-  var header = ['묶음', '업체/구분', '출고 예정일', 'D-day', '상태', '건수', '총 수량', '용도', '품목 (행: 상품명 수량 · 판정)'];
+  var header = ['묶음', '업체/구분', '출고 예정일', 'D-day', '상태', '건수', '총 수량', '용도', '품목 (행: 상품명 수량)'];
   var data = bundles.map(function (b) {
     var state = !b.ship ? '⚠ 재고 확보일 미정' : b.notReady ? '⚠ 재고 미확보 ' + b.notReady + '건 포함' : '✅ 출고 가능';
     if (b.overdue) state += ' · 사용예정일 경과';
