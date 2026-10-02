@@ -61,7 +61,7 @@ var CONFIG = {
   DONE_LABEL: '예약재고_등록완료',
   FAIL_LABEL: '예약재고_등록실패',
   MAIL_REGISTRANT: '메일자동',
-  // PO 로 등록하는 건의 입고처(D)
+  // PO 로 등록하는 건의 입고처(E)
   PO_CHANNEL: '수출',
 
   // 알림 받을 메일 (비우면 알림 없음). 홀딩→예약 전환, 메일 등록 결과를 보냄.
@@ -91,37 +91,39 @@ var COL = {
   created: 1,   // A 작성 일자
   registrant: 2,// B 등록자
   useDate: 3,   // C 사용 예정일
-  channel: 4,   // D 입고처
-  company: 5,   // E 업체명            (입력)
-  purpose: 6,   // F 용도
-  code: 7,      // G 제품코드
-  name: 8,      // H 상품명
-  qty: 9,       // I 예약 재고 수량
-  status: 10,   // J 재고 분류
-  applied: 11,  // K 실재고 반영일
-  shipped: 12,  // L 최종 출고 여부
-  memo: 13,     // M 비고
-  priority: 14, // N 우선순위(수동)    (입력)
-  order: 15,    // O 처리 순번         (자동)
-  verdict: 16,  // P 판정              (자동)
-  freeNow: 17,  // Q 지금 가용재고     (자동)
-  supply: 18,   // R 사용예정일까지 확보가능 (자동)
-  volume: 19,   // S 업체 누적 출고량  (자동)
-  log: 20,      // T 자동 처리 이력    (자동)
-  mailKey: 21,  // U 메일 키 (숨김)
+  shipDate: 4,  // D 출고 예정일       (자동: 묶음 출고 기준)
+  channel: 5,   // E 입고처
+  company: 6,   // F 업체명            (입력)
+  purpose: 7,   // G 용도
+  code: 8,      // H 제품코드
+  name: 9,      // I 상품명
+  qty: 10,      // J 예약 재고 수량
+  status: 11,   // K 재고 분류
+  applied: 12,  // L 실재고 반영일
+  shipped: 13,  // M 최종 출고 여부
+  memo: 14,     // N 비고
+  priority: 15, // O 우선순위(수동)    (입력)
+  order: 16,    // P 처리 순번         (자동)
+  verdict: 17,  // Q 판정              (자동)
+  freeNow: 18,  // R 지금 가용재고     (자동)
+  supply: 19,   // S 사용예정일까지 확보가능 (자동)
+  volume: 20,   // T 업체 누적 출고량  (자동)
+  log: 21,      // U 자동 처리 이력    (자동)
+  mailKey: 22,  // V 메일 키 (숨김)
 };
-var LAST_COL = 21;
+var LAST_COL = 22;
 
 var NEW_HEADERS = {
-  5: '업체명',
-  14: '우선순위\n(긴급/0순위/1순위/2순위)',
-  15: '처리 순번\n(상품별, 자동)',
-  16: '판정 (자동)',
-  17: '지금 가용재고\n(앞 순위 차감 후)',
-  18: '사용예정일까지\n확보 가능 수량',
-  19: '업체 누적\n출고량',
-  20: '자동 처리 이력',
-  21: '메일키',
+  4: '출고 예정일\n(자동·묶음 기준)',
+  6: '업체명',
+  15: '우선순위\n(긴급/0순위/1순위/2순위)',
+  16: '처리 순번\n(상품별, 자동)',
+  17: '판정 (자동)',
+  18: '지금 가용재고\n(앞 순위 차감 후)',
+  19: '사용예정일까지\n확보 가능 수량',
+  20: '업체 누적\n출고량',
+  21: '자동 처리 이력',
+  22: '메일키',
 };
 
 // =====================================================================
@@ -160,7 +162,7 @@ function removeTriggers() {
   });
 }
 
-/** 설치형 onEdit: [예약 재고 관리] A~N 수정 시 재계산 */
+/** 설치형 onEdit: [예약 재고 관리] A~O(입력 열) 수정 시 재계산 */
 function onEditTrigger(e) {
   try {
     if (!e || !e.range) return;
@@ -209,14 +211,16 @@ function runMailImport() {
 // =====================================================================
 
 /**
- * 시트 구조 상태
+ * 시트 구조 상태 (2행 헤더로 판별)
  *  original : 처음 상태 (E=용도, M~AE 에 예전 보조 수식/메모)
- *  v1       : 1차 setup 후 (E=용도, M=업체명, N~U 자동 열)
- *  final    : 현재 구조 (E=업체명, F=용도, N~U)
+ *  v1       : 1차 setup 후 (E=용도, M=업체명)
+ *  v2       : E=업체명, F=용도 (출고 예정일 열 없음)
+ *  final    : 현재 구조 (D=출고 예정일, E=입고처, F=업체명, G=용도 … O=우선순위, P~V 자동)
  */
 function layoutState_(sh) {
-  var h = sh.getRange(CONFIG.HEADER_ROW, 1, 1, 13).getValues()[0].map(function (v) { return String(v).trim(); });
-  if (h[4] === '업체명' && h[5] === '용도') return 'final';
+  var h = sh.getRange(CONFIG.HEADER_ROW, 1, 1, 14).getValues()[0].map(function (v) { return String(v).trim(); });
+  if (/^출고 예정일/.test(h[3]) && h[5] === '업체명' && h[6] === '용도') return 'final';
+  if (h[4] === '업체명' && h[5] === '용도') return 'v2';
   if (h[4] === '용도' && h[12] === '업체명') return 'v1';
   if (h[4] === '용도') return 'original';
   return 'unknown';
@@ -233,9 +237,10 @@ function setup() {
   lock.waitLock(30000);
   try {
     var state = layoutState_(sh);
-    if (state === 'unknown') throw new Error('[예약 재고 관리] 2행 헤더를 인식하지 못했습니다 (E2 가 용도/업체명이어야 함).');
+    if (state === 'unknown') throw new Error('[예약 재고 관리] 2행 헤더를 인식하지 못했습니다 (E2/F2 가 용도·업체명이어야 함).');
     var maxRows = sh.getMaxRows();
 
+    // 열 이동은 모두 시트의 열 삽입/삭제로 한다 → 다른 시트 수식의 참조가 자동으로 따라온다
     if (state === 'original') {
       // 기존 M~T 참고 메모(리드타임 표 등)를 별도 시트로 보관
       if (!ss.getSheetByName(CONFIG.MEMO_SHEET)) {
@@ -248,12 +253,21 @@ function setup() {
       clearCols_(sh, 13, 31 - 12);
       sh.insertColumnBefore(5);
       clearCols_(sh, 5, 1);
+      sh.getRange(CONFIG.HEADER_ROW, 5).setValue('업체명');
+      state = 'v2';
     } else if (state === 'v1') {
       // M(업체명)을 E 로 이동: E 앞에 빈 열 삽입 → 업체명(N 으로 밀림) 복사 → 원래 열 삭제
       sh.insertColumnBefore(5);
       clearCols_(sh, 5, 1);
       sh.getRange(1, 14, maxRows, 1).copyTo(sh.getRange(1, 5, maxRows, 1));
       sh.deleteColumn(14);
+      state = 'v2';
+    }
+    if (state === 'v2') {
+      // 사용 예정일(C) 오른쪽에 출고 예정일(D) 열 삽입 → 입고처부터 한 칸씩 밀림
+      sh.insertColumnBefore(4);
+      clearCols_(sh, 4, 1);
+      sh.getRange(CONFIG.HEADER_ROW, 4).setValue(NEW_HEADERS[4]);
     }
     applyLayout_(sh);
   } finally {
@@ -290,6 +304,11 @@ function applyLayout_(sh) {
     sh.getRange(1, c).setFontColor('#7f6000');
   });
   sh.getRange(1, COL.order).setFontColor('#595959');
+  sh.getRange(1, COL.shipDate).setValue('▼ 자동 (묶음 출고일)').setFontColor('#595959');
+  sh.getRange(CONFIG.HEADER_ROW, COL.shipDate).setBackground('#d9d9d9').setFontWeight('bold').setWrap(true)
+    .setVerticalAlignment('middle').setHorizontalAlignment('center');
+  sh.getRange(CONFIG.FIRST_ROW, COL.shipDate, dataRows, 1).setBackground('#f3f3f3').setNumberFormat('m/d (ddd)');
+  sh.setColumnWidth(COL.shipDate, 95);
   var hdr = sh.getRange(CONFIG.HEADER_ROW, COL.priority, 1, LAST_COL - COL.priority + 1);
   hdr.setFontWeight('bold').setWrap(true).setVerticalAlignment('middle').setHorizontalAlignment('center');
   sh.getRange(CONFIG.HEADER_ROW, COL.company).setFontWeight('bold').setWrap(true)
@@ -379,7 +398,7 @@ function runAllocation() {
     var result = allocate(rows, inventory, now, CONFIG);
     var bundles = planBundles(rows, result, now, CONFIG);
 
-    // 재고 분류(J) 변경분만 개별 기록 (사용자 입력과 충돌 최소화)
+    // 재고 분류(K) 변경분만 개별 기록 (사용자 입력과 충돌 최소화)
     var conversions = [];
     result.forEach(function (r) {
       if (r.newStatus) {
@@ -388,7 +407,7 @@ function runAllocation() {
       }
     });
 
-    // O~T 일괄 기록
+    // P~U 일괄 기록
     var out = values.map(function (v, i) {
       var r = result[i];
       var log = String(v[COL.log - 1] || '');
@@ -397,6 +416,12 @@ function runAllocation() {
       return [r.order, verdict, r.freeNow, r.supply, r.volume, log];
     });
     sh.getRange(CONFIG.FIRST_ROW, COL.order, n, 6).setValues(out);
+    // D 출고 예정일: 출고 전 건만 갱신 (출고 완료 건은 마지막 값을 기록으로 남김)
+    sh.getRange(CONFIG.FIRST_ROW, COL.shipDate, n, 1).setValues(values.map(function (v, i) {
+      var r = result[i];
+      if (r.active) return [r.shipDate || ''];
+      return [r.name ? v[COL.shipDate - 1] : ''];
+    }));
     writeBundleSheet_(ss, bundles, now);
     SpreadsheetApp.flush();
 
@@ -687,7 +712,7 @@ function importMail_() {
           existingKeys[poKey] = true;
           var at = lastDataRow_(sh) + 1;
           if (at + newRows.length - 1 > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), newRows.length + 50);
-          // A~N, U 만 기록 (O~T 는 재계산이 채움)
+          // A~O, V 만 기록 (P~U·D 는 재계산이 채움)
           sh.getRange(at, 1, newRows.length, COL.priority).setValues(newRows.map(function (r) { return r.slice(0, COL.priority); }));
           sh.getRange(at, COL.mailKey, newRows.length, 1).setValues(newRows.map(function (r) { return [r[COL.mailKey - 1]]; }));
           added += newRows.length;
@@ -776,6 +801,7 @@ function planBundles(rows, results, now, cfg) {
     b.dday = b.ship ? Math.round((b.ship - today) / DAY) : null;
     b.purposes = b.items.map(function (it) { return it.r.purpose; }).filter(function (v, k, a) { return v && a.indexOf(v) === k; });
     b.items.forEach(function (it) {
+      results[it.i].shipDate = b.ship || '미정';
       results[it.i].bundle = b.id + (b.ship ? ' · ' + fmtMD_(b.ship) + ' 출고' : ' · 출고일 미정') +
         (b.items.length > 1 ? ' (' + b.items.length + '건 묶음)' : '');
     });
@@ -864,7 +890,7 @@ function sendShipAlert_() {
   });
   if (overdue.length) {
     lines.push('');
-    lines.push(':rotating_light: 사용 예정일이 지났는데 출고 완료되지 않은 묶음 *' + overdue.length + '건* — 출고 여부(L열) 확인 필요');
+    lines.push(':rotating_light: 사용 예정일이 지났는데 출고 완료되지 않은 묶음 *' + overdue.length + '건* — 출고 여부(M열) 확인 필요');
   }
   lines.push('<' + planUrl + '|묶음출고계획 시트 열기>');
   postSlack_(lines.join('\n'));
@@ -1245,7 +1271,7 @@ function toast_(msg) {
   try { SpreadsheetApp.getActive().toast(msg, '예약재고 자동화', 5); } catch (e) { /* 트리거 실행 시 무시 */ }
 }
 
-/** 상품명(H) 또는 수량(I)이 있는 마지막 행 */
+/** 상품명(I) 또는 수량(J)이 있는 마지막 행 */
 function lastDataRow_(sh) {
   var last = sh.getLastRow();
   if (last < CONFIG.FIRST_ROW) return CONFIG.FIRST_ROW - 1;
