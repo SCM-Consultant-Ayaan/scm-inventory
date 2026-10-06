@@ -152,17 +152,25 @@ function rsvInstallTriggers() {
   rsvAssertAllowed_();
   rsvRemoveTriggers();
   var ss = SpreadsheetApp.getActive();
-  ScriptApp.newTrigger('rsvOnOpen').forSpreadsheet(ss).onOpen().create();
+  rsvInstallMenu();
   ScriptApp.newTrigger('rsvOnEditTrigger').forSpreadsheet(ss).onEdit().create();
   ScriptApp.newTrigger('rsvRunScheduled').timeBased().everyMinutes(10).create();
   ScriptApp.newTrigger('rsvDailyShipAlert').timeBased().everyDays(1).atHour(RSV_CONFIG.SHIP_ALERT_HOUR)
     .inTimezone('Asia/Seoul').create();
 }
 
+/** 메뉴(📦 예약재고 자동화)만 붙이는 열기 트리거 설치. 자동화를 꺼둔 시트에서도 메뉴는 쓸 수 있다. */
+function rsvInstallMenu() {
+  rsvAssertAllowed_();
+  var has = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'rsvOnOpen'; });
+  if (!has) ScriptApp.newTrigger('rsvOnOpen').forSpreadsheet(SpreadsheetApp.getActive()).onOpen().create();
+}
+
+/** 자동화 중지: 수정 시 재계산·10분 메일 확인·출고 알림 트리거 삭제 (메뉴는 남김) */
 function rsvRemoveTriggers() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     var fn = t.getHandlerFunction();
-    if (['rsvOnOpen', 'rsvOnEditTrigger', 'rsvRunScheduled', 'rsvDailyShipAlert'].indexOf(fn) >= 0) ScriptApp.deleteTrigger(t);
+    if (['rsvOnEditTrigger', 'rsvRunScheduled', 'rsvDailyShipAlert'].indexOf(fn) >= 0) ScriptApp.deleteTrigger(t);
   });
 }
 
