@@ -16,8 +16,8 @@
 var RSV_CONFIG = {
   // 이 스크립트가 동작해도 되는 스프레드시트 ID. 본 시트 적용 시 여기에 본 시트 ID를 추가.
   ALLOWED_SPREADSHEET_IDS: [
-    '1g8sxsQ1luqqUT98kUqyT9sOgikOiiNkAA_MNXTNeOVo', // 본 시트 ([MD] 발주 / 재고 관리)
-    // '18E5ikb8UmjBJgdgAU2ezfIwc-MqmgqSGp48AwOkD79I', // 테스트 시트 (본 시트 적용 후 사용 중지)
+    '18E5ikb8UmjBJgdgAU2ezfIwc-MqmgqSGp48AwOkD79I', // 사본 시트 ([MD] 발주 / 재고 관리 (사본 - 신규 발주 시뮬레이터))
+    // '1g8sxsQ1luqqUT98kUqyT9sOgikOiiNkAA_MNXTNeOVo', // 본 시트 (적용할 때 주석 해제)
   ],
 
   RES_SHEET: '예약 재고 관리',
@@ -76,6 +76,10 @@ var RSV_CONFIG = {
   SLACK_CHANNEL: 'C08MB21A4DD',
   // true 면 홀딩→예약 자동 전환도 알림
   SLACK_NOTIFY_CONVERSIONS: false,
+  // 신규 PO 알림 스레드에 이 패턴의 답글이 달리면 그 PO 의 행을 재고 분류 '출고 완료'로 바꾼다 (봇 토큰 + channels:history 필요)
+  SHIP_DONE_REPLY: /출고\s*완료/,
+  // 이 일수가 지난 스레드는 더 이상 확인하지 않음
+  SLACK_THREAD_DAYS: 60,
 
   // ---- 묶음 출고 / 출고 예정 알림 ----
   // 같은 업체 건 중 출고 희망일(C 사용 예정일)이 이 일수 안에 있으면 한 번에 출고하도록 묶는다
@@ -86,8 +90,6 @@ var RSV_CONFIG = {
   SHIP_ALERT_HOUR: 9,
   // 출고일까지 남은 일수가 이 값일 때 알림 (0 = 당일)
   SHIP_ALERT_DAYS: [5, 3, 0],
-  // 신규 등록(메일 PO) 알림은 모아두었다가 매일 이 시각(시)에 한 번에 보냄 (10분 확인 주기라 10:00~10:10 사이 전송)
-  DIGEST_HOUR: 10,
   // 공휴일·회사 휴무일 목록 시트 (A열 날짜). 없으면 2026~2027 공휴일로 자동 생성
   HOLIDAY_SHEET: '휴무일',
 };
@@ -145,8 +147,8 @@ function rsvOnOpen() {
     .addItem('메일 발주서 가져오기', 'rsvRunMailImport')
     .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
     .addItem('슬랙 알림 테스트', 'rsvTestSlack')
-    .addItem('신규 등록 알림 지금 보내기', 'rsvSendDigestNow')
     .addItem('출고 예정 알림 지금 보내기', 'rsvSendShipAlertNow')
+    .addItem('슬랙 "출고완료" 답글 지금 확인', 'rsvCheckSlackNow')
     .addSeparator()
     .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'rsvSetup')
     .addItem('트리거만 다시 설치', 'rsvInstallTriggers')
@@ -201,8 +203,8 @@ function rsvRunScheduled() {
   if (RSV_CONFIG.MAIL_ENABLED) {
     try { res = rsvImportMail_(); } catch (err) { console.error('메일 처리 오류', err); }
   }
+  try { rsvCheckSlackThreads_(); } catch (err) { console.error('슬랙 스레드 확인 오류', err); }
   rsvNotifySlack_(res.pos, rsvRunAllocation().conversions);
-  rsvMaybeSendDigest_();
 }
 
 /** [예약재고_등록실패] 라벨을 모두 떼고 다시 가져오기 */
@@ -222,7 +224,7 @@ function rsvRunMailImport() {
   rsvAssertAllowed_();
   var res = rsvImportMail_();
   rsvNotifySlack_(res.pos, rsvRunAllocation().conversions);
-  rsvToast_('메일 발주서 ' + res.added + '건(행) 등록' + (res.added ? ' · 슬랙은 ' + RSV_CONFIG.DIGEST_HOUR + '시에 모아서 전송 (지금 보내기: 메뉴)' : ''));
+  rsvToast_('메일 발주서 ' + res.added + '건(행) 등록');
 }
 
 // =====================================================================
@@ -996,119 +998,65 @@ function rsvIsBusinessDay_(d, holidays) {
 // =====================================================================
 
 /**
- * 신규 등록 PO 는 바로 보내지 않고 모아둔다 (매일 DIGEST_HOUR 시에 한 번에 전송).
- * 설정 시 홀딩→예약 자동 전환은 바로 보낸다. 실패해도 다른 처리는 계속.
+ * 신규 등록 PO 를 건마다 바로 슬랙으로 보낸다 (판정 결과 포함). 보낸 메시지는 스레드 확인 대상으로 기억한다.
+ * 설정 시 홀딩→예약 자동 전환도 보낸다. 실패해도 다른 처리는 계속.
  */
 function rsvNotifySlack_(pos, conversions) {
   try {
-    if (pos && pos.length) rsvQueuePos_(pos);
+    pos = pos || [];
     conversions = RSV_CONFIG.SLACK_NOTIFY_CONVERSIONS ? (conversions || []) : [];
-    if (!conversions.length) return;
+    if (!pos.length && !conversions.length) return;
     var ss = SpreadsheetApp.getActive();
     var sh = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
     var base = ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=';
-    rsvPostSlack_(':arrows_counterclockwise: *홀딩 → 예약 자동 전환 ' + conversions.length + '건*\n' +
-      conversions.map(function (r) {
-        return '• <' + base + 'A' + r.row + '|' + r.row + '행> ' + r.name + ' ' + rsvFmtNum_(r.qty) + '개 (' + (r.company || r.channel || '-') + ')';
-      }).join('\n'));
+
+    pos.forEach(function (p) {
+      var rows = sh.getRange(p.firstRow, 1, p.count, RSV_LAST_COL).getValues();
+      var lines = rows.map(function (v) {
+        return '• ' + v[RSV_COL.name - 1] + ' — *' + rsvFmtNum_(rsvToNum_(v[RSV_COL.qty - 1])) + '개* → ' + (v[RSV_COL.verdict - 1] || v[RSV_COL.status - 1] || '판정 대기');
+      });
+      var text = ':package: *신규 예약 등록 (메일 PO)*\n' +
+        '*PO* ' + p.poNo + '  ·  *업체* ' + (p.company || '-') + '  ·  ' + p.purpose + '\n' +
+        lines.join('\n') + '\n' +
+        '<' + base + 'A' + p.firstRow + '|시트에서 보기 (' + p.firstRow + '행~)>  ·  보낸사람 ' + String(p.from).replace(/[<>]/g, '') + '\n' +
+        '_출고하면 이 스레드에 "출고완료" 라고 답글을 달아주세요 → 시트 재고 분류가 자동으로 출고 완료로 바뀝니다_';
+      var sent = rsvPostSlack_(text);
+      if (sent && sent.ts) rsvTrackThread_(sent.ts, p.poNo);
+    });
+
+    if (conversions.length) {
+      rsvPostSlack_(':arrows_counterclockwise: *홀딩 → 예약 자동 전환 ' + conversions.length + '건*\n' +
+        conversions.map(function (r) {
+          return '• <' + base + 'A' + r.row + '|' + r.row + '행> ' + r.name + ' ' + rsvFmtNum_(r.qty) + '개 (' + (r.company || r.channel || '-') + ')';
+        }).join('\n'));
+    }
   } catch (err) {
     console.error('슬랙 알림 실패', err);
     try { rsvLogSheet_().appendRow([new Date(), '', '[슬랙]', '', '', '⚠ 슬랙 알림 실패: ' + err.message]); } catch (e) { /* 무시 */ }
   }
 }
 
-/** 신규 등록 PO 를 알림 대기열(스크립트 속성)에 추가 */
-function rsvQueuePos_(pos) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(20000);
-  try {
-    var props = PropertiesService.getScriptProperties();
-    var q = JSON.parse(props.getProperty('RSV_PENDING_POS') || '[]');
-    pos.forEach(function (p) {
-      q.push({ poNo: p.poNo, company: p.company, purpose: p.purpose, from: String(p.from).replace(/[<>]/g, ''), at: rsvFmtDateTime_(new Date()) });
-    });
-    props.setProperty('RSV_PENDING_POS', JSON.stringify(q));
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-/** 10분 주기에서 호출: DIGEST_HOUR 시가 지났고 오늘 아직 안 보냈으면 모아둔 신규 등록을 보냄 */
-function rsvMaybeSendDigest_() {
-  try {
-    var now = new Date();
-    if (now.getHours() < RSV_CONFIG.DIGEST_HOUR) return;
-    var props = PropertiesService.getScriptProperties();
-    var todayKey = rsvFmtYMD_(now);
-    if (props.getProperty('DIGEST_SENT') === todayKey) return;
-    rsvSendDigest_();
-    props.setProperty('DIGEST_SENT', todayKey);
-  } catch (err) {
-    console.error('신규 등록 알림 실패', err);
-    try { rsvLogSheet_().appendRow([new Date(), '', '[슬랙]', '', '', '⚠ 신규 등록 알림 실패: ' + err.message]); } catch (e) { /* 무시 */ }
-  }
-}
-
-/** 메뉴: 모아둔 신규 등록 알림을 지금 보내기 */
-function rsvSendDigestNow() {
-  rsvAssertAllowed_();
-  var n = rsvSendDigest_();
-  rsvToast_(n ? '신규 등록 알림 전송 (PO ' + n + '건)' : '보낼 신규 등록이 없습니다');
-}
-
-/** 대기열의 PO 를 현재 시트 상태(판정 포함)로 한 메시지에 묶어 보내고 대기열을 비운다. 보낸 PO 수 반환. */
-function rsvSendDigest_() {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(20000);
-  try {
-    var props = PropertiesService.getScriptProperties();
-    var q = JSON.parse(props.getProperty('RSV_PENDING_POS') || '[]');
-    if (!q.length) return 0;
-    var ss = SpreadsheetApp.getActive();
-    var sh = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
-    var base = ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=';
-    var last = rsvLastDataRow_(sh);
-    var values = last >= RSV_CONFIG.FIRST_ROW
-      ? sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues() : [];
-    var total = 0;
-    var blocks = q.map(function (p) {
-      var prefix = 'po:' + p.poNo + '|', first = 0;
-      var lines = [];
-      values.forEach(function (v, i) {
-        if (String(v[RSV_COL.mailKey - 1]).indexOf(prefix) !== 0) return;
-        if (!first) first = RSV_CONFIG.FIRST_ROW + i;
-        total += rsvToNum_(v[RSV_COL.qty - 1]);
-        lines.push('• ' + v[RSV_COL.name - 1] + ' — *' + rsvFmtNum_(rsvToNum_(v[RSV_COL.qty - 1])) + '개* → ' +
-          (v[RSV_COL.verdict - 1] || v[RSV_COL.status - 1] || '판정 대기'));
-      });
-      return '*PO* ' + p.poNo + '  ·  *업체* ' + (p.company || '-') + '  ·  ' + p.purpose + '\n' +
-        (lines.length ? lines.join('\n') : '_시트에서 삭제됨_') + '\n' +
-        (first ? '<' + base + 'A' + first + '|시트에서 보기 (' + first + '행~)>  ·  ' : '') + '수신 ' + p.at + '  ·  보낸사람 ' + p.from;
-    });
-    rsvPostSlack_(':package: *신규 예약 등록 (메일 PO ' + q.length + '건, 총 ' + rsvFmtNum_(total) + '개)*\n\n' + blocks.join('\n\n'));
-    props.deleteProperty('RSV_PENDING_POS');
-    return q.length;
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-/** 스크립트 속성의 SLACK_BOT_TOKEN(chat.postMessage) 또는 SLACK_WEBHOOK_URL 로 전송 */
-function rsvPostSlack_(text) {
+/**
+ * 스크립트 속성의 SLACK_BOT_TOKEN(chat.postMessage) 또는 SLACK_WEBHOOK_URL 로 전송.
+ * threadTs 를 주면 그 스레드에 답글로 보낸다. 봇 토큰이면 응답(ts 포함)을 반환.
+ */
+function rsvPostSlack_(text, threadTs) {
   var props = PropertiesService.getScriptProperties();
   var token = props.getProperty('SLACK_BOT_TOKEN');
   var hook = props.getProperty('SLACK_WEBHOOK_URL');
   if (token) {
+    var payload = { channel: RSV_CONFIG.SLACK_CHANNEL, text: text, unfurl_links: false };
+    if (threadTs) payload.thread_ts = threadTs;
     var res = UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
       method: 'post',
       contentType: 'application/json; charset=utf-8',
       headers: { Authorization: 'Bearer ' + token },
-      payload: JSON.stringify({ channel: RSV_CONFIG.SLACK_CHANNEL, text: text, unfurl_links: false }),
+      payload: JSON.stringify(payload),
       muteHttpExceptions: true,
     });
     var body = JSON.parse(res.getContentText() || '{}');
     if (!body.ok) throw new Error('chat.postMessage: ' + (body.error || res.getResponseCode()));
-    return;
+    return body;
   }
   if (hook) {
     var r = UrlFetchApp.fetch(hook, {
@@ -1116,9 +1064,129 @@ function rsvPostSlack_(text) {
       payload: JSON.stringify({ text: text }), muteHttpExceptions: true,
     });
     if (r.getResponseCode() >= 300) throw new Error('webhook ' + r.getResponseCode() + ': ' + r.getContentText());
-    return;
+    return null;
   }
   throw new Error('스크립트 속성에 SLACK_BOT_TOKEN 또는 SLACK_WEBHOOK_URL 이 없습니다');
+}
+
+// =====================================================================
+// 슬랙 스레드 답글 → 출고 완료
+// =====================================================================
+
+/** 확인할 스레드 목록 {ts: {po, at}} (스크립트 속성) */
+function rsvThreads_() {
+  return JSON.parse(PropertiesService.getScriptProperties().getProperty('RSV_SLACK_THREADS') || '{}');
+}
+
+function rsvSaveThreads_(map) {
+  PropertiesService.getScriptProperties().setProperty('RSV_SLACK_THREADS', JSON.stringify(map));
+}
+
+function rsvTrackThread_(ts, poNo) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var map = rsvThreads_();
+    map[ts] = { po: poNo, at: Date.now() };
+    rsvSaveThreads_(map);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** 메뉴: 슬랙 스레드 답글을 지금 확인 (10분을 기다리지 않고) */
+function rsvCheckSlackNow() {
+  rsvAssertAllowed_();
+  var n = rsvCheckSlackThreads_();
+  if (n) rsvRunAllocation();
+  rsvToast_(n ? n + '행을 출고 완료로 변경' : '새 "출고완료" 답글 없음 (확인 중인 스레드 ' + Object.keys(rsvThreads_()).length + '개)');
+}
+
+/** 답글이 출고 완료 신호인지 (순수 함수). 봇이 쓴 글은 제외. */
+function rsvIsShipDoneReply(msg, cfg) {
+  if (!msg || msg.bot_id || (msg.subtype && msg.subtype !== 'thread_broadcast')) return false;
+  return cfg.SHIP_DONE_REPLY.test(String(msg.text || ''));
+}
+
+/**
+ * 10분마다: 신규 PO 알림 스레드의 답글을 확인해 "출고완료" 가 있으면 그 PO 의 행을 K열 '출고 완료' 로 바꾼다.
+ * 처리했거나, 행이 모두 출고 완료됐거나, 시트에서 지워졌거나, 오래된 스레드는 목록에서 뺀다.
+ */
+function rsvCheckSlackThreads_() {
+  var props = PropertiesService.getScriptProperties();
+  var token = props.getProperty('SLACK_BOT_TOKEN');
+  if (!token) return 0;
+  var map = rsvThreads_();
+  var keys = Object.keys(map);
+  if (!keys.length) return 0;
+
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(sh);
+  if (last < RSV_CONFIG.FIRST_ROW) return 0;
+  var n = last - RSV_CONFIG.FIRST_ROW + 1;
+  var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, n, RSV_LAST_COL).getValues();
+  var changed = false, doneCount = 0;
+
+  for (var k = 0; k < keys.length; k++) {
+    var ts = keys[k], entry = map[ts];
+    var prefix = 'po:' + entry.po + '|';
+    var idx = [];
+    values.forEach(function (v, i) { if (String(v[RSV_COL.mailKey - 1]).indexOf(prefix) === 0) idx.push(i); });
+    var open = idx.filter(function (i) { return String(values[i][RSV_COL.status - 1]).trim() !== RSV_CONFIG.STATUS_DONE; });
+    if (!idx.length || !open.length || Date.now() - entry.at > RSV_CONFIG.SLACK_THREAD_DAYS * 86400000) {
+      delete map[ts]; changed = true; continue;
+    }
+
+    var res = UrlFetchApp.fetch('https://slack.com/api/conversations.replies?channel=' + encodeURIComponent(RSV_CONFIG.SLACK_CHANNEL) +
+      '&ts=' + encodeURIComponent(ts) + '&limit=200', { headers: { Authorization: 'Bearer ' + token }, muteHttpExceptions: true });
+    var body = JSON.parse(res.getContentText() || '{}');
+    if (!body.ok) {
+      if (body.error === 'thread_not_found' || body.error === 'message_not_found') { delete map[ts]; changed = true; continue; }
+      rsvWarnOnce_('슬랙 스레드 확인 실패: ' + body.error +
+        (body.error === 'missing_scope' ? ' (슬랙 앱에 channels:history, groups:history 권한 추가 후 재설치 필요)' : ''));
+      break;
+    }
+    var hit = (body.messages || []).slice(1).filter(function (m) { return rsvIsShipDoneReply(m, RSV_CONFIG); })[0];
+    if (!hit) continue;
+
+    var stamp = rsvFmtDateTime_(new Date());
+    open.forEach(function (i) {
+      var row = RSV_CONFIG.FIRST_ROW + i;
+      var log = String(values[i][RSV_COL.log - 1] || '');
+      sh.getRange(row, RSV_COL.status).setValue(RSV_CONFIG.STATUS_DONE);
+      sh.getRange(row, RSV_COL.log).setValue((log ? log + '\n' : '') + stamp + ' 슬랙 스레드 답글("' +
+        String(hit.text).slice(0, 30) + '")로 출고 완료 처리');
+      values[i][RSV_COL.status - 1] = RSV_CONFIG.STATUS_DONE;
+    });
+    doneCount += open.length;
+    try {
+      rsvPostSlack_(':white_check_mark: PO ' + entry.po + ' — ' + open.length + '행을 *출고 완료* 로 바꿨습니다 (' +
+        open.map(function (i) { return (RSV_CONFIG.FIRST_ROW + i) + '행'; }).join(', ') + ')', ts);
+    } catch (e) { console.error(e); }
+    delete map[ts]; changed = true;
+  }
+  if (changed) {
+    var lock = LockService.getScriptLock();
+    lock.waitLock(20000);
+    try {
+      // 확인 중에 새로 추가된 스레드는 살린다
+      var latest = rsvThreads_();
+      Object.keys(latest).forEach(function (t) { if (keys.indexOf(t) < 0) map[t] = latest[t]; });
+      rsvSaveThreads_(map);
+    } finally {
+      lock.releaseLock();
+    }
+  }
+  return doneCount;
+}
+
+/** 같은 경고는 하루 한 번만 [메일수신로그]에 남긴다 */
+function rsvWarnOnce_(msg) {
+  var props = PropertiesService.getScriptProperties();
+  var key = rsvFmtYMD_(new Date()) + msg;
+  if (props.getProperty('RSV_LAST_WARN') === key) return;
+  props.setProperty('RSV_LAST_WARN', key);
+  try { rsvLogSheet_().appendRow([new Date(), '', '[슬랙]', '', '', '⚠ ' + msg]); } catch (e) { /* 무시 */ }
 }
 
 /** 메뉴: 슬랙 연결 확인용 테스트 메시지 */
@@ -1523,5 +1591,5 @@ function rsvFmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
+  module.exports = { rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
 }
