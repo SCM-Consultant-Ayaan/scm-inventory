@@ -14,7 +14,8 @@
 var CONFIG = {
   // 이 스크립트가 동작해도 되는 스프레드시트 ID. 본 시트 적용 시 여기에 본 시트 ID를 추가.
   ALLOWED_SPREADSHEET_IDS: [
-    '18E5ikb8UmjBJgdgAU2ezfIwc-MqmgqSGp48AwOkD79I', // 테스트 시트
+    '1g8sxsQ1luqqUT98kUqyT9sOgikOiiNkAA_MNXTNeOVo', // 본 시트 ([MD] 발주 / 재고 관리)
+    // '18E5ikb8UmjBJgdgAU2ezfIwc-MqmgqSGp48AwOkD79I', // 테스트 시트 (본 시트 적용 후 사용 중지)
   ],
 
   RES_SHEET: '예약 재고 관리',
@@ -52,7 +53,7 @@ var CONFIG = {
   // Gmail 검색어. 처리 완료/실패 라벨이 붙은 메일은 제외된다.
   MAIL_QUERY: 'has:attachment newer_than:14d',
   // 이 날짜 이후 받은 메일만 처리 (이전 메일은 이미 수기 등록된 것으로 간주). 'YYYY/MM/DD', 비우면 제한 없음
-  MAIL_AFTER: '2026/10/01',
+  MAIL_AFTER: '2026/10/06', // 본 시트 적용일. 이전 PO 는 수기 등록분과 겹치지 않도록 제외
   // 첨부파일명 정규식: "[로지킴]" 으로 시작하는 엑셀만 처리. 예: [로지킴]플루고_PO 26100101_261001.xlsx
   // 이름이 맞아도 내용이 PURCHASE ORDER 양식이 아니면 건너뛴다.
   ATTACHMENT_NAME_PATTERN: /^\s*\[로지킴\]/,
