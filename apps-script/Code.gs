@@ -348,6 +348,7 @@ function rsvApplyLayout_(sh) {
   sh.setColumnWidth(RSV_COL.volume, 90);
   sh.setColumnWidth(RSV_COL.log, 260);
   sh.hideColumns(RSV_COL.mailKey);
+  rsvHeaderNotes_(sh);
   sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.freeNow, dataRows, 3).setNumberFormat('#,##0');
 
   // 입력 규칙: 우선순위 드롭다운, 재고 분류 드롭다운(빈칸 허용 = 자동 판정)
@@ -386,6 +387,13 @@ function rsvApplyLayout_(sh) {
   sh.getRange(RSV_CONFIG.HEADER_ROW, 1, Math.max(rsvLastDataRow_(sh), RSV_CONFIG.FIRST_ROW) - RSV_CONFIG.HEADER_ROW + 1, RSV_COL.log)
     .createFilter();
   sh.setFrozenRows(RSV_CONFIG.HEADER_ROW);
+}
+
+/** R·S·T 헤더에 계산 방법 메모 */
+function rsvHeaderNotes_(sh) {
+  sh.getRange(RSV_CONFIG.HEADER_ROW, RSV_COL.freeNow).setNote('[재고관리] 현재고 − 같은 상품의 출고 전 예약재고 합계\n· 예약재고 행: 처리 순번(P)이 자기 이하인 예약재고까지 뺌\n· 홀딩재고 행: 모든 예약재고를 뺌\n음수면 확정 예약이 현재고보다 많다는 뜻');
+  sh.getRange(RSV_CONFIG.HEADER_ROW, RSV_COL.supply).setNote('홀딩재고 행만 계산\n= 지금 가용재고(R) − 같은 상품에서 순번이 앞선 홀딩재고 수량\n  + [재고관리] 1~3차 입고예정 중 사용 예정일(C) 이전에 들어오는 수량\n이 값이 수량(J) 이상이면 사용 예정일까지 출고 가능');
+  sh.getRange(RSV_CONFIG.HEADER_ROW, RSV_COL.volume).setNote('같은 업체(F 업체명, 비어 있으면 E 입고처) 행 중\n재고 분류(K)가 출고 완료이거나 최종 출고 여부(M)가 O 인 수량 합계\n→ 우선순위 마지막 기준(많을수록 앞)');
 }
 
 function rsvColumnLetter_(c) {
@@ -431,15 +439,21 @@ function rsvRunAllocation() {
       }
     });
 
-    // P~U 일괄 기록
-    var out = values.map(function (v, i) {
-      var r = result[i];
+    // P 처리 순번 · Q 판정 (값)
+    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.order, n, 2).setValues(result.map(function (r) {
+      return [r.order, r.verdict + (r.bundle ? ' · 📦 ' + r.bundle : '')];
+    }));
+    // R 지금 가용재고 · S 사용예정일까지 확보 가능 · T 업체 누적 출고량 (수식 — 셀을 눌러 계산 근거를 볼 수 있음)
+    var formulas = [];
+    for (var i = 0; i < n; i++) formulas.push(rsvRstFormulas_(RSV_CONFIG.FIRST_ROW + i));
+    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.freeNow, n, 3).setFormulas(formulas);
+    rsvHeaderNotes_(sh);
+    // U 자동 처리 이력 (값)
+    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.log, n, 1).setValues(values.map(function (v, i) {
       var log = String(v[RSV_COL.log - 1] || '');
-      if (r.logAppend) log = (log ? log + '\n' : '') + r.logAppend;
-      var verdict = r.verdict + (r.bundle ? ' · 📦 ' + r.bundle : '');
-      return [r.order, verdict, r.freeNow, r.supply, r.volume, log];
-    });
-    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.order, n, 6).setValues(out);
+      if (result[i].logAppend) log = (log ? log + '\n' : '') + result[i].logAppend;
+      return [log];
+    }));
     // D 출고 예정일: 출고 전 건만 갱신 (출고 완료 건은 마지막 값을 기록으로 남김)
     sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.shipDate, n, 1).setValues(values.map(function (v, i) {
       var r = result[i];
@@ -459,6 +473,45 @@ function rsvRunAllocation() {
   } finally {
     lock.releaseLock();
   }
+}
+
+/**
+ * R·S·T 열 수식 (행 번호 n). rsvAllocate 의 계산과 같은 결과가 나온다.
+ *  R 지금 가용재고 = [재고관리] 현재고
+ *       − 같은 상품의 출고 전 예약재고 수량 합계
+ *         (예약재고 행: 처리 순번이 자기 이하인 예약재고까지 / 홀딩재고 행: 모든 예약재고)
+ *  S 사용예정일까지 확보 가능 (홀딩재고 행만)
+ *     = R − 같은 상품에서 순번이 앞선 홀딩재고 수량 + [재고관리] 1~3차 입고예정 중 사용 예정일(C) 이전 수량
+ *  T 업체 누적 출고량 = 같은 업체(F 업체명, 비어 있으면 E 입고처) 행 중 출고 완료(K) 또는 최종 출고 여부 O(M) 인 수량 합계
+ */
+function rsvRstFormulas_(n) {
+  var INV = "'" + RSV_CONFIG.INV_SHEET + "'!";
+  var F = RSV_CONFIG.FIRST_ROW;
+  var col = function (key) { return rsvColumnLetter_(RSV_COL[key]); };
+  var I = col('name'), J = col('qty'), K = col('status'), M = col('shipped'), P = col('order');
+  var C = col('useDate'), E = col('channel'), Fc = col('company'), R = col('freeNow');
+  var rng = function (c) { return '$' + c + '$' + F + ':$' + c; };
+  var cell = function (c) { return '$' + c + n; };
+  var stock = 'IFERROR(INDEX(' + INV + '$F$4:$F,MATCH(' + cell(I) + ',' + INV + '$E$4:$E,0)),0)';
+  var firm = 'SUMIFS(' + rng(J) + ',' + rng(I) + ',' + cell(I) + ',' + rng(K) + ',"예약재고*",' + rng(M) + ',"<>O",' +
+    rng(P) + ',IF(LEFT(' + cell(K) + ',4)="예약재고","<="&' + cell(P) + ',"<>"))';
+  var fR = '=IF(OR(' + cell(I) + '="",' + cell(P) + '=""),"",' + stock + '-' + firm + ')';
+
+  var inb = function (d, q) {
+    var dd = 'INDEX(' + INV + '$' + d + '$4:$' + d + ',x)', qq = 'INDEX(' + INV + '$' + q + '$4:$' + q + ',x)';
+    return 'IFERROR(IF(AND(ISNUMBER(' + dd + '),OR(NOT(ISNUMBER(u)),' + dd + '<=u)),MAX(0,N(' + qq + ')),0),0)';
+  };
+  var aheadHold = 'SUMIFS(' + rng(J) + ',' + rng(I) + ',' + cell(I) + ',' + rng(K) + ',"홀딩재고*",' + rng(M) + ',"<>O",' +
+    rng(P) + ',"<"&' + cell(P) + ')';
+  var fS = '=IF(OR(' + cell(P) + '="",LEFT(' + cell(K) + ',4)<>"홀딩재고"),"",LET(x,MATCH(' + cell(I) + ',' + INV + '$E$4:$E,0),u,' + cell(C) + ',' +
+    cell(R) + '-' + aheadHold + '+' + inb('K', 'L') + '+' + inb('M', 'N') + '+' + inb('O', 'P') + '))';
+
+  var done = function (byCompany) {
+    var who = byCompany ? rng(Fc) + ',k' : rng(Fc) + ',"",' + rng(E) + ',k';
+    return 'SUMIFS(' + rng(J) + ',' + who + ',' + rng(K) + ',"출고 완료")+SUMIFS(' + rng(J) + ',' + who + ',' + rng(K) + ',"<>출고 완료",' + rng(M) + ',"O")';
+  };
+  var fT = '=IF(' + cell(I) + '="","",LET(k,IF(' + cell(Fc) + '<>"",' + cell(Fc) + ',' + cell(E) + '),IF(k="","",' + done(true) + '+' + done(false) + ')))';
+  return [fR, fS, fT];
 }
 
 function rsvRowFromValues_(v, rowNum) {
