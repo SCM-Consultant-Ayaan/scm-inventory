@@ -7170,9 +7170,8 @@ var LG_UP_SPECS = {
     // 비어 있으면 구매입고. 발주내역 [입고내역] 과 같은 입고는 매일 07시 자동보정이 빼 준다(중복 방지).
     {k:"세부구분", t:"enum", req:false, opts:["구매입고","무상입고","반품입고","창고이동"], def:"구매입고"},
     {k:"수량", t:"qty", req:true},
-    // 2026-10-06 — 세부구분이 창고이동이면 [거래_창고이동] 에 (출발=상대창고 → 도착=창고코드) 로 기록된다
-    {k:"상대창고", t:"wh", label:"창고이동일 때 출발 창고"},
-    {k:"메모", t:"text"},
+    // 세부구분이 창고이동이면 비고(메모)란의 창고코드를 출발 창고로 읽어 [거래_창고이동] 에 (출발 → 창고코드) 로 기록한다
+    {k:"메모", t:"text", label:"비고"},
     {k:"재고상태", t:"enum", opts:["정상","불량","반품"], def:"정상"},
   ],
   "출고": [
@@ -7182,14 +7181,13 @@ var LG_UP_SPECS = {
     {k:"상품코드", t:"sku", req:true},
     {k:"세부구분", t:"enum", req:true, opts:["판매출고","기타출고","창고이동"]},
     {k:"수량", t:"qty", req:true},
-    // 2026-10-06 — 세부구분이 창고이동이면 [거래_창고이동] 에 (출발=창고코드 → 도착=상대창고) 로 기록된다
-    {k:"상대창고", t:"wh", label:"창고이동일 때 도착 창고"},
     {k:"출처", t:"enum", opts:["실측","잔차추정"], def:"실측"},
     // 2026-09 추가 — 선택 입력. 채워두면 업로드 후 재고수불부 계산치와 자동 비교해서,
     // 모자란 만큼(전산재고 > 여기 값)을 판매출고(잔차추정)로 추가 기록한다. 채널 리포트에
     // "현재 재고"까지 같이 나온다면 이 열을 채워서 재고 대시보드 업로드를 따로 안 해도 되게 한다.
     {k:"현재고", t:"qty", req:false, label:"실제 재고(선택) — 있으면 업로드 후 재고수불부 계산치와 자동 대사"},
-    {k:"메모", t:"text"},
+    // 세부구분이 창고이동이면 비고(메모)란의 창고코드를 도착 창고로 읽어 [거래_창고이동] 에 (창고코드 → 도착) 로 기록한다
+    {k:"메모", t:"text", label:"비고"},
     {k:"재고상태", t:"enum", opts:["정상","불량","반품"], def:"정상"},
   ],
   // 2026-09 추가 — 서버에 이 이름으로 저장되지 않는다. 업로드 시점에 재고수불부가 이미
@@ -7292,6 +7290,27 @@ function lgFindEntity(v){
     if(String(list[i]["법인코드"]).trim()===t || String(list[i]["법인명"]).trim()===t) return list[i]["법인코드"];
   }
   return null;   // null = 못 찾음 (빈 문자열과 구분)
+}
+/* 창고이동 행의 비고(메모)에서 상대 창고를 찾는다 — 비고 전체가 창고코드/창고명이거나,
+   글 속에 등록된 창고코드가 하나만 따로 떨어져 있으면 그 코드. 둘 이상이면 판단하지 않는다. */
+function lgWhFromMemo_(memo){
+  var t=String(memo==null?"":memo).trim(); if(!t) return {};
+  var whole=lgFindWh(t); if(whole) return {code:whole};
+  var list=(lgMasters&&lgMasters.warehouses)||[], hits=[];
+  list.forEach(function(w){
+    var c=String(w["창고코드"]||"").trim(); if(!c) return;
+    // 정규식 대신 앞뒤 글자를 직접 본다 — 코드에 특수문자가 있어도 안전하다
+    var isWord=function(ch){ return !!ch && /[0-9A-Za-z]/.test(ch); };   // 한글 조사("S01로")는 경계로 본다
+    var at=t.indexOf(c), found=false;
+    while(at>=0 && !found){
+      if(!isWord(t.charAt(at-1)) && !isWord(t.charAt(at+c.length))) found=true;
+      else at=t.indexOf(c,at+1);
+    }
+    if(found && hits.indexOf(c)<0) hits.push(c);
+  });
+  if(hits.length===1) return {code:hits[0]};
+  if(hits.length>1) return {multi:hits};
+  return {};
 }
 function lgFindWh(v){
   var t=String(v==null?"":v).trim(); if(!t) return "";
@@ -7405,8 +7424,14 @@ function lgCoerceRow(type, raw){
   if(type==="사간거래" && out["from법인코드"] && out["from법인코드"]===out["to법인코드"]) errs.push("출발/도착 법인이 같습니다");
   if(type==="창고이동" && out["from창고코드"] && out["from창고코드"]===out["to창고코드"]) errs.push("출발/도착 창고가 같습니다");
   if((type==="입고"||type==="출고") && out["세부구분"]==="창고이동"){
-    if(!out["상대창고"]) errs.push("창고이동은 상대창고("+(type==="입고"?"출발":"도착")+" 창고)가 필요합니다");
-    else if(out["상대창고"]===out["창고코드"]) errs.push("상대창고가 창고코드와 같습니다");
+    var side=type==="입고"?"출발":"도착";
+    var wm=lgWhFromMemo_(out["메모"]);
+    if(wm.code){
+      out["상대창고"]=wm.code;
+      if(wm.code===out["창고코드"]) errs.push("비고의 창고코드("+wm.code+")가 이 행의 창고와 같습니다");
+    }
+    else if(wm.multi) errs.push("비고에 창고코드가 여러 개 있습니다("+wm.multi.join(", ")+") — "+side+" 창고 하나만 적어주세요");
+    else errs.push("창고이동은 비고란에 "+side+" 창고코드가 있어야 합니다");
   }
   if(type==="재고상태전환" && out["from재고상태"] && out["from재고상태"]===out["to재고상태"]) errs.push("전환 전/후 상태가 같습니다");
   return {payload:out, errs:errs};
