@@ -392,7 +392,7 @@ function rsvApplyLayout_(sh) {
     SpreadsheetApp.newConditionalFormatRule()
       .whenFormulaSatisfied('=OR($' + pr + RSV_CONFIG.FIRST_ROW + '="긴급",$' + pr + RSV_CONFIG.FIRST_ROW + '="0순위")')
       .setFontColor('#cc0000').setBold(true).setRanges([rowRange]).build(),
-    statusRule('=LEFT(' + kc + ',4)="예약재고"', '#d9ead3'),          // 예약재고: 연초록
+    statusRule('=LEFT(' + kc + ',4)="예약재고"', '#ebf5e8'),          // 예약재고: 연초록
     statusRule('=LEFT(' + kc + ',4)="홀딩재고"', '#efefef'),          // 홀딩재고: 연회색
     statusRule('=' + kc + '="' + RSV_CONFIG.STATUS_DONE + '"', '#b7b7b7', '#434343'), // 출고 완료: 진회색
   ]));
