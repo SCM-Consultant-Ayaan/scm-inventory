@@ -366,10 +366,22 @@ function rsvApplyLayout_(sh) {
   var pRange = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.verdict, dataRows, 1);
   var rowRange = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, dataRows, RSV_COL.memo);
   var pr = rsvColumnLetter_(RSV_COL.priority);
+  var kc = '$' + rsvColumnLetter_(RSV_COL.status) + RSV_CONFIG.FIRST_ROW;
+  // 재고 분류(K)별 행 색상: 비고(N, 손으로 칠한 강조 유지)와 판정(Q, 판정 색상 유지)은 제외
+  var statusRanges = [
+    sh.getRange(RSV_CONFIG.FIRST_ROW, 1, dataRows, RSV_COL.shipped),                              // A~M
+    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.priority, dataRows, RSV_COL.order - RSV_COL.priority + 1), // O~P
+    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.freeNow, dataRows, RSV_COL.log - RSV_COL.freeNow + 1),    // R~U
+  ];
+  var statusRule = function (formula, bg, fg) {
+    var b = SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(formula).setBackground(bg).setRanges(statusRanges);
+    if (fg) b.setFontColor(fg);
+    return b.build();
+  };
   var keep = sh.getConditionalFormatRules().filter(function (r) {
     var bc = r.getBooleanCondition();
     var vals = bc ? bc.getCriteriaValues().join(' ') : '';
-    if (/긴급/.test(vals)) return false;
+    if (/긴급|예약재고|홀딩재고|출고 완료/.test(vals)) return false;
     return r.getRanges().every(function (rg) { return rg.getLastColumn() < RSV_COL.priority; });
   });
   sh.setConditionalFormatRules(keep.concat([
@@ -380,6 +392,9 @@ function rsvApplyLayout_(sh) {
     SpreadsheetApp.newConditionalFormatRule()
       .whenFormulaSatisfied('=OR($' + pr + RSV_CONFIG.FIRST_ROW + '="긴급",$' + pr + RSV_CONFIG.FIRST_ROW + '="0순위")')
       .setFontColor('#cc0000').setBold(true).setRanges([rowRange]).build(),
+    statusRule('=LEFT(' + kc + ',4)="예약재고"', '#d9ead3'),          // 예약재고: 연초록
+    statusRule('=LEFT(' + kc + ',4)="홀딩재고"', '#efefef'),          // 홀딩재고: 연회색
+    statusRule('=' + kc + '="' + RSV_CONFIG.STATUS_DONE + '"', '#b7b7b7', '#434343'), // 출고 완료: 진회색
   ]));
 
   var f = sh.getFilter();
