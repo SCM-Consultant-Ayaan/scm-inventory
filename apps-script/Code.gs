@@ -51,7 +51,8 @@ var RSV_CONFIG = {
   HOLD_WARN_DAYS: 80,
 
   // ---- 자동 정렬 ----
-  // 출고 전 건을 출고 예정일 → 업체명 → 용도 → 상품명 → 재고 분류(예약 위, 홀딩 아래) 순으로 정렬
+  // 출고 전 건을 건(업체명+용도)별로 모으고, 건 안에서는 예약재고 → 홀딩재고, 각각 상품명 순으로 정렬.
+  // 건끼리는 그 건의 가장 이른 출고 예정일 순
   AUTO_SORT: true,
   // true: 출고 완료 건을 위(기록), 출고 전 건을 아래에 / false: 출고 전 건을 위에
   SORT_DONE_FIRST: true,
@@ -515,22 +516,33 @@ function rsvRunAllocation(opts) {
 /**
  * 정렬 순서 (순수 함수). rows 와 같은 길이의 결과 → 새 순서대로 나열한 원래 인덱스 배열.
  *  출고 완료 건: SORT_DONE_FIRST 면 위, 아니면 아래 (서로의 순서는 그대로)
- *  출고 전 건: 출고 예정일(D, 날짜 → '미정' → 빈칸) → 업체명 → 용도 → 상품명 → 재고 분류(예약 → 홀딩 → 미판정)
+ *  출고 전 건: 건(업체명 + 용도) 단위로 모은다.
+ *    건끼리: 그 건의 가장 이른 출고 예정일(D) → 업체명 → 용도
+ *    건 안: 예약재고 → 홀딩재고 → 미판정, 각각 상품명 순
  *  상품명·수량이 모두 빈 행은 맨 아래
  */
 function rsvSortOrder(rows, results, cfg) {
-  var LAST = '\uffff';
+  var LAST = '￿';
   var str = function (s) { return s ? String(s) : LAST; };
+  var dateKey = function (d) { return d instanceof Date ? d.getTime() : d === '미정' ? 9e15 : 9.5e15; };
+  var groupOf = function (r) { return r.company + '\u0001' + r.purpose; };
+  var isEmpty = function (r) { return !r.name && !(rsvToNum_(r.qty) > 0); };
+  var isDone = function (r) { return r.status === cfg.STATUS_DONE || rsvIsShipped_(r); };
+
+  // 건별 가장 이른 출고 예정일
+  var first = {};
+  rows.forEach(function (r, i) {
+    if (isEmpty(r) || isDone(r)) return;
+    var k = groupOf(r), d = dateKey(results[i] && results[i].shipDate);
+    if (!(k in first) || d < first[k]) first[k] = d;
+  });
+
   var keyed = rows.map(function (r, i) {
-    var empty = !r.name && !(rsvToNum_(r.qty) > 0);
-    var done = !empty && (r.status === cfg.STATUS_DONE || rsvIsShipped_(r));
-    var group = empty ? 3 : done ? (cfg.SORT_DONE_FIRST ? 0 : 2) : 1;
+    var group = isEmpty(r) ? 3 : isDone(r) ? (cfg.SORT_DONE_FIRST ? 0 : 2) : 1;
     var key = [group];
     if (group === 1) {
-      var d = results[i] && results[i].shipDate;
-      var dk = d instanceof Date ? d.getTime() : d === '미정' ? 9e15 : 9.5e15;
       var st = r.status.indexOf('예약재고') === 0 ? 0 : r.status.indexOf('홀딩재고') === 0 ? 1 : 2;
-      key.push(dk, str(r.company), str(r.purpose), str(r.name), st);
+      key.push(first[groupOf(r)], str(r.company), str(r.purpose), st, str(r.name));
     }
     key.push(i);
     return { i: i, key: key };
@@ -540,21 +552,29 @@ function rsvSortOrder(rows, results, cfg) {
 }
 
 /**
- * 시트 행을 rsvSortOrder 순서로 옮긴다. 순서가 같거나, 필터로 숨긴 행이 있으면(보던 화면 유지) 건너뜀.
+ * 시트 행을 rsvSortOrder 순서로 옮긴다. 순서가 같으면 건너뜀.
+ * 필터가 걸려 있으면 조건을 기억했다가 정렬 후 그대로 다시 적용한다 (보던 화면 유지).
  * 반환: {원래 행번호: 새 행번호} 또는 null(안 옮김)
  */
 function rsvSortRows_(sh, rows, results) {
   var n = rows.length;
   var order = rsvSortOrder(rows, results, RSV_CONFIG);
   if (order.every(function (idx, pos) { return idx === pos; })) return null;
-  var f = sh.getFilter(), filterA1 = null;
+  var f = sh.getFilter(), filterA1 = null, criteria = [];
   if (f) {
-    for (var c = 1; c <= f.getRange().getLastColumn(); c++) {
-      if (f.getColumnFilterCriteria(c)) return null; // 필터 사용 중이면 정렬하지 않음
+    var fr = f.getRange();
+    for (var c = fr.getColumn(); c <= fr.getLastColumn(); c++) {
+      var cr = f.getColumnFilterCriteria(c);
+      if (cr) criteria.push({ col: c, crit: cr.copy().build() });
     }
-    filterA1 = f.getRange().getA1Notation();
+    filterA1 = fr.getA1Notation();
     f.remove(); // 필터 범위와 정렬 범위가 겹치면 정렬이 막히므로 잠시 해제 후 다시 만든다
   }
+  var restoreFilter = function () {
+    if (!filterA1 || sh.getFilter()) return;
+    var nf = sh.getRange(filterA1).createFilter();
+    criteria.forEach(function (x) { nf.setColumnFilterCriteria(x.col, x.crit); });
+  };
   var keyCol = RSV_LAST_COL + 1;
   if (sh.getMaxColumns() < keyCol) sh.insertColumnsAfter(sh.getMaxColumns(), keyCol - sh.getMaxColumns());
   var rank = new Array(n);
@@ -566,11 +586,11 @@ function rsvSortRows_(sh, rows, results) {
   } catch (err) {
     rsvWarnOnce_('자동 정렬 실패: ' + err.message);
     keyRange.clearContent();
-    if (filterA1 && !sh.getFilter()) sh.getRange(filterA1).createFilter();
+    restoreFilter();
     return null;
   }
   keyRange.clearContent();
-  if (filterA1) sh.getRange(filterA1).createFilter();
+  restoreFilter();
   var map = {};
   order.forEach(function (idx, pos) { map[RSV_CONFIG.FIRST_ROW + idx] = RSV_CONFIG.FIRST_ROW + pos; });
   return map;
