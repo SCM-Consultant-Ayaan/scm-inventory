@@ -1690,6 +1690,26 @@ const DEAD_DEMAND_API_URLS=[
   "https://script.google.com/macros/s/AKfycbzI7UX3TO1HhnaG6s03Xtw5GVql2qHZH-e_ol8JX9K_R-4UosqReiHhehXLrrAaPbldXQ/exec",   // [S&OP 로그용] 개인 계정 원본 — 2026-09-28 로지킴 계정으로 이전
 ];
 let demandApiUrl="", demandSubmitter="";
+/* S&OP 기능(수요입력·클라우드 동기화)은 2026-10-06 부터 재고수불부 웹앱(sop.* 액션)이 먼저 받는다.
+   예전 S&OP 웹앱은 ping 도 6~83초가 걸려서다. 데이터는 같은 S&OP 시트라 어느 쪽에 저장해도 같다.
+   재고수불부가 응답하지 않거나 아직 이 액션이 없는 옛 배포면 예전 주소(demandApiUrl)로 넘어간다. */
+async function sopFetch_(action, body){
+  const tryOne=async(url,act)=>{
+    const res = body
+      ? await fetch(url,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify(Object.assign({},body,{action:act}))})
+      : await fetch(`${url}?action=${encodeURIComponent(act)}&t=${Date.now()}`);
+    return res.json();
+  };
+  if(ledgerApiUrl){
+    try{
+      const j=await tryOne(ledgerApiUrl,"sop."+action);
+      if(j && !(j.ok===false && /알 수 없는 action|조회 권한|관리자 인증/.test(j.error||""))) return j;
+    }catch(e){ /* 아래 예전 주소로 */ }
+  }
+  if(!demandApiUrl) throw new Error("수요입력 연동 URL이 설정되지 않았습니다.");
+  return tryOne(demandApiUrl,action);
+}
+function sopReady_(){ return !!(ledgerApiUrl||demandApiUrl); }
 let demandEntries=[];      // 캐시: [{submitter,channel,sku,name,month,qty,ts}]
 let demandChannelsSeen=[]; // 실제 제출 데이터에 등장한 채널(자동 수집)
 let demandChannels=[];     // 사용자가 드롭다운에 직접 추가/삭제하는 채널 목록
@@ -4140,12 +4160,10 @@ async function runReset_(){
       logs.push("✅ 재고수불부 서버:<br>"+tabLines+"<br>↳ 백업: 보관_초기화_"+res.backupStamp+"_* 탭에 남았습니다.");
     }
     if(scopes.indexOf("alloc")>=0){
-      if(!demandApiUrl){
+      if(!sopReady_()){
         logs.push("⚠ 수요입력 연동 URL이 설정되지 않아 수요입력 데이터는 못 지웠습니다.");
       }else{
-        const r2=await fetch(demandApiUrl,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},
-          body:JSON.stringify({action:"admin.reset",pw:pw,confirm:confirmTxt})});
-        const j2=await r2.json();
+        const j2=await sopFetch_("admin.reset",{pw:pw,confirm:confirmTxt});
         if(!j2.ok) throw new Error("수요입력 초기화 실패: "+(j2.error||"알 수 없는 오류"));
         logs.push("✅ 수요입력 — "+(j2.cleared||0)+"행 지움 (백업 탭: "+(j2.backupTab||"-")+")");
       }
@@ -4535,18 +4553,16 @@ function updateCloudSyncUI(msg){
 }
 function scheduleCloudPush(){
   if(_suppressNextPush){ _suppressNextPush=false; return; }
-  if(!demandApiUrl) return;
+  if(!sopReady_()) return;
   clearTimeout(_cloudPushTimer);
   _cloudPushTimer=setTimeout(pushCloudState,2500);
 }
 async function pushCloudState(){
-  if(!demandApiUrl||_cloudSyncing) return;
+  if(!sopReady_()||_cloudSyncing) return;
   _cloudSyncing=true;
   updateCloudSyncUI("업로드 중...");
   try{
-    const res=await fetch(demandApiUrl,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},
-      body:JSON.stringify({action:"saveState",state:cloudSyncPayload()})});
-    const data=await res.json();
+    const data=await sopFetch_("saveState",{state:cloudSyncPayload()});
     updateCloudSyncUI(data.ok?`동기화됨 (${stateSavedAt})`:"동기화 실패");
   }catch(e){
     updateCloudSyncUI("동기화 실패 (오프라인?)");
@@ -4554,11 +4570,10 @@ async function pushCloudState(){
   _cloudSyncing=false;
 }
 async function pullCloudState(auto){
-  if(!demandApiUrl){ updateCloudSyncUI("미연결 — 관리자 모드에서 수요 입력 URL을 설정하세요"); return; }
+  if(!sopReady_()){ updateCloudSyncUI("미연결 — 관리자 모드에서 수요 입력 URL을 설정하세요"); return; }
   updateCloudSyncUI("불러오는 중...");
   try{
-    const res=await fetch(`${demandApiUrl}?action=loadState&t=${Date.now()}`);
-    const data=await res.json();
+    const data=await sopFetch_("loadState");
     if(!data.ok||!data.state){ updateCloudSyncUI(stateSavedAt?`로컬 데이터만 있음 (${stateSavedAt})`:"클라우드에 저장된 데이터 없음"); return; }
     const cloud=JSON.parse(data.state);
     const cloudTs=cloud.savedAt||data.savedAt||"";
@@ -4594,15 +4609,14 @@ document.getElementById("btnCloudSyncNow").addEventListener("click",()=>pullClou
 async function fetchDemandData(silent=false){
   const statusEl=document.getElementById("demReloadStatus");
   const apiEl=document.getElementById("demApiStatus");
-  if(!demandApiUrl){
+  if(!sopReady_()){
     if(apiEl) apiEl.textContent="미연결";
     if(!silent) alert("연동 URL이 설정되지 않았습니다. 관리자 모드에서 설정하세요.");
     return;
   }
   if(statusEl) statusEl.textContent="불러오는 중...";
   try{
-    const res=await fetch(`${demandApiUrl}?action=list&t=${Date.now()}`);
-    const data=await res.json();
+    const data=await sopFetch_("list");
     if(!data.ok) throw new Error(data.error||"조회 실패");
     demandEntries=data.entries||[];
     demandEntries.forEach(e=>{if(e.channel&&!demandChannelsSeen.includes(e.channel)) demandChannelsSeen.push(e.channel);});
@@ -4619,7 +4633,7 @@ async function fetchDemandData(silent=false){
 }
 async function submitDemand(){
   const statusEl=document.getElementById("demSubmitStatus");
-  if(!demandApiUrl) return alert("먼저 관리자 모드에서 연동 URL을 설정하세요.");
+  if(!sopReady_()) return alert("먼저 관리자 모드에서 연동 URL을 설정하세요.");
   const submitter=document.getElementById("demSubmitter").value.trim();
   const channel=document.getElementById("demChannel").value.trim();
   const month=document.getElementById("demMonth").value;
@@ -4635,9 +4649,7 @@ async function submitDemand(){
   demandSubmitter=submitter; save();
   statusEl.textContent="제출 중...";
   try{
-    const res=await fetch(demandApiUrl,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},
-      body:JSON.stringify({action:"submit",submitter,channel,month,rows})});
-    const data=await res.json();
+    const data=await sopFetch_("submit",{submitter,channel,month,rows});
     if(!data.ok) throw new Error(data.error||"저장 실패");
     statusEl.textContent=`✅ ${rows.length}건 제출 완료 (${dateStr(new Date().toISOString())})`;
     if(!demandChannelsSeen.includes(channel)){demandChannelsSeen.push(channel);save();}
@@ -4706,7 +4718,7 @@ document.getElementById("btnDemResetCh").addEventListener("click",()=>{
   const ch=sel.value; if(!ch) return alert("초기화할 채널을 선택하세요.");
   const moSel=document.getElementById("demResetMoSel");
   const month=moSel.value==="__all__"?null:moSel.value;
-  if(!demandApiUrl) return alert("먼저 연동 URL을 설정하세요.");
+  if(!sopReady_()) return alert("먼저 연동 URL을 설정하세요.");
   const cnt=demandEntries.filter(e=>e.channel===ch&&(!month||e.month===month)).length;
   const scope=month?`"${ch}" 채널의 ${monthLabel_(month)} 데이터`:`"${ch}" 채널의 전체 데이터`;
   if(!confirm(`${scope} ${cnt}건을 시트에서 완전히 삭제합니다.\n이 작업은 되돌릴 수 없습니다. 계속할까요?`)) return;
@@ -4716,9 +4728,7 @@ document.getElementById("btnDemResetCh").addEventListener("click",()=>{
 });
 async function resetDemandChannel(channel,month){
   try{
-    const res=await fetch(demandApiUrl,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},
-      body:JSON.stringify({action:"resetChannel",channel,month:month||undefined})});
-    const data=await res.json();
+    const data=await sopFetch_("resetChannel",{channel,month:month||undefined});
     if(!data.ok) throw new Error(data.error||"삭제 실패");
     alert(`✅ ${month?`"${channel}" ${monthLabel_(month)}`:`"${channel}" 채널 전체`} ${data.deleted??""}건 삭제 완료`);
     if(!month){ // 채널 전체 삭제 때만 채널 목록에서도 제거
@@ -10366,14 +10376,10 @@ var alLastDemandFailDraftIds_ = null;  // 수요입력 기록이 실패한 직�
 
 /** 수요입력 백엔드로 한 배치 POST한다. submitDemand()와 같은 형식(text/plain, action=submit). */
 function alSubmitDemandBatch_(payload) {
-  if (typeof demandApiUrl === "undefined" || !demandApiUrl) {
+  if (!sopReady_()) {
     return Promise.reject(new Error("수요입력 연동 URL이 설정되지 않았습니다."));
   }
-  return fetch(demandApiUrl, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ action: "submit", submitter: payload.submitter, channel: payload.channel, month: payload.month, rows: payload.rows }),
-  }).then(function (res) { return res.json(); }).then(function (data) {
+  return sopFetch_("submit", { submitter: payload.submitter, channel: payload.channel, month: payload.month, rows: payload.rows }).then(function (data) {
     if (!data.ok) throw new Error(data.error || "저장 실패");
     return data;
   });
