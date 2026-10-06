@@ -522,7 +522,7 @@ function rsvRunAllocation(opts) {
  *  상품명·수량이 모두 빈 행은 맨 아래
  */
 function rsvSortOrder(rows, results, cfg) {
-  var LAST = '￿';
+  var LAST = '\uffff';
   var str = function (s) { return s ? String(s) : LAST; };
   var dateKey = function (d) { return d instanceof Date ? d.getTime() : d === '미정' ? 9e15 : 9.5e15; };
   var groupOf = function (r) { return r.company + '\u0001' + r.purpose; };
