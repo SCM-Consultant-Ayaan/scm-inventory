@@ -695,9 +695,11 @@ function rsvImportMail_() {
         if (!/\.(xlsx|xls|xlsm)$/i.test(fname)) return;
         touched = true;
         try {
-          var po = rsvParsePurchaseOrder(rsvAttachmentToGrid_(att));
+          var grids = rsvAttachmentToGrids_(att);
+          var po = rsvPickPurchaseOrder(grids);
           if (!po) { rsvWriteLog_(msg, fname, '건너뜀: PURCHASE ORDER 양식이 아님 (상단 PURCHASE ORDER / PO No. 확인)'); return; }
           if (!po.lines.length) throw new Error('PO ' + po.poNo + ': 품목(품목명 + 총 수량)이 없음');
+          rsvTranslateLines(po, rsvPoCatalog(grids));
           var poKey = 'po:' + po.poNo;
           if (existingKeys[poKey]) { rsvWriteLog_(msg, fname, '건너뜀: 이미 등록된 PO ' + po.poNo); return; }
           var newRows = po.lines.map(function (ln) {
@@ -1016,11 +1018,11 @@ function rsvSenderAllowed_(from) {
 }
 
 /**
- * 엑셀 첨부 → PO 탭(없으면 첫 탭)의 2차원 배열.
+ * 엑셀 첨부 → 모든 탭의 2차원 배열 목록.
  * xlsx 는 압축을 풀어 직접 읽는다 (Drive API 권한 불필요, 수식은 엑셀에 저장된 계산값 사용).
  * 직접 읽기에 실패한 경우(.xls 등)에만 임시 구글 시트로 변환해 읽는다.
  */
-function rsvAttachmentToGrid_(att) {
+function rsvAttachmentToGrids_(att) {
   var grids = null, directErr = '';
   try {
     var blob = att.copyBlob().setContentType('application/zip');
@@ -1033,10 +1035,7 @@ function rsvAttachmentToGrid_(att) {
     grids = null;
     directErr = e.message;
   }
-  if (grids && grids.length) {
-    for (var g = 0; g < grids.length; g++) if (rsvParsePurchaseOrder(grids[g])) return grids[g];
-    return grids[0];
-  }
+  if (grids && grids.length) return grids;
   var fileId;
   try {
     fileId = rsvConvertToSheet_(att);
@@ -1045,12 +1044,7 @@ function rsvAttachmentToGrid_(att) {
   }
   try {
     var tmp = SpreadsheetApp.openById(fileId);
-    var sheets = tmp.getSheets();
-    for (var i = 0; i < sheets.length; i++) {
-      var grid = sheets[i].getDataRange().getValues();
-      if (rsvParsePurchaseOrder(grid)) return grid;
-    }
-    return sheets[0].getDataRange().getValues();
+    return tmp.getSheets().map(function (s) { return s.getDataRange().getValues(); });
   } finally {
     DriveApp.getFileById(fileId).setTrashed(true);
   }
@@ -1214,6 +1208,52 @@ function rsvParsePurchaseOrder(grid) {
   return out;
 }
 
+/** 여러 탭 중 PURCHASE ORDER 양식인 첫 탭을 파싱 (순수 함수). 없으면 null. */
+function rsvPickPurchaseOrder(grids) {
+  for (var g = 0; g < grids.length; g++) {
+    var po = rsvParsePurchaseOrder(grids[g]);
+    if (po) return po;
+  }
+  return null;
+}
+
+/**
+ * PO 파일의 [제품정보] 탭(SKU CODE | 품목명(국문) | 품목명(영문)) → 영문/SKU → 국문 사전 (순수 함수).
+ * 헤더 이름으로 찾으므로 탭 이름·열 순서가 바뀌어도 된다. 없으면 빈 사전.
+ */
+function rsvPoCatalog(grids) {
+  var key = function (v) { return String(v == null ? '' : v).toLowerCase().replace(/[\s'’`]/g, ''); };
+  var cat = { byCode: {}, byEng: {} };
+  grids.forEach(function (grid) {
+    for (var r = 0; r < Math.min(grid.length, 10); r++) {
+      var h = grid[r].map(key);
+      var find = function (re) { for (var c = 0; c < h.length; c++) if (re.test(h[c])) return c; return -1; };
+      var cKo = find(/^품목명\(?국문/), cEn = find(/^품목명\(?영문/), cCode = find(/^(skucode|sku|품목코드)/);
+      if (cKo < 0 || (cEn < 0 && cCode < 0)) continue;
+      for (var i = r + 1; i < grid.length; i++) {
+        var ko = String(grid[i][cKo] == null ? '' : grid[i][cKo]).trim();
+        if (!ko) continue;
+        if (cCode >= 0 && key(grid[i][cCode])) cat.byCode[key(grid[i][cCode])] = ko;
+        if (cEn >= 0 && key(grid[i][cEn])) cat.byEng[key(grid[i][cEn])] = ko;
+      }
+      return;
+    }
+  });
+  return cat;
+}
+
+/** PO 품목명이 영문이면 [제품정보] 사전으로 국문명으로 바꾼다 (품목코드 우선, 그다음 영문명). 원래 이름은 비고로. */
+function rsvTranslateLines(po, cat) {
+  var key = function (v) { return String(v == null ? '' : v).toLowerCase().replace(/[\s'’`]/g, ''); };
+  po.lines.forEach(function (ln) {
+    var ko = cat.byCode[key(ln.code)] || cat.byEng[key(ln.name)];
+    if (!ko || ko === ln.name) return;
+    ln.memo = [ln.memo, '원문: ' + ln.name].filter(String).join(' / ');
+    ln.name = ko;
+  });
+  return po;
+}
+
 /** 상품 목록: [재고관리] A/E + [상품 마스터] E/F */
 function rsvReadProducts_(ss) {
   var list = [];
@@ -1334,5 +1374,5 @@ function rsvFmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
+  module.exports = { rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
 }
