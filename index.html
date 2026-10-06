@@ -788,7 +788,7 @@ input[type=file]{display:none}
       </div>
     </div>
     <div class="wh-section" id="ledgerWhSection" style="display:none">
-      <div class="wh-sh"><h2>재고수불부 연동 창고</h2><span class="badge">자동 동기화</span></div>
+      <div class="wh-sh"><h2>재고수불부 연동 창고</h2><span class="badge">자동 동기화</span><button class="sm ghost admin-only" id="ledgerRestoreBtn" style="display:none;margin-left:auto" onclick="restoreLedgerWarehouses_()">삭제한 창고 되살리기</button></div>
       <div class="wh-grid" id="ledgerGrid"></div>
     </div>
     <div class="wh-section">
@@ -960,7 +960,7 @@ input[type=file]{display:none}
       <button class="sm ghost" id="btnFcExport">예측 Excel</button>
     </div>
     <div class="tw">
-      <div class="empty-box" id="fcEmpty">스냅샷이 2개 이상 쌓이면 판매이력과 예측이 표시됩니다. 재고 현황에서 서로 다른 날짜로 2회 이상 업로드해 주세요.</div>
+      <div class="empty-box" id="fcEmpty">판매이력이 없습니다. 재고 현황에서 재고수불부 <b>[지금 동기화]</b>를 누르면 판매출고 실적으로 예측합니다(아래 "재고수불부 판매 실적 사용"이 켜져 있어야 합니다). 수불부에 없는 창고는 재고 현황에 서로 다른 날짜로 2회 이상 업로드하면 스냅샷으로 계산됩니다.</div>
       <table id="fcTable" hidden></table>
     </div>
     <div id="fcDetail" class="an-box" style="display:none;margin-top:14px"></div>
@@ -2564,6 +2564,7 @@ function withPw(fn){
 
 /* ── renderAll ── */
 function renderAll(){
+  purgeRemovedLedgerWh_();   // 다른 사용자가 삭제한 연동 창고가 클라우드로 들어와도 빼고 그린다
   syncSkuMeta();
   renderSummary(); renderLedgerGrid(); renderPlatformGrid(); renderCustomGrid();
   renderDashTable(); renderRopWhFilter(); populateRopMonthSel(); renderRopTable();
@@ -2696,13 +2697,25 @@ function ledgerCardHTML(id,name,ico,hasData){
   const uH=upd
     ? `<div class="wh-updated">기준 연월: <b>${esc(dd||"—")}</b><br><span style="color:var(--faint)">동기화: ${dateStr(upd)}</span></div>`
     : `<div class="wh-updated" style="color:var(--warn)">아직 동기화 안 됨</div>`;
-  const acts=`<button class="sm primary" data-ledger-sync="${id}">지금 동기화</button><button class="sm danger admin-only" style="display:none" data-ledger-remove="${id}">숨기기</button>`;
+  const acts=`<button class="sm primary" data-ledger-sync="${id}">지금 동기화</button><button class="sm danger admin-only" style="display:none" data-ledger-remove="${id}">삭제</button>`;
   return`<div class="wh-name"><span>${esc(ico)}</span>${esc(name)}</div>${qH}${uH}<div class="wh-acts">${acts}</div>`;
+}
+/* 삭제한 연동 창고 — 창고코드 목록. params 에 두어 클라우드 동기화로 모든 사용자에게 같이 적용된다.
+   재고수불부(원장)의 창고·재고는 건드리지 않고, 대시보드 동기화에서만 빼고 받는다. */
+function ledgerRemovedCodes_(){ return Array.isArray(params.ledgerRemovedWh)?params.ledgerRemovedWh:[]; }
+function purgeRemovedLedgerWh_(){
+  const rm=new Set(ledgerRemovedCodes_().map(c=>"ledger_"+c));
+  if(!rm.size) return;
+  Object.keys(WH).forEach(id=>{ if(rm.has(id)) delete WH[id]; });
+  ledgerWarehouses=ledgerWarehouses.filter(l=>!rm.has(l.id));
 }
 function renderLedgerGrid(){
   const section=document.getElementById("ledgerWhSection");
   const g=document.getElementById("ledgerGrid"); if(!g) return;
-  section.style.display=ledgerWarehouses.length?"":"none";
+  const removed=ledgerRemovedCodes_();
+  section.style.display=(ledgerWarehouses.length||removed.length)?"":"none";
+  const rb=document.getElementById("ledgerRestoreBtn");
+  if(rb){ rb.textContent=`삭제한 창고 ${removed.length}개 되살리기`; rb.dataset.empty=removed.length?"":"1"; }
   g.innerHTML="";
   ledgerWarehouses.forEach(lw=>{
     const has=!!(WH[lw.id]?.data?.length);
@@ -2711,12 +2724,27 @@ function renderLedgerGrid(){
   });
   g.querySelectorAll("[data-ledger-sync]").forEach(b=>b.addEventListener("click",()=>pullLedgerStock(true)));
   g.querySelectorAll("[data-ledger-remove]").forEach(b=>b.addEventListener("click",()=>{
+    const id=b.dataset.ledgerRemove, code=id.replace(/^ledger_/,"");
+    const name=(ledgerWarehouses.find(l=>l.id===id)||{}).name||code;
+    if(!confirm(`'${name}' 창고를 대시보드에서 삭제할까요?\n\n`
+              +`재고 합계에서 빠지고, 다음 동기화 때도 다시 생기지 않습니다.\n`
+              +`재고수불부의 창고·재고 기록은 그대로 남습니다.\n`
+              +`(나중에 [삭제한 창고 되살리기]로 되돌릴 수 있습니다)`)) return;
     withPw(()=>{
-      const id=b.dataset.ledgerRemove;
+      params.ledgerRemovedWh=[...new Set([...ledgerRemovedCodes_(),code])];
       delete WH[id]; ledgerWarehouses=ledgerWarehouses.filter(w=>w.id!==id);
       save(); renderAll();
     });
   }));
+}
+function restoreLedgerWarehouses_(){
+  const removed=ledgerRemovedCodes_();
+  if(!removed.length){ alert("삭제한 연동 창고가 없습니다."); return; }
+  if(!confirm(`삭제한 연동 창고 ${removed.length}개(${removed.join(", ")})를 되살릴까요?\n바로 재고수불부에서 다시 받아옵니다.`)) return;
+  withPw(()=>{
+    params.ledgerRemovedWh=[];
+    save(); renderAll(); pullLedgerStock(true);
+  });
 }
 /** 재고수불부 판매출고 실적 동기화 — action=scm.sales.
  *  창고 합산(totals) 기준으로 SKU별 일평균(rate)을 만든다.
@@ -2734,9 +2762,14 @@ async function pullLedgerSales(manual){
   if(!j||!j.ok) throw new Error((j&&j.error)||"판매 실적 조회 실패");
 
   const d=j.data||{}, tot=d.totals||{}, whs=d.warehouses||{};
-  const byWh={};
+  const byWh={}, monthly={}, weekly={};   // 월별·주별(ISO 주) 판매 — 수요예측 시계열용, 창고 합산
+  const addTo=(dst,sku,src)=>{ if(!src) return; const o=dst[sku]=dst[sku]||{};
+    Object.keys(src).forEach(k=>{ o[k]=(o[k]||0)+(+src[k]||0); }); };
   Object.keys(whs).forEach(code=>{
-    (whs[code].items||[]).forEach(it=>{ (byWh[it.sku]=byWh[it.sku]||{})[code]=it.qty; });
+    (whs[code].items||[]).forEach(it=>{
+      (byWh[it.sku]=byWh[it.sku]||{})[code]=it.qty;
+      addTo(monthly,it.sku,it.monthly); addTo(weekly,it.sku,it.weekly);
+    });
   });
   const n=Math.max(1,+d.days||days);
   const next={};
@@ -2748,7 +2781,7 @@ async function pullLedgerSales(manual){
     next[sku]={qty:q, days:dd,
                rate:(t.rate!=null&&isFinite(+t.rate))?+t.rate:Math.round(q/dd*10)/10,
                firstDate:t.firstDate||"", lastDate:t.lastDate||"",
-               byWh:byWh[sku]||{}};
+               byWh:byWh[sku]||{}, monthly:monthly[sku]||{}, weekly:weekly[sku]||{}};
   });
   ledgerSales=next;
   ledgerSalesMeta={from:d.from||"", to:d.to||"", days:n,
@@ -2788,7 +2821,8 @@ async function pullLedgerStock(manual){
     // 재고수불부 WebApp.gs 응답 규격: 항상 {ok, data:{...}} (성공) / {ok:false, error} (실패)
     const d=j.data||{};
     const warehouses=d.warehouses||{};
-    const codes=Object.keys(warehouses);
+    const removedSet=new Set(ledgerRemovedCodes_());
+    const codes=Object.keys(warehouses).filter(c=>!removedSet.has(c));   // 삭제한 창고는 받지 않는다
     codes.forEach(code=>{
       const id="ledger_"+code;
       const w=warehouses[code]||{};
@@ -5405,10 +5439,48 @@ function intervalBuckets_(prevDate,curDate,bucket){
   return{out,total};
 }
 
+/* ── 재고수불부 판매출고 실적 → 시계열 ──
+   스냅샷이 없어도 [거래_출고] 판매출고의 월별·주별 합계로 판매이력을 만든다.
+   구간 = max(실적 데이터 시작, 그 SKU 첫 판매일) ~ 실적 데이터 마지막 날. 판매가 없던 달/주는 0 으로 넣는다
+   (빠뜨리면 예측이 실제보다 높게 나온다). 품절 여부는 알 수 없어 stockout=false. */
+function ledgerSeriesOn_(){
+  return params.salesSource!=="snapshot" && !!ledgerSalesMeta?.coverageTo
+    && Object.values(ledgerSales).some(r=>r&&r.monthly&&Object.keys(r.monthly).length);
+}
+function isoWeekKeyOf_(ds){   // yyyy-MM-dd → "2026-W31" (서버 salesIsoWeek_ 와 같은 규칙)
+  const p=ds.split("-"), d=new Date(Date.UTC(+p[0],+p[1]-1,+p[2]));
+  const day=d.getUTCDay()||7; d.setUTCDate(d.getUTCDate()+4-day);
+  const y=d.getUTCFullYear(), wk=Math.ceil(((d-Date.UTC(y,0,1))/864e5+1)/7);
+  return `${y}-W${String(wk).padStart(2,"0")}`;
+}
+function ledgerSeriesOf_(sku,bucket){
+  const r=ledgerSales[sku], m=ledgerSalesMeta;
+  if(!r||!m?.coverageTo||!r.monthly) return null;
+  const covFrom=m.coverageFrom||m.from, start=(r.firstDate&&r.firstDate>covFrom)?r.firstDate:covFrom, end=m.coverageTo;
+  if(!start||start>end) return null;
+  const days={}, isoOf={};
+  const d=new Date(start+"T00:00:00"), last=new Date(end+"T00:00:00");
+  for(let g=0; d<=last && g<1500; g++, d.setDate(d.getDate()+1)){
+    const ds=localDateStr(d), k=bucketKeyOf_(ds,bucket);
+    days[k]=(days[k]||0)+1;
+    if(bucket==="week") isoOf[k]=isoWeekKeyOf_(ds);
+  }
+  const keys=Object.keys(days).sort();
+  const buckets=keys.map(k=>{
+    const qty=+(bucket==="week"?(r.weekly||{})[isoOf[k]]:r.monthly[k])||0;
+    const dd=days[k], span=bucketSpanDays_(k,bucket);
+    return{key:k,label:bucketLabel_(k,bucket),days:dd,rate:qty/dd,qty:Math.round(qty),
+           norm:Math.round(qty/dd*span),partial:dd<span*0.6,stockout:false};
+  }).filter((b,i,a)=>!(b.partial&&a.length>2&&(i===0||i===a.length-1)));   // 앞뒤 자투리(예: 1일짜리 주)는 예측을 흔들어서 뺀다
+  return{buckets,keys,lastSaleDate:r.lastDate||"",totalDays:keys.reduce((a,k)=>a+days[k],0),
+         dropped:[],droppedCount:0,outliers:0,bridged:0,source:"ledger"};
+}
+
 /* ── 판매이력 시계열 생성 ── */
 function buildSeries_(){
   const bucket=params.fcBucket||"month";
-  const sig=`${bucket}|${_stateSig_()}|${params.excludeOutlier!==false?1:0}`;
+  const useLg=ledgerSeriesOn_();
+  const sig=`${bucket}|${_stateSig_()}|${params.excludeOutlier!==false?1:0}|${useLg?ledgerSalesMeta.at:"-"}`;
   if(_seriesCache_&&_seriesCache_.sig===sig) return _seriesCache_.data;
 
   const bySku={}, keySet=new Set();
@@ -5458,8 +5530,21 @@ function buildSeries_(){
     e.droppedCount=e.dropped.length;
   });
 
-  const data={bySku,keys,bucket,
-    range:snapshots.length>=2?{from:snapshots[0].date,to:snapshots.at(-1).date}:null};
+  // 재고수불부 실적이 있는 SKU 는 스냅샷 역산 대신 실적 시계열을 쓴다 (재발주 계산기의 일판매량과 같은 근거)
+  let range=snapshots.length>=2?{from:snapshots[0].date,to:snapshots.at(-1).date}:null, allKeys=keys, lgCnt=0;
+  if(useLg){
+    const ks=new Set(keys);
+    Object.keys(ledgerSales).forEach(sku=>{
+      const e=ledgerSeriesOf_(sku,bucket); if(!e||!e.buckets.length) return;
+      e.keys.forEach(k=>ks.add(k)); delete e.keys;
+      bySku[sku]=e; lgCnt++;
+    });
+    allKeys=[...ks].sort();
+    const m=ledgerSalesMeta;
+    if(lgCnt) range={from:m.coverageFrom||m.from,to:m.coverageTo,source:"ledger"};
+  }
+
+  const data={bySku,keys:allKeys,bucket,range,ledgerSkuCount:lgCnt};
   _seriesCache_={sig,data};
   return data;
 }
