@@ -2561,22 +2561,48 @@ function withPw(fn){
   okBtn.addEventListener("click",async ()=>{
     const pw=pwField.value;
     if(!pw) return;
-    if(!demandApiUrl){ showWrong("관리자 인증 서버(연동 URL)가 설정되지 않았습니다."); return; }
-    okBtn.disabled=true; okBtn.textContent="확인 중... (최대 10초)";
+    if(!demandApiUrl&&!ledgerApiUrl){ showWrong("관리자 인증 서버(연동 URL)가 설정되지 않았습니다."); return; }
+    okBtn.disabled=true; okBtn.textContent="확인 중...";
+    const pass=(token,expSec,note)=>{
+      lgSetToken(token||"", expSec||0);
+      lgTokenNote = token ? "" : (note||"");
+      saveAdminSession_(token||"", expSec||0, lgTokenNote);
+      lgPaintUploadGate();
+      closeOverlay(); fn();
+    };
+    /* 1차: 재고수불부에 바로 로그인 (2~3초). 예전에는 수요입력 Apps Script(checkPw)가 대신
+       로그인해 줬는데, 그 서버가 바쁠 때 30초 이상 걸렸다. 같은 비밀번호라 결과는 같다.
+       재고수불부가 응답하지 않을 때만 아래 2차(checkPw — 예비 비밀번호 포함)로 넘어간다. */
+    if(ledgerApiUrl){
+      let lj=null;
+      try{
+        const ctrl=(typeof AbortController!=="undefined")?new AbortController():null;
+        const timer=setTimeout(()=>{ if(ctrl) ctrl.abort(); },15000);
+        try{
+          lj=await (await fetch(ledgerApiUrl,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},
+            body:JSON.stringify({action:"login",payload:{password:pw}}),signal:ctrl?ctrl.signal:undefined})).json();
+        }finally{ clearTimeout(timer); }
+      }catch(e){ lj=null; }
+      if(lj&&lj.ok&&lj.data&&lj.data.token){
+        okBtn.disabled=false; okBtn.textContent=okLabel;
+        pass(lj.data.token, lj.data.expiresInSec); return;
+      }
+      if(lj&&!lj.ok&&/일치하지/.test(lj.error||"")){
+        okBtn.disabled=false; okBtn.textContent=okLabel;
+        showWrong(); return;
+      }
+      if(!demandApiUrl){ okBtn.disabled=false; okBtn.textContent=okLabel; showWrong("확인 실패 — 잠시 후 다시 시도하세요."); return; }
+      okBtn.textContent="확인 중... (예비 서버, 조금 걸립니다)";
+    }
     try{
       const res=await fetch(demandApiUrl,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},
         body:JSON.stringify({action:"checkPw",pw})});
       const data=await res.json();
       if(data.ok){
         // 입력한 비밀번호로 서버가 재고수불부에 로그인해 받아온 쓰기 토큰.
-        // 별도 로그인 화면 없이 "관리자 모드 = 업로드 가능"이 된다.
-        lgSetToken(data.ledgerToken||"", data.ledgerTokenExpiresInSec||0);
         // 토큰 없이 통과한 경우(재고수불부에 닿지 못해 예비 비밀번호로 열린 경우)
         // 업로드가 왜 잠겨 있는지 화면에 남겨둔다.
-        lgTokenNote = data.ledgerToken ? "" : (data.ledgerNote||"");
-        saveAdminSession_(data.ledgerToken||"", data.ledgerTokenExpiresInSec||0, lgTokenNote);
-        lgPaintUploadGate();
-        closeOverlay(); fn();
+        pass(data.ledgerToken, data.ledgerTokenExpiresInSec, data.ledgerNote);
       }
       else showWrong();
     }catch(e){
