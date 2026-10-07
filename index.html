@@ -1374,6 +1374,7 @@ input[type=file]{display:none}
         <div class="lg-f" style="flex:1;min-width:200px"><label>상품코드 / 상품명 검색</label><input id="lgFilterSku" placeholder="일부만 입력해도 검색됩니다"></div>
         <div class="lg-f" style="flex:1;min-width:200px"><label>법인명 / 창고명 검색</label><input id="lgFilterEw" placeholder="드롭다운에 없는 값(미등록 코드)도 찾을 수 있습니다"></div>
         <div class="lg-f"><label>&nbsp;</label><button class="sm ghost" id="btnLgFilterReset">필터 초기화</button></div>
+        <div class="lg-f"><label>&nbsp;</label><label style="display:flex;align-items:center;gap:5px;cursor:pointer;text-transform:none;font-weight:600;padding:7px 0"><input type="checkbox" id="lgShowHidden" style="accent-color:var(--accent)"> 숨김 상품 보기 <span id="lgHiddenCnt" style="color:var(--faint)"></span></label></div>
       </div>
       <p class="lg-hint">Excel 내보내기는 조회 시작월부터 선택한 연월까지 모든 달을 한 시트에 나란히 담습니다.</p>
     </div>
@@ -6734,19 +6735,39 @@ function lgInitSort(){
   });
 }
 
+/* ── 수불부 상품 숨김 (2026-10-07) ──
+   재고 대시보드의 SKU 숨김과 같은 방식이지만 목록은 따로 둔다 — 수불부에는 부자재·옛 코드처럼
+   대시보드에 없는 품목이 많아서다. params 에 두어 클라우드 동기화로 다른 사람 화면에도 같이 적용된다.
+   데이터는 지우지 않고 표시·합계에서만 뺀다. "숨김 상품 보기"를 켜면 흐리게 다시 보인다. */
+var lgShowHidden = false;
+function lgHiddenSet_(){ return new Set(Array.isArray(params.lgHiddenSkus)?params.lgHiddenSkus:[]); }
+function lgToggleHidden_(sku){
+  var s=lgHiddenSet_();
+  if(s.has(sku)) s.delete(sku); else s.add(sku);
+  params.lgHiddenSkus=Array.from(s);
+  save(); lgApplyFilterAndRender();
+}
 function lgApplyFilterAndRender(){
   if(!lgDataCache) return;
   var q  = document.getElementById("lgFilterSku").value.trim().toLowerCase();
   var wq = document.getElementById("lgFilterEw").value.trim().toLowerCase();
+  var hid = lgHiddenSet_(), hiddenCnt = {};
   var rows = lgDataCache.rows.filter(function(r){
     if(q && String(r.상품코드||"").toLowerCase().indexOf(q)<0 && String(r.상품명||"").toLowerCase().indexOf(q)<0) return false;
     if(wq && String(r.법인명||"").toLowerCase().indexOf(wq)<0 && String(r.창고명||"").toLowerCase().indexOf(wq)<0) return false;
+    if(hid.has(r.상품코드)){ hiddenCnt[r.상품코드]=1; if(!lgShowHidden) return false; }
     return true;
   });
+  var hc=document.getElementById("lgHiddenCnt"); if(hc){ var n=Object.keys(hiddenCnt).length; hc.textContent=n?"("+n+"개)":""; }
   lgRenderLedger(rows, lgYmCache);
 }
 ["lgFilterSku","lgFilterEw"].forEach(function(id){
   document.getElementById(id).addEventListener("input", lgApplyFilterAndRender);
+});
+document.getElementById("lgShowHidden").addEventListener("change", function(e){ lgShowHidden=e.target.checked; lgApplyFilterAndRender(); });
+document.getElementById("lgTable").addEventListener("click", function(e){
+  var b=e.target.closest("[data-lg-hide]"); if(!b) return;
+  e.stopPropagation(); lgToggleHidden_(b.dataset.lgHide);
 });
 document.getElementById("btnLgFilterReset").addEventListener("click", function(){
   document.getElementById("lgFilterSku").value=""; document.getElementById("lgFilterEw").value="";
@@ -6771,22 +6792,27 @@ function lgRenderLedger(rows, ym){
   }).join("")+"</tr>";
 
   var totQty=0, totSku={}, totWh={}, amtByCcy={}, shown=0, html=[];
+  var hidSet = lgHiddenSet_();
   rows.forEach(function(r){
     var m = lgMonthlyAt(r.monthly, ym);
     if(!m) return;
     shown++;
+    var isHid = hidSet.has(r.상품코드);
     var inQ  = (m.매입수량||0)+(m.무상매입||0)+(m.반품입고||0);
     var outQ = (m.판매출고||0)+(m.기타출고||0);
     var itc  = (m.사간거래IN||0)-(m.사간거래OUT||0);
     var mv   = (m.창고이동IN||0)-(m.창고이동OUT||0);
-    totQty += Number(m.기말수량)||0;
-    totSku[r.상품코드]=1; totWh[r.창고코드]=1;
     var ccy = m.통화코드||"KRW";
-    amtByCcy[ccy] = (amtByCcy[ccy]||0) + (Number(m.기말금액)||0);
+    if(!isHid){   // 숨긴 상품은 "숨김 상품 보기"로 보여도 합계에는 넣지 않는다(재고 대시보드와 같은 규칙)
+      totQty += Number(m.기말수량)||0;
+      totSku[r.상품코드]=1; totWh[r.창고코드]=1;
+      amtByCcy[ccy] = (amtByCcy[ccy]||0) + (Number(m.기말금액)||0);
+    }
     var neg = (Number(m.기말수량)||0) < 0;
-    html.push("<tr>"+
+    var hideBtn = '<button type="button" data-lg-hide="'+esc(r.상품코드)+'" title="'+(isHid?"숨김 해제(다시 표시)":"이 상품 숨기기 — 표시·합계에서만 빠지고 데이터는 그대로입니다")+'" style="border:none;background:none;cursor:pointer;padding:0 0 0 6px;font-size:12px;line-height:1;vertical-align:middle;opacity:'+(isHid?1:.3)+'">'+(isHid?"🙈":"👁")+"</button>";
+    html.push("<tr"+(isHid?' style="opacity:.55;background:var(--panel)"':"")+">"+
       "<td>"+esc(r.구분)+"</td>"+
-      '<td class="sku-c">'+esc(r.상품코드)+"</td>"+
+      '<td class="sku-c">'+esc(r.상품코드)+hideBtn+"</td>"+
       "<td>"+esc(r.법인명)+"</td><td>"+esc(r.창고명)+"</td>"+
       '<td class="name-c">'+esc(r.상품명)+"</td>"+
       "<td>"+lgStatusChip(r.재고상태)+"</td>"+
