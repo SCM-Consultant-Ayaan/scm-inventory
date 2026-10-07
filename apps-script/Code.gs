@@ -5,7 +5,7 @@
  *  - 신규 요청 → 예약재고 / 홀딩재고 자동 판정 (현재고·확정예약·앞순위 홀딩·입고예정 반영)
  *  - 홀딩재고 → 예약재고 자동 전환 (가용재고만으로 출고 가능해졌을 때)
  *  - Gmail 발주서 첨부(회사 표준 PURCHASE ORDER 엑셀) → [예약 재고 관리] 자동 등록 + 슬랙 알림
- *  - 업체별 묶음 출고 계획(14일 단위) + 출고 D-5 / D-3 / 당일 슬랙 알림
+ *  - 업체별 묶음 출고 계획(같은 날 출고) + 출고 D-5 / D-3 / 당일 슬랙 알림
  *
  * 설치 방법은 apps-script/README.md 참고.
  * 기존 코드가 있는 프로젝트에 "새 파일"로 추가해도 되도록 모든 이름에 rsv / RSV_ 접두어를 붙였고,
@@ -91,8 +91,6 @@ var RSV_CONFIG = {
   SLACK_THREAD_DAYS: 60,
 
   // ---- 묶음 출고 / 출고 예정 알림 ----
-  // 같은 업체 건 중 출고 희망일(C 사용 예정일)이 이 일수 안에 있으면 한 번에 출고하도록 묶는다
-  BUNDLE_DAYS: 14,
   BUNDLE_SHEET: '묶음출고계획',
   // 매일 이 시각(시)에 출고 예정 알림을 슬랙으로 보냄. 주말·[휴무일] 시트의 날짜에는 보내지 않고,
   // 그 사이에 지나간 D-5 / D-3 알림은 다음 영업일 알림에 합쳐 보낸다.
@@ -942,53 +940,32 @@ function rsvImportMail_() {
 // =====================================================================
 
 /**
- * 출고 전 건을 업체별로 묶는다 (순수 함수). results[i].bundle 에 "B03 · 10/15 출고" 형태를 기록하고 묶음 목록을 반환.
- *  - 업체: E 업체명 → 없으면 입고처가 수출이면 용도 첫 단어(국가) → 그 외 입고처
- *  - 기준일: C 사용 예정일(지났으면 오늘). 비어 있으면 재고 확보일.
- *  - 가장 이른 기준일부터 BUNDLE_DAYS 안의 건 중, 그 출고일까지 재고가 확보되는 건을 한 번에 묶는다.
- *    출고일 = max(가장 이른 기준일, 그 건의 재고 확보일). 늦게 확보되는 건은 다음 묶음으로,
- *    확보일을 아예 모르는 건은 같은 묶음에 '미확보'로 포함.
+ * 출고 예정일 계산 + 묶음 (순수 함수). results[i].shipDate / .bundle 을 기록하고 묶음 목록을 반환.
+ *  - 출고 예정일 = 사용 예정일(C). 단, 이미 지났으면 오늘, 그날까지 재고가 확보되지 않으면 재고 확보일.
+ *    사용 예정일이 비어 있으면 재고 확보일, 그것도 모르면 '미정'.
+ *  - 묶음 = 같은 업체(E 업체명 → 없으면 수출은 용도 첫 단어, 그 외 입고처) + 같은 출고 예정일.
+ *    사용 예정일보다 앞당겨 묶지 않는다.
+ *  - 출고 예정일까지 재고 확보 시점을 모르는 건은 '미확보'로 표시.
  */
 function rsvPlanBundles(rows, results, now, cfg) {
   var today = rsvStartOfDay_(now), DAY = 86400000;
-  var items = [];
+  var byKey = {}, order = [];
   rows.forEach(function (r, i) {
     var res = results[i];
     if (!res.active || /^⚠ (수량|재고 분류|\[재고관리\])/.test(res.verdict)) return;
     var need = rsvToDate_(r.useDate, today);
     var avail = res.avail ? rsvStartOfDay_(res.avail) : null;
-    items.push({
-      i: i, r: r, key: rsvBundleKey_(r), need: need, avail: avail,
-      overdue: !!(need && need < today),
-      base: need ? (need < today ? today : need) : avail,
-    });
+    var base = need ? (need < today ? today : need) : avail;
+    var ship = base ? (avail && avail > base ? avail : base) : null;
+    var it = { i: i, r: r, need: need, avail: avail, overdue: !!(need && need < today) };
+    var k = rsvBundleKey_(r) + '|' + (ship ? ship.getTime() : '');
+    if (!byKey[k]) { byKey[k] = { key: rsvBundleKey_(r), ship: ship, items: [] }; order.push(k); }
+    byKey[k].items.push(it);
   });
-
-  var byKey = {};
-  items.forEach(function (it) { (byKey[it.key] = byKey[it.key] || []).push(it); });
-  var bundles = [];
-  Object.keys(byKey).forEach(function (key) {
-    var dated = byKey[key].filter(function (it) { return it.base; }).sort(function (a, b) { return a.base - b.base; });
-    var undated = byKey[key].filter(function (it) { return !it.base; });
-    while (dated.length) {
-      var first = dated[0];
-      var ship = first.avail && first.avail > first.base ? first.avail : first.base;
-      var limit = first.base.getTime() + cfg.BUNDLE_DAYS * DAY;
-      var members = [], rest = [];
-      dated.forEach(function (it, idx) {
-        var inWindow = it.base.getTime() <= limit;
-        var ready = it.avail && it.avail <= ship;
-        // 확보일을 모르는 건은 기다려도 날짜가 안 정해지므로 같은 묶음에 넣고 '미확보'로 표시
-        if (idx === 0 || (inWindow && (ready || !it.avail))) members.push(it); else rest.push(it);
-      });
-      bundles.push({ key: key, ship: ship, items: members });
-      dated = rest;
-    }
-    if (undated.length) bundles.push({ key: key, ship: null, items: undated });
-  });
+  var bundles = order.map(function (k) { return byKey[k]; });
 
   bundles.sort(function (a, b) {
-    if (!a.ship) return 1;
+    if (!a.ship) return b.ship ? 1 : (a.key < b.key ? -1 : 1);
     if (!b.ship) return -1;
     return a.ship - b.ship || (a.key < b.key ? -1 : 1);
   });
@@ -1029,7 +1006,7 @@ function rsvWriteBundleSheet_(ss, bundles, now) {
     ];
   });
   sh.clearContents();
-  sh.getRange(1, 1).setValue('업체별 묶음 출고 계획 (자동 생성, ' + rsvFmtDateTime_(now) + ' 기준 · ' + RSV_CONFIG.BUNDLE_DAYS + '일 안의 건을 묶음)');
+  sh.getRange(1, 1).setValue('업체별 묶음 출고 계획 (자동 생성, ' + rsvFmtDateTime_(now) + ' 기준 · 같은 업체 + 같은 출고 예정일(= 사용 예정일, 재고 늦으면 확보일)을 묶음)');
   sh.getRange(2, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#d9d9d9');
   if (data.length) {
     sh.getRange(3, 1, data.length, header.length).setValues(data);
