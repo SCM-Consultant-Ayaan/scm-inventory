@@ -77,6 +77,8 @@ var RSV_CONFIG = {
   MAIL_REGISTRANT: '메일자동',
   // PO 로 등록하는 건의 입고처(E)
   PO_CHANNEL: '수출',
+  // 메일 PO 의 빈 사용 예정일(C) 자동 기재: 출고 가능일이 이 일수 안에 모이는 품목끼리 한 번에 출고
+  USE_DATE_BUNDLE_DAYS: 10,
   // 발주서 업체명 → 업체명(F) 드롭다운 값. 회사명 정리(㈜·코퍼레이션 등 제거) 후 드롭다운과 비슷하면 자동으로 맞춤.
   // 영문명처럼 자동으로 안 맞는 업체만 여기에 추가 (왼쪽: 발주서에 적힌 이름의 일부, 오른쪽: 드롭다운 값)
   COMPANY_ALIASES: {
@@ -489,7 +491,7 @@ function rsvRunAllocation(opts) {
 
     // 메일로 등록된 PO 의 빈 사용 예정일(C) → 같은 PO 품목을 최대한 한 번에 출고할 수 있는 날짜로 자동 기재
     var keys = values.map(function (v) { return String(v[RSV_COL.mailKey - 1] || ''); });
-    var fill = rsvSuggestUseDates(rows, keys, result, now);
+    var fill = rsvSuggestUseDates(rows, keys, result, now, RSV_CONFIG.USE_DATE_BUNDLE_DAYS);
     var filled = Object.keys(fill);
     if (filled.length) {
       filled.forEach(function (i) {
@@ -500,7 +502,7 @@ function rsvRunAllocation(opts) {
       result = rsvAllocate(rows, inventory, now, RSV_CONFIG);
       var stampFill = rsvFmtDateTime_(now);
       filled.forEach(function (i) {
-        var note = stampFill + ' 사용예정일 자동 기재 ' + rsvFmtMD_(fill[i]) + ' (같은 PO 묶음 출고 기준)';
+        var note = stampFill + ' 사용예정일 자동 기재 ' + rsvFmtMD_(fill[i]) + ' (같은 PO ' + RSV_CONFIG.USE_DATE_BUNDLE_DAYS + '일 단위 묶음 출고 기준)';
         result[i].logAppend = (result[i].logAppend ? result[i].logAppend + '\n' : '') + note;
       });
     }
@@ -1056,28 +1058,47 @@ function rsvPlanBundles(rows, results, now, cfg) {
 
 /**
  * 메일 PO 행의 빈 사용 예정일(C) 제안 (순수 함수). 반환: {행 인덱스: 날짜}
- *  같은 PO(메일키 po:<PO No.>|) 의 출고 전 품목 중 출고 가능일이 가장 늦은 날 = 모든 품목을 한 번에 보낼 수 있는 가장 빠른 날.
- *  같은 PO 에 이미 사용 예정일이 적힌 행이 있으면 그 날짜도 함께 고려 (나중에 추가된 품목이 기존 묶음에 합류).
- *  출고 가능일을 모르는 품목(재고 확보일 미정)은 제외. 전부 미정이면 비워 둔다.
+ *  같은 PO(메일키 po:<PO No.>|) 품목을 출고 가능일 기준 USE_DATE_BUNDLE_DAYS(10일) 단위로 묶는다.
+ *   - 가장 이른 출고 가능일 d 부터 d+10일 안에 출고 가능한 품목을 한 묶음으로 → 그 묶음에서 가장 늦은 출고 가능일에 함께 출고
+ *   - 남은 품목은 다음으로 이른 날부터 같은 방식으로 반복
+ *     예) 10/10 2종 · 10/23 3종 · 10/30 1종 → 10/10(2종) / 10/30(4종) 두 번
+ *   - 같은 PO 에 이미 적힌 사용 예정일이 출고 가능일 ~ +10일 안에 있으면 그 날짜에 합류 (나중에 추가된 품목 등)
+ *  출고 가능일을 모르는 품목(재고 확보일 미정)은 비워 둔다 (확보일이 잡히면 다음 재계산 때 채워짐).
  */
-function rsvSuggestUseDates(rows, keys, results, now) {
-  var today = rsvStartOfDay_(now), groups = {}, out = {};
+function rsvSuggestUseDates(rows, keys, results, now, days) {
+  var today = rsvStartOfDay_(now), DAY = 86400000, groups = {}, out = {};
+  var span = (days == null ? 10 : days) * DAY;
   rows.forEach(function (r, i) {
     var m = /^po:([^|]+)\|/.exec(keys[i] || '');
     if (m && r.name && results[i] && results[i].active) (groups[m[1]] = groups[m[1]] || []).push(i);
   });
   Object.keys(groups).forEach(function (po) {
     var idx = groups[po];
-    var blank = idx.filter(function (i) { return !rsvToDate_(rows[i].useDate, today); });
-    if (!blank.length) return;
-    var best = null;
+    var fixed = [], todo = [];
     idx.forEach(function (i) {
-      var d = rsvToDate_(rows[i].useDate, today) || (results[i].avail ? rsvStartOfDay_(results[i].avail) : null);
-      if (d && (!best || d > best)) best = d;
+      var c = rsvToDate_(rows[i].useDate, today);
+      if (c) { fixed.push(c); return; }
+      var a = results[i].avail ? rsvStartOfDay_(results[i].avail) : null;
+      if (!a) return;
+      todo.push({ i: i, a: a < today ? today : a });
     });
-    if (!best) return;
-    if (best < today) best = today;
-    blank.forEach(function (i) { out[i] = best; });
+    fixed.sort(function (x, y) { return x - y; });
+    // 이미 정해진 출고일에 합류
+    todo = todo.filter(function (t) {
+      var hit = fixed.filter(function (f) { return f >= t.a && f - t.a <= span; })[0];
+      if (hit) { out[t.i] = hit; return false; }
+      return true;
+    });
+    // 남은 품목: 10일 단위 묶음
+    todo.sort(function (x, y) { return x.a - y.a; });
+    var k = 0;
+    while (k < todo.length) {
+      var start = todo[k].a, end = k;
+      while (end + 1 < todo.length && todo[end + 1].a - start <= span) end++;
+      var ship = todo[end].a;
+      for (var j = k; j <= end; j++) out[todo[j].i] = ship;
+      k = end + 1;
+    }
   });
   return out;
 }
