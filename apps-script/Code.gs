@@ -498,7 +498,7 @@ function rsvRunAllocation(opts) {
     var rows = values.map(function (v, i) { return rsvRowFromValues_(v, RSV_CONFIG.FIRST_ROW + i); });
     var result = rsvAllocate(rows, inventory, now, RSV_CONFIG);
 
-    // 메일로 등록된 PO 의 빈 사용 예정일(C) → 같은 PO 품목을 최대한 한 번에 출고할 수 있는 날짜로 자동 기재
+    // 빈 사용 예정일(C) → 같은 건(메일 PO / 수기: 업체+용도) 품목을 10일 단위로 묶어 자동 기재
     var keys = values.map(function (v) { return String(v[RSV_COL.mailKey - 1] || ''); });
     var fill = rsvSuggestUseDates(rows, keys, result, now, RSV_CONFIG.USE_DATE_BUNDLE_DAYS);
     var filled = Object.keys(fill);
@@ -511,7 +511,7 @@ function rsvRunAllocation(opts) {
       result = rsvAllocate(rows, inventory, now, RSV_CONFIG);
       var stampFill = rsvFmtDateTime_(now);
       filled.forEach(function (i) {
-        var note = stampFill + ' 사용예정일 자동 기재 ' + rsvFmtMD_(fill[i]) + ' (같은 PO ' + RSV_CONFIG.USE_DATE_BUNDLE_DAYS + '일 단위 묶음 출고 기준)';
+        var note = stampFill + ' 사용예정일 자동 기재 ' + rsvFmtMD_(fill[i]) + ' (같은 건 ' + RSV_CONFIG.USE_DATE_BUNDLE_DAYS + '일 단위 묶음 출고 기준)';
         result[i].logAppend = (result[i].logAppend ? result[i].logAppend + '\n' : '') + note;
       });
     }
@@ -1121,20 +1121,24 @@ function rsvPlanBundles(rows, results, now, cfg) {
 }
 
 /**
- * 메일 PO 행의 빈 사용 예정일(C) 제안 (순수 함수). 반환: {행 인덱스: 날짜}
- *  같은 PO(메일키 po:<PO No.>|) 품목을 출고 가능일 기준 USE_DATE_BUNDLE_DAYS(10일) 단위로 묶는다.
+ * 빈 사용 예정일(C) 제안 (순수 함수). 반환: {행 인덱스: 날짜}
+ *  한 건 = 메일 PO 는 같은 PO No.(메일키 po:<PO No.>|), 수기 입력은 같은 업체 + 같은 용도.
+ *  한 건의 품목을 출고 가능일 기준 USE_DATE_BUNDLE_DAYS(10일) 단위로 묶는다.
  *   - 가장 이른 출고 가능일 d 부터 d+10일 안에 출고 가능한 품목을 한 묶음으로 → 그 묶음에서 가장 늦은 출고 가능일에 함께 출고
  *   - 남은 품목은 다음으로 이른 날부터 같은 방식으로 반복
  *     예) 10/10 2종 · 10/23 3종 · 10/30 1종 → 10/10(2종) / 10/30(4종) 두 번
- *   - 같은 PO 에 이미 적힌 사용 예정일이 출고 가능일 ~ +10일 안에 있으면 그 날짜에 합류 (나중에 추가된 품목 등)
+ *   - 같은 건에 이미 적힌 사용 예정일이 출고 가능일 ~ +10일 안에 있으면 그 날짜에 합류 (나중에 추가된 품목 등)
  *  출고 가능일을 모르는 품목(재고 확보일 미정)은 비워 둔다 (확보일이 잡히면 다음 재계산 때 채워짐).
  */
 function rsvSuggestUseDates(rows, keys, results, now, days) {
   var today = rsvStartOfDay_(now), DAY = 86400000, groups = {}, out = {};
   var span = (days == null ? 10 : days) * DAY;
   rows.forEach(function (r, i) {
+    if (!r.name || !results[i] || !results[i].active) return;
+    // 메일 PO 는 PO No. 로, 수기 입력 건은 업체(없으면 입고처) + 용도로 한 건을 묶는다
     var m = /^po:([^|]+)\|/.exec(keys[i] || '');
-    if (m && r.name && results[i] && results[i].active) (groups[m[1]] = groups[m[1]] || []).push(i);
+    var g = m ? 'po:' + m[1] : (r.purpose ? 'm:' + (r.company || r.channel) + '|' + r.purpose : '');
+    if (g) (groups[g] = groups[g] || []).push(i);
   });
   Object.keys(groups).forEach(function (po) {
     var idx = groups[po];
