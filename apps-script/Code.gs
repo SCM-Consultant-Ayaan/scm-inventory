@@ -1689,7 +1689,7 @@ function rsvNotifySlack_(pos, conversions) {
 
 /**
  * 요약(헤더)만 채널에 올리고 상세 내용은 그 메시지의 스레드 답글로 보낸다.
- * 웹훅(스레드 불가)이면 한 메시지로 합쳐서 보냄. 반환: 헤더 메시지 응답 (ts 포함)
+ * 웹훅(스레드 불가)이면 상세를 다음 메시지로 이어서 보냄. 반환: 헤더 메시지 응답 (ts 포함)
  */
 function rsvPostSlackThreaded_(head, detail) {
   var sent = rsvPostSlack_(head);
