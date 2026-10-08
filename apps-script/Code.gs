@@ -486,6 +486,24 @@ function rsvRunAllocation(opts) {
 
     var rows = values.map(function (v, i) { return rsvRowFromValues_(v, RSV_CONFIG.FIRST_ROW + i); });
     var result = rsvAllocate(rows, inventory, now, RSV_CONFIG);
+
+    // 메일로 등록된 PO 의 빈 사용 예정일(C) → 같은 PO 품목을 최대한 한 번에 출고할 수 있는 날짜로 자동 기재
+    var keys = values.map(function (v) { return String(v[RSV_COL.mailKey - 1] || ''); });
+    var fill = rsvSuggestUseDates(rows, keys, result, now);
+    var filled = Object.keys(fill);
+    if (filled.length) {
+      filled.forEach(function (i) {
+        values[i][RSV_COL.useDate - 1] = fill[i];
+        rows[i].useDate = fill[i];
+        sh.getRange(rows[i].row, RSV_COL.useDate).setValue(fill[i]);
+      });
+      result = rsvAllocate(rows, inventory, now, RSV_CONFIG);
+      var stampFill = rsvFmtDateTime_(now);
+      filled.forEach(function (i) {
+        var note = stampFill + ' 사용예정일 자동 기재 ' + rsvFmtMD_(fill[i]) + ' (같은 PO 묶음 출고 기준)';
+        result[i].logAppend = (result[i].logAppend ? result[i].logAppend + '\n' : '') + note;
+      });
+    }
     var bundles = rsvPlanBundles(rows, result, now, RSV_CONFIG);
 
     // 재고 분류(K) 변경분만 개별 기록 (사용자 입력과 충돌 최소화)
@@ -1036,6 +1054,34 @@ function rsvPlanBundles(rows, results, now, cfg) {
   return bundles;
 }
 
+/**
+ * 메일 PO 행의 빈 사용 예정일(C) 제안 (순수 함수). 반환: {행 인덱스: 날짜}
+ *  같은 PO(메일키 po:<PO No.>|) 의 출고 전 품목 중 출고 가능일이 가장 늦은 날 = 모든 품목을 한 번에 보낼 수 있는 가장 빠른 날.
+ *  같은 PO 에 이미 사용 예정일이 적힌 행이 있으면 그 날짜도 함께 고려 (나중에 추가된 품목이 기존 묶음에 합류).
+ *  출고 가능일을 모르는 품목(재고 확보일 미정)은 제외. 전부 미정이면 비워 둔다.
+ */
+function rsvSuggestUseDates(rows, keys, results, now) {
+  var today = rsvStartOfDay_(now), groups = {}, out = {};
+  rows.forEach(function (r, i) {
+    var m = /^po:([^|]+)\|/.exec(keys[i] || '');
+    if (m && r.name && results[i] && results[i].active) (groups[m[1]] = groups[m[1]] || []).push(i);
+  });
+  Object.keys(groups).forEach(function (po) {
+    var idx = groups[po];
+    var blank = idx.filter(function (i) { return !rsvToDate_(rows[i].useDate, today); });
+    if (!blank.length) return;
+    var best = null;
+    idx.forEach(function (i) {
+      var d = rsvToDate_(rows[i].useDate, today) || (results[i].avail ? rsvStartOfDay_(results[i].avail) : null);
+      if (d && (!best || d > best)) best = d;
+    });
+    if (!best) return;
+    if (best < today) best = today;
+    blank.forEach(function (i) { out[i] = best; });
+  });
+  return out;
+}
+
 function rsvBundleKey_(r) {
   if (r.company) return '업체:' + r.company;
   if (r.channel === '수출' && r.purpose) return '수출:' + r.purpose.split(/\s+/)[0];
@@ -1103,9 +1149,17 @@ function rsvSendShipAlert_() {
   var overdue = bundles.filter(function (b) { return b.overdue; });
   if (!targets.length && !overdue.length) return 0;
 
-  var lines = [':calendar: *출고 예정 알림* (' + rsvFmtMD_(new Date()) + ')'];
+  var dd = {};
+  targets.forEach(function (b) { var k = b.dday === 0 ? '오늘 출고' : 'D-' + b.dday; dd[k] = (dd[k] || 0) + 1; });
+  var notReady = targets.filter(function (b) { return b.notReady; }).length;
+  var head = ':calendar: *출고 예정 알림* (' + rsvFmtMD_(new Date()) + ')\n' +
+    (targets.length ? '• ' + Object.keys(dd).map(function (k) { return k + ' *' + dd[k] + '묶음*'; }).join(' · ') +
+      (notReady ? ' · :warning: 재고 미확보 ' + notReady + '묶음' : '') + '\n' : '') +
+    (overdue.length ? '• :rotating_light: 사용 예정일 지났는데 미출고 *' + overdue.length + '묶음*\n' : '') +
+    '• 묶음별 품목은 스레드에 :point_down:';
+  var lines = [];
   targets.forEach(function (b) {
-    lines.push('');
+    if (lines.length) lines.push('');
     lines.push('*' + (b.dday === 0 ? '🚚 오늘 출고' : 'D-' + b.dday) + ' · ' + rsvFmtMD_(b.ship) + ' · ' + b.company + '* (' +
       b.items.length + '건, ' + rsvFmtNum_(b.qty) + '개) ' + (b.notReady ? ':warning: 재고 미확보 ' + b.notReady + '건' : ':white_check_mark: 출고 가능') +
       (rsvIsBusinessDay_(b.ship, holidays) ? '' : ' :warning: 출고일이 휴무일'));
@@ -1118,9 +1172,10 @@ function rsvSendShipAlert_() {
   if (overdue.length) {
     lines.push('');
     lines.push(':rotating_light: 사용 예정일이 지났는데 출고 완료되지 않은 묶음 *' + overdue.length + '건* — 출고 여부(M열) 확인 필요');
+    overdue.forEach(function (b) { lines.push('• ' + b.company + ' · ' + b.purposes.join(' / ') + ' (' + b.items.length + '건)'); });
   }
   lines.push('<' + planUrl + '|묶음출고계획 시트 열기>');
-  rsvPostSlack_(lines.join('\n'));
+  rsvPostSlackThreaded_(head, lines.join('\n'));
   return targets.length;
 }
 
@@ -1275,18 +1330,18 @@ function rsvCompanyList_(sh) {
 
 /**
  * 시트에서 이 PO 의 행 찾기 (순수 함수).
- *  1) 메일키가 같은 PO No. 인 행  2) 없으면 용도가 같고(차수 포함) 업체명이 비슷한 행 (예: 뷰릿지 ↔ (주)뷰릿지코퍼레이션)
+ *  메일키가 같은 PO No. 인 행 + 용도가 같고(차수 포함) 업체명이 비슷한 행 (예: 뷰릿지 ↔ (주)뷰릿지코퍼레이션)
  */
 function rsvFindPoRows(rows, po) {
   var key = 'po:' + po.poNo + '|';
-  var byKey = rows.filter(function (r) { return r.name && r.key.indexOf(key) === 0; });
-  if (byKey.length) return byKey;
-  if (!/\d+차/.test(po.purpose)) return [];
-  var norm = rsvCompanyNorm;
-  var pc = norm(po.company);
+  var hasRound = /\d+차/.test(po.purpose);
+  var pc = rsvCompanyNorm(po.company);
+  // 메일키가 있는 행 + (차수가 있으면) 같은 용도·비슷한 업체명 행을 모두 — 일부 행에만 메일키가 있어도 나머지를 놓치지 않게
   return rows.filter(function (r) {
-    if (!r.name || r.purpose !== String(po.purpose).trim()) return false;
-    var rc = norm(r.company);
+    if (!r.name) return false;
+    if (r.key.indexOf(key) === 0) return true;
+    if (!hasRound || r.purpose !== String(po.purpose).trim()) return false;
+    var rc = rsvCompanyNorm(r.company);
     return !rc || !pc || rc.indexOf(pc) >= 0 || pc.indexOf(rc) >= 0;
   });
 }
@@ -1384,14 +1439,18 @@ function rsvCreateChangeRequest_(po, diff, msg, fname, existing) {
     var ss = SpreadsheetApp.getActive();
     var link = ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=A' + (last + 1);
     var actionable = diff.filter(function (d) { return !d.info; }).length;
-    var text = ':memo: *발주 수량 변경 요청 · 승인 필요* ' + RSV_CONFIG.CHANGE_NOTIFY_MENTION + '\n' +
-      '*PO* ' + po.poNo + '  ·  *업체* ' + (po.company || '-') + '  ·  ' + po.purpose + '  ·  `' + id + '`\n' +
-      diff.map(function (d) {
+    var count = {};
+    diff.forEach(function (d) { var t = d.type.split(' ')[0]; count[t] = (count[t] || 0) + 1; });
+    var head = ':memo: *발주 수량 변경 요청 · 승인 필요* · ' + po.purpose + ' / ' + (groupCompany || po.company || '-') + ' ' +
+      RSV_CONFIG.CHANGE_NOTIFY_MENTION + '\n' +
+      '• PO ' + po.poNo + ' · 변경 ' + diff.length + '건 (' +
+      Object.keys(count).map(function (t) { return t + ' ' + count[t]; }).join(' · ') + ')  `' + id + '`\n' +
+      (actionable ? '• 상세는 스레드에 :point_down:  ·  스레드에 *승인* / *반려* 답글' : '• 상세는 스레드에 :point_down:  ·  확인만 필요 (자동 반영 없음)');
+    var detail = diff.map(function (d) {
         return '• ' + d.name + ' — ' + rsvFmtNum_(d.oldQty) + ' → *' + rsvFmtNum_(d.newQty) + '* (' + d.type + (d.missing ? ', 발주서에서 빠짐' : '') + ')';
       }).join('\n') + '\n' +
-      (actionable ? '_이 스레드에 *승인* 또는 *반려* 라고 답글을 달면 시트에 반영됩니다 (또는 [변경요청] 시트 J열에서 선택)_\n' : '') +
       '<' + link + '|변경요청 시트 열기>  ·  메일: ' + mail.replace(/[<>]/g, '');
-    var sent = rsvPostSlack_(text);
+    var sent = rsvPostSlackThreaded_(head, detail);
     if (sent && sent.ts && actionable) {
       var props = PropertiesService.getScriptProperties();
       var map = JSON.parse(props.getProperty('RSV_CHANGE_THREADS') || '{}');
@@ -1602,17 +1661,22 @@ function rsvNotifySlack_(pos, conversions) {
       var lines = rows.map(function (v) {
         return '• ' + v[RSV_COL.name - 1] + ' — *' + rsvFmtNum_(rsvToNum_(v[RSV_COL.qty - 1])) + '개* → ' + (v[RSV_COL.verdict - 1] || v[RSV_COL.status - 1] || '판정 대기');
       });
-      var text = ':package: *신규 예약 등록 (메일 PO)*\n' +
-        '*PO* ' + p.poNo + '  ·  *업체* ' + (p.company || '-') + '  ·  ' + p.purpose + '\n' +
-        lines.join('\n') + '\n' +
-        '<' + base + 'A' + firstRow + '|시트에서 보기 (' + firstRow + '행~)>  ·  보낸사람 ' + String(p.from).replace(/[<>]/g, '') + '\n' +
-        '_출고하면 이 스레드에 "출고완료" 라고 답글을 달아주세요 → 시트 재고 분류가 자동으로 출고 완료로 바뀝니다_';
-      var sent = rsvPostSlack_(text);
+      var total = rows.reduce(function (s, v) { return s + rsvToNum_(v[RSV_COL.qty - 1]); }, 0);
+      var nRes = rows.filter(function (v) { return String(v[RSV_COL.status - 1]).indexOf('예약재고') === 0; }).length;
+      var nHold = rows.filter(function (v) { return String(v[RSV_COL.status - 1]).indexOf('홀딩재고') === 0; }).length;
+      var useDate = rows.map(function (v) { return rsvToDate_(v[RSV_COL.useDate - 1], new Date()); }).filter(Boolean)[0];
+      var head = ':package: *신규 예약 등록* · ' + p.purpose + ' / ' + (p.company || '-') + '\n' +
+        '• PO ' + p.poNo + ' · ' + (rows.length || p.count) + '종 / 총 ' + rsvFmtNum_(total) + '개' +
+        (rows.length ? ' (예약 ' + nRes + ' · 홀딩 ' + nHold + ')' : '') + (useDate ? ' · 사용예정 ' + rsvFmtMD_(useDate) : '') + '\n' +
+        '• 품목별 판정은 스레드에 :point_down:  ·  출고하면 스레드에 "출고완료" 답글';
+      var detail = (lines.length ? lines.join('\n') + '\n' : '') +
+        '<' + base + 'A' + firstRow + '|시트에서 보기 (' + firstRow + '행~)>  ·  보낸사람 ' + String(p.from).replace(/[<>]/g, '');
+      var sent = rsvPostSlackThreaded_(head, detail);
       if (sent && sent.ts) rsvTrackThread_(sent.ts, p.poNo);
     });
 
     if (conversions.length) {
-      rsvPostSlack_(':arrows_counterclockwise: *홀딩 → 예약 자동 전환 ' + conversions.length + '건*\n' +
+      rsvPostSlackThreaded_(':arrows_counterclockwise: *홀딩 → 예약 자동 전환 ' + conversions.length + '건*\n• 품목은 스레드에 :point_down:',
         conversions.map(function (r) {
           return '• <' + base + 'A' + r.row + '|' + r.row + '행> ' + r.name + ' ' + rsvFmtNum_(r.qty) + '개 (' + (r.company || r.channel || '-') + ')';
         }).join('\n'));
@@ -1621,6 +1685,21 @@ function rsvNotifySlack_(pos, conversions) {
     console.error('슬랙 알림 실패', err);
     try { rsvLogSheet_().appendRow([new Date(), '', '[슬랙]', '', '', '⚠ 슬랙 알림 실패: ' + err.message]); } catch (e) { /* 무시 */ }
   }
+}
+
+/**
+ * 요약(헤더)만 채널에 올리고 상세 내용은 그 메시지의 스레드 답글로 보낸다.
+ * 웹훅(스레드 불가)이면 한 메시지로 합쳐서 보냄. 반환: 헤더 메시지 응답 (ts 포함)
+ */
+function rsvPostSlackThreaded_(head, detail) {
+  var sent = rsvPostSlack_(head);
+  if (!detail) return sent;
+  if (sent && sent.ts) {
+    try { rsvPostSlack_(detail, sent.ts); } catch (e) { console.error('슬랙 스레드 상세 전송 실패', e); }
+  } else {
+    rsvPostSlack_(detail);
+  }
+  return sent;
 }
 
 /**
