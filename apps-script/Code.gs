@@ -62,7 +62,7 @@ var RSV_CONFIG = {
 
   // ---- 메일 발주서 자동 등록 ----
   MAIL_ENABLED: true,
-  // Gmail 검색어. 처리 완료/실패 라벨이 붙은 메일은 제외된다.
+  // Gmail 검색어. 이미 처리한 메일(메시지)은 RSV_MAIL_SEEN 기록으로 건너뛴다.
   MAIL_QUERY: 'has:attachment newer_than:14d',
   // 이 날짜 이후 받은 메일만 처리 (이전 메일은 이미 수기 등록된 것으로 간주). 'YYYY/MM/DD', 비우면 제한 없음
   MAIL_AFTER: '2026/10/06', // 본 시트 적용일. 이전 PO 는 수기 등록분과 겹치지 않도록 제외
