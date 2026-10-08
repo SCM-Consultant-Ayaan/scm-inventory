@@ -52,9 +52,15 @@ var RSV_CONFIG = {
   HOLD_WARN_DAYS: 80,
 
   // ---- 자동 정렬 ----
-  // 출고 전 건을 건(업체명+용도)별로 모으고, 건 안에서는 예약재고 → 홀딩재고, 각각 상품명 순으로 정렬.
-  // 건끼리는 그 건의 가장 이른 출고 예정일 순
+  // 자동 정렬. 정렬 방식은 메뉴에서 선택 (출고일 정렬 / 업체별 정렬) — 마지막 선택을 기억
+  //  출고일 정렬: 출고 예정일 → 업체 → 차수 → 예약/홀딩 → 상품명 (같이 나가는 출고 묶음끼리 모임)
+  //  업체별 정렬: 업체(가장 이른 출고일 순) → 출고 예정일 → 차수 → 예약/홀딩 → 상품명
   AUTO_SORT: true,
+  SORT_MODE_DEFAULT: 'ship', // 'ship' 출고일 정렬 / 'company' 업체별 정렬
+  // 묶음(출고일 정렬: 업체+출고일 / 업체별 정렬: 업체)이 바뀌는 행 위에 굵은 구분선
+  SORT_SEPARATOR: true,
+  SORT_LINE_COLOR: '#999999',     // 일반 행 사이 선 (시트 기존 테두리 색)
+  SORT_SEPARATOR_COLOR: '#434343',
   // true: 출고 완료 건을 위(기록), 출고 전 건을 아래에 / false: 출고 전 건을 위에
   SORT_DONE_FIRST: true,
   // 10분 자동 실행 때, 마지막 수정 후 이 분(min)이 안 지났으면 정렬을 미룸 (입력 중 행이 움직이지 않게)
@@ -169,6 +175,8 @@ function rsvOnOpen() {
   SpreadsheetApp.getUi()
     .createMenu('📦 예약재고 자동화')
     .addItem('지금 재계산 + 정렬', 'rsvRunAllocation')
+    .addItem('보기: 출고일 정렬 (출고 묶음)', 'rsvSortByShip')
+    .addItem('보기: 업체별 정렬 (업체 → 출고일 → 차수)', 'rsvSortByCompany')
     .addItem('메일 발주서 가져오기', 'rsvRunMailImport')
     .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
     .addItem('슬랙 알림 테스트', 'rsvTestSlack')
@@ -471,7 +479,7 @@ function rsvRule_(range, text, bg, fg) {
 /** opts.sort: false 면 정렬하지 않음 (기본: 정렬). 메뉴에서 실행하면 opts 가 없으므로 정렬한다. */
 function rsvRunAllocation(opts) {
   rsvAssertAllowed_();
-  var doSort = RSV_CONFIG.AUTO_SORT && !(opts && opts.sort === false);
+  var doSort = (opts && opts.sort === true) || (RSV_CONFIG.AUTO_SORT && !(opts && opts.sort === false));
   var lock = LockService.getDocumentLock();
   if (!lock.tryLock(30000)) return { conversions: [], bundles: [] };
   try {
@@ -562,42 +570,78 @@ function rsvRunAllocation(opts) {
   }
 }
 
+/** 메뉴: 출고일 정렬 (출고 묶음 단위) */
+function rsvSortByShip() { rsvSetSortMode_('ship'); }
+/** 메뉴: 업체별 정렬 (업체 → 출고일 → 차수) */
+function rsvSortByCompany() { rsvSetSortMode_('company'); }
+
+function rsvSetSortMode_(mode) {
+  rsvAssertAllowed_();
+  PropertiesService.getScriptProperties().setProperty('RSV_SORT_MODE', mode);
+  rsvRunAllocation({ sort: true });
+  rsvToast_(mode === 'company' ? '업체별 정렬로 바꿨습니다 (업체 → 출고일 → 차수)' : '출고일 정렬로 바꿨습니다 (출고 묶음 단위)');
+}
+
+function rsvSortMode_() {
+  try { return PropertiesService.getScriptProperties().getProperty('RSV_SORT_MODE') || RSV_CONFIG.SORT_MODE_DEFAULT; }
+  catch (e) { return RSV_CONFIG.SORT_MODE_DEFAULT; }
+}
+
+/** 숫자를 자릿수 맞춰 비교 (26-6차 < 26-8차 < 26-10차) */
+function rsvNaturalKey_(s) {
+  return String(s || '').replace(/\d+/g, function (d) { return ('000000000' + d).slice(-9); });
+}
+
 /**
- * 정렬 순서 (순수 함수). rows 와 같은 길이의 결과 → 새 순서대로 나열한 원래 인덱스 배열.
+ * 정렬 순서 (순수 함수). rows 와 같은 길이의 결과 → { order: 새 순서대로 나열한 원래 인덱스, group: 인덱스별 구분선 묶음 키 }
  *  출고 완료 건: SORT_DONE_FIRST 면 위, 아니면 아래 (서로의 순서는 그대로)
- *  출고 전 건: 건(업체명 + 용도) 단위로 모은다.
- *    건끼리: 그 건의 가장 이른 출고 예정일(D) → 업체명 → 용도
- *    건 안: 예약재고 → 홀딩재고 → 미판정, 각각 상품명 순
+ *  출고 전 건 — mode 'ship'   : 출고 예정일(D) → 업체 → 용도(차수 숫자순) → 예약/홀딩/미판정 → 상품명
+ *              — mode 'company': 업체(그 업체의 가장 이른 출고 예정일 순) → 출고 예정일 → 용도(차수) → 예약/홀딩 → 상품명
  *  상품명·수량이 모두 빈 행은 맨 아래
  */
-function rsvSortOrder(rows, results, cfg) {
-  var LAST = '\uffff';
+function rsvSortPlan(rows, results, cfg, mode) {
+  var LAST = '￿';
   var str = function (s) { return s ? String(s) : LAST; };
   var dateKey = function (d) { return d instanceof Date ? d.getTime() : d === '미정' ? 9e15 : 9.5e15; };
-  var groupOf = function (r) { return r.company + '\u0001' + r.purpose; };
   var isEmpty = function (r) { return !r.name && !(rsvToNum_(r.qty) > 0); };
   var isDone = function (r) { return r.status === cfg.STATUS_DONE || rsvIsShipped_(r); };
+  var who = function (r) { return r.company || r.channel || ''; };
 
-  // 건별 가장 이른 출고 예정일
+  // 업체별 가장 이른 출고 예정일 (업체별 정렬에서 업체끼리 순서)
   var first = {};
   rows.forEach(function (r, i) {
     if (isEmpty(r) || isDone(r)) return;
-    var k = groupOf(r), d = dateKey(results[i] && results[i].shipDate);
+    var k = who(r), d = dateKey(results[i] && results[i].shipDate);
     if (!(k in first) || d < first[k]) first[k] = d;
   });
 
+  var group = new Array(rows.length);
   var keyed = rows.map(function (r, i) {
-    var group = isEmpty(r) ? 3 : isDone(r) ? (cfg.SORT_DONE_FIRST ? 0 : 2) : 1;
-    var key = [group];
-    if (group === 1) {
+    var g = isEmpty(r) ? 3 : isDone(r) ? (cfg.SORT_DONE_FIRST ? 0 : 2) : 1;
+    var key = [g];
+    group[i] = 'g' + g;
+    if (g === 1) {
       var st = r.status.indexOf('예약재고') === 0 ? 0 : r.status.indexOf('홀딩재고') === 0 ? 1 : 2;
-      key.push(first[groupOf(r)], str(r.company), str(r.purpose), st, str(r.name));
+      var d = dateKey(results[i] && results[i].shipDate);
+      var purpose = r.purpose ? rsvNaturalKey_(r.purpose) : LAST;
+      if (mode === 'company') {
+        key.push(first[who(r)], str(who(r)), d, purpose, st, str(r.name));
+        group[i] = 'c:' + who(r);
+      } else {
+        key.push(d, str(who(r)), purpose, st, str(r.name));
+        group[i] = 's:' + d + '|' + who(r);
+      }
     }
     key.push(i);
     return { i: i, key: key };
   });
   keyed.sort(function (a, b) { return rsvCmpKey_(a.key, b.key); });
-  return keyed.map(function (k) { return k.i; });
+  return { order: keyed.map(function (k) { return k.i; }), group: group };
+}
+
+/** 이전 이름 호환: 순서 배열만 */
+function rsvSortOrder(rows, results, cfg, mode) {
+  return rsvSortPlan(rows, results, cfg, mode || 'ship').order;
 }
 
 /**
@@ -607,8 +651,9 @@ function rsvSortOrder(rows, results, cfg) {
  */
 function rsvSortRows_(sh, rows, results) {
   var n = rows.length;
-  var order = rsvSortOrder(rows, results, RSV_CONFIG);
-  if (order.every(function (idx, pos) { return idx === pos; })) return null;
+  var plan = rsvSortPlan(rows, results, RSV_CONFIG, rsvSortMode_());
+  var order = plan.order;
+  if (order.every(function (idx, pos) { return idx === pos; })) { rsvDrawSeparators_(sh, plan); return null; }
   var f = sh.getFilter(), filterA1 = null, criteria = [];
   if (f) {
     var fr = f.getRange();
@@ -640,9 +685,27 @@ function rsvSortRows_(sh, rows, results) {
   }
   keyRange.clearContent();
   restoreFilter();
+  rsvDrawSeparators_(sh, plan);
   var map = {};
   order.forEach(function (idx, pos) { map[RSV_CONFIG.FIRST_ROW + idx] = RSV_CONFIG.FIRST_ROW + pos; });
   return map;
+}
+
+/** 정렬 순서대로 놓인 행에서 묶음이 바뀌는 곳 위에 굵은 선 (나머지 행 사이는 기존 얇은 선) */
+function rsvDrawSeparators_(sh, plan) {
+  if (!RSV_CONFIG.SORT_SEPARATOR) return;
+  try {
+    var n = plan.order.length, F = RSV_CONFIG.FIRST_ROW, lastCol = rsvColumnLetter_(RSV_COL.log);
+    if (!n) return;
+    var thin = SpreadsheetApp.BorderStyle.SOLID, thick = SpreadsheetApp.BorderStyle.SOLID_MEDIUM;
+    sh.getRange(F, 1, n, RSV_COL.log).setBorder(null, null, null, null, null, true, RSV_CONFIG.SORT_LINE_COLOR, thin);
+    var marks = [];
+    for (var pos = 1; pos < n; pos++) {
+      var g = plan.group[plan.order[pos]], prev = plan.group[plan.order[pos - 1]];
+      if (g !== prev && g !== 'g3') marks.push('A' + (F + pos) + ':' + lastCol + (F + pos));
+    }
+    if (marks.length) sh.getRangeList(marks).setBorder(true, null, null, null, null, null, RSV_CONFIG.SORT_SEPARATOR_COLOR, thick);
+  } catch (e) { rsvWarnOnce_('정렬 구분선 그리기 실패: ' + e.message); }
 }
 
 /**
@@ -2310,5 +2373,5 @@ function rsvFmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
+  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
 }
