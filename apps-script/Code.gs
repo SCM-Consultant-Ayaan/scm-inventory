@@ -1257,7 +1257,11 @@ function rsvMatchCompany(name, list, aliases) {
 /** 업체명(F) 드롭다운 값 목록. 드롭다운(목록/범위) 이 없으면 null */
 function rsvCompanyList_(sh) {
   try {
-    var dv = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.company).getDataValidation();
+    var last = rsvLastDataRow_(sh), dv = null;
+    [RSV_CONFIG.FIRST_ROW, last, last + 1].some(function (r) {
+      if (r >= RSV_CONFIG.FIRST_ROW) dv = sh.getRange(r, RSV_COL.company).getDataValidation();
+      return !!dv;
+    });
     if (!dv) return null;
     var type = dv.getCriteriaType(), vals = dv.getCriteriaValues();
     if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) return vals[0].map(String);
