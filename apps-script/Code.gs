@@ -2617,6 +2617,62 @@ function rsvBuildShipSchedule(company) {
   }
 }
 
+// =====================================================================
+// [재고관리] X열: 권장수량 발주 시 소진 예상일 (한 번만 실행하는 설치 함수)
+// =====================================================================
+
+/**
+ * 편집기에서 한 번 실행: [재고관리] W열(발주 권장수량) 오른쪽에 X열을 새로 끼워 넣고
+ *  X  = 권장수량대로 발주했을 때 소진 예상일 = 오늘 + (미래 재고 R + 권장수량 W) / 일평균 출고량 V
+ *  (기존 X 월평균 재고 → Y, 기존 Y 2개월치 재고 → Z 로 한 칸씩 밀림. 시트 안 수식 참조는 구글 시트가 자동으로 고침)
+ * 2개월치 재고(Z) 수식은 월별 열(AA~AT)에서 0 인 달을 빼고 마지막 두 달을 더하도록 다시 쓴다.
+ * 다시 실행해도 열을 또 끼우지 않고 수식만 다시 씀.
+ */
+function rsvAddRunoutColumn() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(RSV_CONFIG.INV_SHEET);
+  var HEAD = '권장수량 발주 시\n소진 예상일';
+  var head = function (col) { return String(sh.getRange(3, col).getValue()).trim(); };
+  var X = 24; // X열
+  if (head(X).replace(/\s/g, '') !== HEAD.replace(/\s/g, '')) {
+    if (head(X) !== '월평균 재고' || head(X + 1) !== '2개월치 재고') {
+      throw new Error('[재고관리] X3/Y3 머리글이 예상과 다릅니다 (X3="' + head(X) + '", Y3="' + head(X + 1) + '"). 구조를 확인해 주세요.');
+    }
+    sh.insertColumnBefore(X);
+    var lastRow = sh.getMaxRows();
+    sh.getRange(1, 19, lastRow, 1).copyFormatToRange(sh, X, X, 1, lastRow); // S열(최종 소진 예상, 날짜) 서식을 그대로
+    sh.setColumnWidth(X, sh.getColumnWidth(19));
+  }
+  sh.getRange(2, X).setValue('*자동(미래 재고+권장수량)/일평균 출고량\n입고 리드타임 미반영');
+  sh.getRange(3, X).setValue(HEAD);
+
+  // 데이터 행: E열(상품명)이 있는 4행~마지막 행
+  var last = sh.getLastRow();
+  var names = sh.getRange(4, 5, last - 3, 1).getValues();
+  var end = 3;
+  names.forEach(function (v, i) { if (String(v[0]).trim() !== '') end = 4 + i; });
+  var n = end - 3;
+  if (n <= 0) return;
+
+  // X: 권장수량 발주 시 소진 예상일 (권장수량이 숫자가 아니면 빈칸)
+  var fx = [], fz = [];
+  for (var r = 4; r <= end; r++) {
+    fx.push(['=IF(OR(N($W' + r + ')<=0,N($V' + r + ')<=0,NOT(ISNUMBER($R' + r + '))),"",' +
+      'IF($R' + r + '+$W' + r + '<=0,"결품",TODAY()+($R' + r + '+$W' + r + ')/$V' + r + '))']);
+    fz.push(['=IFERROR(LET(vals,FILTER($AA' + r + ':$AT' + r + ',ISNUMBER($AA' + r + ':$AT' + r + '),$AA' + r + ':$AT' + r + '<>0),' +
+      'n,COUNT(vals),IF(n=0,"",IF(n>=2,INDEX(vals,1,n)+INDEX(vals,1,n-1),INDEX(vals,1,n)))),"")']);
+  }
+  sh.getRange(4, X, n, 1).setFormulas(fx).setNumberFormat('yyyy-mm-dd');
+
+  // Z(2개월치 재고): 기존에 수식이 있던 행만 0 제외 버전으로 교체
+  var zr = sh.getRange(4, X + 2, n, 1), zf = zr.getFormulas();
+  var out = zf.map(function (f, i) { return [f[0] ? fz[i][0] : f[0]]; });
+  var vals = zr.getValues();
+  zr.setValues(out.map(function (f, i) { return [f[0] || vals[i][0]]; }));
+  SpreadsheetApp.flush();
+  rsvToast_('[재고관리] X열(권장수량 발주 시 소진 예상일) ' + n + '행 · 2개월치 재고(Z) 0 제외 수식 적용 완료');
+}
+
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
   module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
