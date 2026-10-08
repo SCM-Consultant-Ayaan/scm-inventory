@@ -2379,7 +2379,7 @@ function rsvFmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(
 /** 메뉴: 업체를 골라 출고 가능 일정 엑셀(.xlsx)을 내려받는다 */
 function rsvShipScheduleDialog() {
   rsvAssertAllowed_();
-  rsvRunAllocation({ sort: false }); // 출고 예정일(D) 최신화
+  // 재계산은 10분 자동 실행·편집 시 이미 돌고 있으므로 여기서는 시트의 현재 출고 예정일(D)을 그대로 쓴다 (빠르게 열리도록)
   var companies = rsvScheduleCompanies(rsvReadScheduleRows_());
   if (!companies.length) { rsvToast_('출고 전 예약/홀딩 건이 없습니다'); return; }
   var opts = companies.map(function (c) {
