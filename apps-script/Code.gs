@@ -85,8 +85,6 @@ var RSV_CONFIG = {
   PO_CHANNEL: '수출',
   // 메일 PO 의 빈 사용 예정일(C) 자동 기재: 출고 가능일이 이 일수 안에 모이는 품목끼리 한 번에 출고
   USE_DATE_BUNDLE_DAYS: 10,
-  // 출고 가능 일정 파일: 비고(N)를 넣을지. 내부 메모가 업체에 나가면 안 되면 false
-  SCHEDULE_INCLUDE_MEMO: true,
   // 발주서 업체명 → 업체명(F) 드롭다운 값. 회사명 정리(㈜·코퍼레이션 등 제거) 후 드롭다운과 비슷하면 자동으로 맞춤.
   // 영문명처럼 자동으로 안 맞는 업체만 여기에 추가 (왼쪽: 발주서에 적힌 이름의 일부, 오른쪽: 드롭다운 값)
   COMPANY_ALIASES: {
@@ -2393,7 +2391,7 @@ function rsvShipScheduleDialog() {
     'select{width:100%;padding:8px;font-size:14px;margin:8px 0 14px}' +
     'button{background:#1a73e8;color:#fff;border:0;border-radius:4px;padding:9px 18px;font-size:14px;cursor:pointer}' +
     'button:disabled{background:#9bbcf0}#msg{margin-top:14px;line-height:1.6}a{color:#1a73e8}</style>' +
-    '<div>업체를 고르면 출고 전(예약·홀딩) 품목의 <b>출고 가능일 · 제품 · 수량 · 출고 차수 · 비고</b>를 엑셀로 내려받습니다.</div>' +
+    '<div>업체를 고르면 출고 전(예약·홀딩) 품목의 <b>출고 가능일 · 제품 · 수량 · 출고 차수</b>를 엑셀로 내려받습니다. (비고 칸은 비워 둠)</div>' +
     '<select id="c">' + opts + '</select>' +
     '<button id="b" onclick="go()">엑셀 만들기</button><div id="msg"></div>' +
     '<script>' +
@@ -2444,17 +2442,22 @@ function rsvScheduleCompanies(rows) {
   return list.sort(function (a, b) { return a.first - b.first || (a.name < b.name ? -1 : 1); });
 }
 
-/** 비고에서 내부용 메모(PO 번호·원문·업체 매칭 메모)를 뺀 나머지 */
-function rsvScheduleMemo_(memo) {
-  if (!RSV_CONFIG.SCHEDULE_INCLUDE_MEMO) return '';
-  return String(memo || '').split(/\s+\/\s+/).filter(function (t) {
-    return t && !/^(PO\s|원문:|업체:)/.test(t);
-  }).join(', ');
+/** 용도들에서 차수 번호만 모아 '7·8·10차' (차수가 없으면 '') */
+function rsvScheduleRounds(purposes) {
+  var nums = [];
+  purposes.forEach(function (p) {
+    var m = String(p).match(/(\d+)\s*차/g);
+    if (!m) return;
+    var n = +m[m.length - 1].replace(/\D/g, '');
+    if (nums.indexOf(n) < 0) nums.push(n);
+  });
+  nums.sort(function (a, b) { return a - b; });
+  return nums.length ? nums.join('·') + '차' : '';
 }
 
 /**
- * 출고 가능 일정 (순수 함수). 같은 출고일 + 같은 제품 + 같은 비고는 한 줄로 합치고 차수를 모두 적는다.
- * 반환: [{ date: Date|null(미정), items: [{name, qty, purposes:[], memo, merged}] , qty }]  — 날짜순, 미정은 맨 뒤
+ * 출고 가능 일정 (순수 함수). 같은 출고일 + 같은 제품은 한 줄로 합치고 차수를 모두 적는다.
+ * 반환: [{ date: Date|null(미정), items: [{name, qty, purposes:[], merged}] , qty }]  — 날짜순, 미정은 맨 뒤
  */
 function rsvShipSchedule(rows, company) {
   var groups = {}, order = [];
@@ -2463,9 +2466,8 @@ function rsvShipSchedule(rows, company) {
     var d = rsvToDate_(r.ship, new Date());
     var dk = d ? d.getTime() : 'x';
     if (!groups[dk]) { groups[dk] = { date: d, items: [], byKey: {}, qty: 0 }; order.push(dk); }
-    var g = groups[dk], memo = rsvScheduleMemo_(r.memo), key = r.name + '\u0001' + memo;
-    var it = g.byKey[key];
-    if (!it) { it = g.byKey[key] = { name: r.name, qty: 0, purposes: [], memo: memo }; g.items.push(it); }
+    var g = groups[dk], it = g.byKey[r.name];
+    if (!it) { it = g.byKey[r.name] = { name: r.name, qty: 0, purposes: [] }; g.items.push(it); }
     it.qty += r.qty; g.qty += r.qty;
     if (r.purpose && it.purposes.indexOf(r.purpose) < 0) it.purposes.push(r.purpose);
   });
@@ -2488,9 +2490,15 @@ function rsvBuildShipSchedule(company) {
   var groups = rsvShipSchedule(rsvReadScheduleRows_(), company);
   if (!groups.length) throw new Error(company + ' 의 출고 전 예약/홀딩 건이 없습니다');
   var now = new Date(), today = rsvStartOfDay_(now), DAY = 86400000;
-  var fname = String(company).replace(/[\\\/:*?"<>|]/g, '_') + '_출고 가능 일정_' + rsvPad_(now.getMonth() + 1) + rsvPad_(now.getDate());
-  var totalQty = 0, totalItems = 0;
-  groups.forEach(function (g) { totalQty += g.qty; totalItems += g.items.length; });
+  var totalQty = 0, totalItems = 0, allPurposes = [];
+  groups.forEach(function (g) {
+    totalQty += g.qty; totalItems += g.items.length;
+    g.items.forEach(function (it) { allPurposes = allPurposes.concat(it.purposes); });
+  });
+  var rounds = rsvScheduleRounds(allPurposes);
+  // 파일명: 업체명_차수들_출고 일정_MMDD (예: 뷰릿지_7·8·10차_출고 일정_1008)
+  var fname = [company, rounds, '출고 일정', rsvPad_(now.getMonth() + 1) + rsvPad_(now.getDate())]
+    .filter(String).join('_').replace(/[\\\/:*?"<>|]/g, '_');
 
   var tmp = SpreadsheetApp.create(fname);
   try {
@@ -2501,7 +2509,7 @@ function rsvBuildShipSchedule(company) {
     var sh = tmp.getSheets()[0];
     sh.setName('출고 리스트');
     var COLS = 6;
-    sh.getRange(1, 1, 1, COLS).merge().setValue(company + '  출고 가능 일정')
+    sh.getRange(1, 1, 1, COLS).merge().setValue(company + (rounds ? '  ' + rounds : '') + '  출고 가능 일정')
       .setFontSize(16).setFontWeight('bold').setFontColor(C.title);
     sh.getRange(2, 1, 1, COLS).merge().setValue(
       '기준일 ' + rsvFmtYMD_(now) + '   ·   출고 ' + groups.length + '회   ·   총 ' + totalItems + '종 / ' + rsvFmtNum_(totalQty) + '개')
@@ -2515,8 +2523,7 @@ function rsvBuildShipSchedule(company) {
     groups.forEach(function (g, gi) {
       var start = data.length;
       g.items.forEach(function (it, k) {
-        data.push([g.date || '미정', k === 0 ? dday(g.date) : '', it.name, it.qty, it.purposes.join('\n'),
-          it.memo || (g.date ? '' : '재고 확보일 미정')]);
+        data.push([g.date || '미정', k === 0 ? dday(g.date) : '', it.name, it.qty, it.purposes.join('\n'), '']);
         fmt.push({ type: it.merged ? 'merged' : 'item', band: gi % 2, undecided: !g.date });
       });
       data.push(['', '', '소계  ' + g.items.length + '종', g.qty, '', '']);
@@ -2569,7 +2576,7 @@ function rsvBuildShipSchedule(company) {
 
     // ── 시트 2: 출고 일정 요약 ──
     var sm = tmp.insertSheet('출고 일정 요약', 0);
-    sm.getRange(1, 1, 1, 5).merge().setValue(company + '  출고 일정 요약').setFontSize(16).setFontWeight('bold').setFontColor(C.title);
+    sm.getRange(1, 1, 1, 5).merge().setValue(company + (rounds ? '  ' + rounds : '') + '  출고 일정 요약').setFontSize(16).setFontWeight('bold').setFontColor(C.title);
     sm.getRange(2, 1, 1, 5).merge().setValue('기준일 ' + rsvFmtYMD_(now) + '   ·   상세 품목은 [출고 리스트] 탭').setFontColor(C.muted);
     sm.getRange(4, 1, 1, 5).setValues([['출고 가능일', 'D-day', '품목 수', '총 수량', '출고 차수']])
       .setBackground(C.head).setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center');
@@ -2612,5 +2619,5 @@ function rsvBuildShipSchedule(company) {
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
+  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
 }
