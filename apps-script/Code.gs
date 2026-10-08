@@ -24,6 +24,7 @@ var RSV_CONFIG = {
   INV_SHEET: '재고관리',
   MASTER_SHEET: '상품 마스터 시트(수기)',
   LOG_SHEET: '메일수신로그',
+  CHANGE_SHEET: '변경요청',
   MEMO_SHEET: '예약관리_참고메모',
   HEADER_ROW: 2,
   FIRST_ROW: 3,
@@ -90,6 +91,12 @@ var RSV_CONFIG = {
   SHIP_DONE_REPLY: /출고\s*완료/,
   // 이 일수가 지난 스레드는 더 이상 확인하지 않음
   SLACK_THREAD_DAYS: 60,
+  // 이미 등록된 PO 의 수정 발주서가 오면 바로 바꾸지 않고 변경요청으로 올린다.
+  // 담당자 멘션 (예: '<@U01ABCDEF>' 또는 '<!subteam^S0123>'), 비우면 멘션 없이 채널에 알림
+  CHANGE_NOTIFY_MENTION: '',
+  // 변경요청 스레드에서 승인/반려로 인정하는 답글
+  CHANGE_APPROVE_REPLY: /^\s*(승인|ok|오케이)/i,
+  CHANGE_REJECT_REPLY: /^\s*(반려|거절)/,
 
   // ---- 묶음 출고 / 출고 예정 알림 ----
   BUNDLE_SHEET: '묶음출고계획',
@@ -156,7 +163,8 @@ function rsvOnOpen() {
     .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
     .addItem('슬랙 알림 테스트', 'rsvTestSlack')
     .addItem('출고 예정 알림 지금 보내기', 'rsvSendShipAlertNow')
-    .addItem('슬랙 "출고완료" 답글 지금 확인', 'rsvCheckSlackNow')
+    .addItem('슬랙 답글 지금 확인 (출고완료 · 변경 승인)', 'rsvCheckSlackNow')
+    .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow')
     .addSeparator()
     .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'rsvSetup')
     .addItem('트리거만 다시 설치', 'rsvInstallTriggers')
@@ -195,6 +203,15 @@ function rsvOnEditTrigger(e) {
   try {
     if (!e || !e.range) return;
     var sh = e.range.getSheet();
+    if (sh.getName() === RSV_CONFIG.CHANGE_SHEET) {
+      // 변경요청 시트에서 상태(J)를 승인/반려로 바꾸면 바로 반영
+      if (e.range.getColumn() <= RSV_CHG.status && e.range.getLastColumn() >= RSV_CHG.status) {
+        var who = '';
+        try { who = (e.user && e.user.getEmail && e.user.getEmail()) || ''; } catch (x) { /* 무시 */ }
+        rsvProcessChangeDecisions_(null, who ? '시트 · ' + who : '시트');
+      }
+      return;
+    }
     if (sh.getName() !== RSV_CONFIG.RES_SHEET) return;
     if (e.range.getLastRow() < RSV_CONFIG.FIRST_ROW) return;
     if (e.range.getColumn() > RSV_COL.priority) return;
@@ -213,6 +230,7 @@ function rsvRunScheduled() {
     try { res = rsvImportMail_(); } catch (err) { console.error('메일 처리 오류', err); }
   }
   try { rsvCheckSlackThreads_(); } catch (err) { console.error('슬랙 스레드 확인 오류', err); }
+  try { rsvCheckChangeThreads_(); } catch (err) { console.error('변경요청 스레드 확인 오류', err); }
   var lastEdit = Number(PropertiesService.getScriptProperties().getProperty('RSV_LAST_EDIT') || 0);
   var idle = Date.now() - lastEdit >= RSV_CONFIG.SORT_IDLE_MINUTES * 60000;
   rsvNotifySlack_(res.pos, rsvRunAllocation({ sort: idle }).conversions);
@@ -235,7 +253,7 @@ function rsvRunMailImport() {
   rsvAssertAllowed_();
   var res = rsvImportMail_();
   rsvNotifySlack_(res.pos, rsvRunAllocation().conversions);
-  rsvToast_('메일 발주서 ' + res.added + '건(행) 등록');
+  rsvToast_('메일 발주서 ' + res.added + '건(행) 등록' + (res.changes ? ' · 수량 변경요청 ' + res.changes + '건(승인 대기)' : ''));
 }
 
 // =====================================================================
@@ -448,6 +466,7 @@ function rsvRunAllocation(opts) {
     var sh = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
     if (!rsvLayoutOk_(sh)) { rsvToast_('구조가 최신이 아닙니다. 메뉴에서 "초기 설정"을 먼저 실행하세요.'); return { conversions: [], bundles: [] }; }
     var last = rsvLastDataRow_(sh);
+    rsvClearOrphanKeys_(sh);
     if (last < RSV_CONFIG.FIRST_ROW) return { conversions: [], bundles: [] };
     var n = last - RSV_CONFIG.FIRST_ROW + 1;
     var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, n, RSV_LAST_COL).getValues();
@@ -861,18 +880,9 @@ function rsvImportMail_() {
   var threads = GmailApp.search(q, 0, 30);
   if (!threads.length) return none;
 
-  var existingKeys = {};
-  var last = rsvLastDataRow_(sh);
-  if (last >= RSV_CONFIG.FIRST_ROW) {
-    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.mailKey, last - RSV_CONFIG.FIRST_ROW + 1, 1).getValues()
-      .forEach(function (v) {
-        if (!v[0]) return;
-        existingKeys[v[0]] = true;
-        existingKeys[String(v[0]).split('|')[0]] = true; // PO 단위 키
-      });
-  }
+  var processed = {}; // 이번 실행에서 이미 처리한 PO (같은 첨부가 답장 메일에 또 붙은 경우)
   var products = rsvReadProducts_(ss);
-  var added = 0, pos = [];
+  var added = 0, pos = [], changes = 0;
 
   threads.forEach(function (th) {
     var threadOk = true, touched = false;
@@ -891,7 +901,24 @@ function rsvImportMail_() {
           if (!po.lines.length) throw new Error('PO ' + po.poNo + ': 품목(품목명 + 총 수량)이 없음');
           rsvTranslateLines(po, rsvPoCatalog(grids));
           var poKey = 'po:' + po.poNo;
-          if (existingKeys[poKey]) { rsvWriteLog_(msg, fname, '건너뜀: 이미 등록된 PO ' + po.poNo); return; }
+          if (processed[poKey]) { rsvWriteLog_(msg, fname, '건너뜀: 같은 실행에서 이미 처리한 PO ' + po.poNo); return; }
+          processed[poKey] = true;
+
+          // 이미 시트에 있는 발주(같은 PO No. 또는 같은 업체·용도)면 → 수량 비교 후 변경요청(승인 대기)
+          var existing = rsvFindPoRows(rsvReadResRows_(sh), po);
+          if (existing.length) {
+            var lines = po.lines.map(function (ln) {
+              var prod = rsvResolveProduct(ln, products);
+              return { name: prod.name || ln.name, barcode: prod.barcode || '', qty: ln.qty, sourceRow: ln.sourceRow, memo: ln.memo };
+            });
+            var diff = rsvDiffPo(existing, lines, RSV_CONFIG);
+            if (!diff.length) { rsvWriteLog_(msg, fname, '변경 없음: 이미 등록된 발주와 수량 동일 · PO ' + po.poNo + ' · ' + po.purpose); return; }
+            var req = rsvCreateChangeRequest_(po, diff, msg, fname, existing);
+            if (req.dup) { rsvWriteLog_(msg, fname, '건너뜀: 같은 내용의 변경요청 ' + req.id + ' 승인 대기 중'); return; }
+            changes++;
+            rsvWriteLog_(msg, fname, '변경요청 ' + req.id + ' · ' + diff.length + '건 · PO ' + po.poNo + ' · ' + po.purpose + ' → 승인 대기');
+            return;
+          }
           var newRows = po.lines.map(function (ln) {
             var prod = rsvResolveProduct(ln, products);
             var row = new Array(RSV_LAST_COL);
@@ -933,7 +960,7 @@ function rsvImportMail_() {
   if (added && RSV_CONFIG.NOTIFY_TO) {
     MailApp.sendEmail(RSV_CONFIG.NOTIFY_TO, '[예약재고] 메일 발주서 ' + added + '행 등록', ss.getUrl());
   }
-  return { added: added, pos: pos };
+  return { added: added, pos: pos, changes: changes };
 }
 
 // =====================================================================
@@ -1146,6 +1173,332 @@ function rsvIsBusinessDay_(d, holidays) {
 }
 
 // =====================================================================
+// 수정 발주서 → 변경요청 (승인 후 반영)
+// =====================================================================
+
+// [변경요청] 시트 열
+var RSV_CHG = {
+  id: 1, at: 2, poNo: 3, company: 4, purpose: 5, name: 6, oldQty: 7, newQty: 8, type: 9,
+  status: 10, result: 11, mail: 12, data: 13, sig: 14,
+};
+var RSV_CHG_HEADERS = ['요청ID', '접수일시', 'PO No.', '업체', '용도', '상품명', '현재 수량', '변경 수량', '구분',
+  '상태 (승인/반려 선택)', '처리 결과', '메일', '데이터(자동)', '중복확인(자동)'];
+
+/** [예약 재고 관리] 행 목록 (변경 비교용) */
+function rsvReadResRows_(sh) {
+  var last = rsvLastDataRow_(sh);
+  if (last < RSV_CONFIG.FIRST_ROW) return [];
+  return sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues()
+    .map(function (v, i) {
+      return {
+        row: RSV_CONFIG.FIRST_ROW + i,
+        company: String(v[RSV_COL.company - 1] || '').trim(), purpose: String(v[RSV_COL.purpose - 1] || '').trim(),
+        name: String(v[RSV_COL.name - 1] || '').trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
+        status: String(v[RSV_COL.status - 1] || '').trim(), shipped: String(v[RSV_COL.shipped - 1] || '').trim(),
+        key: String(v[RSV_COL.mailKey - 1] || ''),
+      };
+    });
+}
+
+/**
+ * 시트에서 이 PO 의 행 찾기 (순수 함수).
+ *  1) 메일키가 같은 PO No. 인 행  2) 없으면 용도가 같고(차수 포함) 업체명이 비슷한 행 (예: 뷰릿지 ↔ (주)뷰릿지코퍼레이션)
+ */
+function rsvFindPoRows(rows, po) {
+  var key = 'po:' + po.poNo + '|';
+  var byKey = rows.filter(function (r) { return r.name && r.key.indexOf(key) === 0; });
+  if (byKey.length) return byKey;
+  if (!/\d+차/.test(po.purpose)) return [];
+  var norm = function (s) {
+    return String(s || '').toLowerCase().replace(/\(주\)|㈜|주식회사|코퍼레이션|corporation|co\.?,?\s*ltd\.?|inc\.?|[\s.,()]/g, '');
+  };
+  var pc = norm(po.company);
+  return rows.filter(function (r) {
+    if (!r.name || r.purpose !== String(po.purpose).trim()) return false;
+    var rc = norm(r.company);
+    return !rc || !pc || rc.indexOf(pc) >= 0 || pc.indexOf(rc) >= 0;
+  });
+}
+
+/**
+ * 기존 행 vs 수정 발주서 품목 비교 (순수 함수). 반환: 변경 목록
+ *  수량변경 / 취소(0 또는 발주서에서 빠짐) / 추가(새 품목) — 승인하면 반영
+ *  이미 출고 완료된 품목이 달라졌거나 같은 상품이 여러 행이면 '확인필요' (자동 반영 안 함)
+ */
+function rsvDiffPo(existing, lines, cfg) {
+  var isDone = function (r) { return r.status === cfg.STATUS_DONE || /^o$/i.test(r.shipped); };
+  var sum = function (rs) { return rs.reduce(function (s, r) { return s + r.qty; }, 0); };
+  var byName = {}, names = [];
+  existing.forEach(function (r) { if (!byName[r.name]) { byName[r.name] = []; names.push(r.name); } byName[r.name].push(r); });
+  var seen = {}, out = [];
+  lines.forEach(function (l) {
+    seen[l.name] = true;
+    var rs = byName[l.name] || [];
+    var open = rs.filter(function (r) { return !isDone(r); });
+    if (!rs.length) { out.push({ type: '추가', name: l.name, oldQty: 0, newQty: l.qty, line: l }); return; }
+    if (!open.length) {
+      if (sum(rs) !== l.qty) out.push({ type: '확인필요 (이미 출고 완료)', name: l.name, oldQty: sum(rs), newQty: l.qty, info: true });
+      return;
+    }
+    if (open.length > 1) {
+      if (sum(open) !== l.qty) out.push({ type: '확인필요 (같은 상품 ' + open.length + '행)', name: l.name, oldQty: sum(open), newQty: l.qty, info: true });
+      return;
+    }
+    var r = open[0];
+    if (r.qty !== l.qty) out.push({ type: l.qty > 0 ? '수량변경' : '취소', name: l.name, oldQty: r.qty, newQty: l.qty, target: r, line: l });
+  });
+  names.forEach(function (n) {
+    if (seen[n]) return;
+    byName[n].filter(function (r) { return !isDone(r); }).forEach(function (r) {
+      out.push({ type: '취소', name: n, oldQty: r.qty, newQty: 0, target: r, missing: true });
+    });
+  });
+  return out;
+}
+
+function rsvChangeSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(RSV_CONFIG.CHANGE_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(RSV_CONFIG.CHANGE_SHEET);
+    sh.getRange(1, 1, 1, RSV_CHG_HEADERS.length).setValues([RSV_CHG_HEADERS]).setFontWeight('bold').setBackground('#d9d9d9');
+    sh.setFrozenRows(1);
+    sh.hideColumns(RSV_CHG.data, 2);
+    sh.setColumnWidth(RSV_CHG.name, 280);
+    sh.setColumnWidth(RSV_CHG.status, 130);
+    sh.setColumnWidth(RSV_CHG.result, 280);
+    sh.getRange(2, RSV_CHG.status, sh.getMaxRows() - 1, 1).setDataValidation(
+      SpreadsheetApp.newDataValidation().requireValueInList(['대기', '승인', '반려', '확인필요'], true).build());
+    var st = sh.getRange(2, RSV_CHG.status, sh.getMaxRows() - 1, 1);
+    sh.setConditionalFormatRules([
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('대기').setBackground('#fff2cc').setRanges([st]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('승인').setBackground('#d9ead3').setRanges([st]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('반려').setBackground('#efefef').setRanges([st]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('확인필요').setBackground('#f4cccc').setRanges([st]).build(),
+    ]);
+  }
+  return sh;
+}
+
+/** 변경요청을 [변경요청] 시트에 올리고 슬랙으로 담당자에게 알린다. 같은 내용이 대기 중이면 {dup:true} */
+function rsvCreateChangeRequest_(po, diff, msg, fname, existing) {
+  // 새로 추가되는 품목은 기존 행과 같은 업체명으로 (묶음·정렬이 한 건으로 묶이게)
+  var groupCompany = (existing && existing[0] && existing[0].company) || po.company;
+  var sh = rsvChangeSheet_();
+  var sig = po.poNo + '|' + diff.map(function (d) { return d.name + ':' + d.oldQty + '>' + d.newQty; }).join(';');
+  var last = sh.getLastRow();
+  if (last >= 2) {
+    var dup = sh.getRange(2, 1, last - 1, RSV_CHG.sig).getValues().filter(function (v) {
+      return v[RSV_CHG.sig - 1] === sig && (v[RSV_CHG.status - 1] === '대기' || v[RSV_CHG.status - 1] === '확인필요');
+    })[0];
+    if (dup) return { dup: true, id: dup[RSV_CHG.id - 1] };
+  }
+  var now = new Date();
+  var id = 'CR-' + rsvFmtYMD_(now).slice(2).replace(/-/g, '') + '-' + rsvPad_(now.getHours()) + rsvPad_(now.getMinutes()) + '-' + (last);
+  var mail = (msg ? msg.getSubject() : '') + (fname ? ' / ' + fname : '');
+  var rows = diff.map(function (d) {
+    var data = {
+      poNo: po.poNo, company: groupCompany, purpose: po.purpose,
+      target: d.target ? { company: d.target.company, purpose: d.target.purpose, name: d.target.name, qty: d.target.qty } : null,
+      line: d.line || null,
+    };
+    return [id, now, po.poNo, po.company, po.purpose, d.name, d.oldQty, d.newQty, d.type + (d.missing ? ' (발주서에서 빠짐)' : ''),
+      d.info ? '확인필요' : '대기', '', mail, JSON.stringify(data), sig];
+  });
+  sh.getRange(last + 1, 1, rows.length, RSV_CHG_HEADERS.length).setValues(rows);
+  sh.getRange(last + 1, RSV_CHG.oldQty, rows.length, 2).setNumberFormat('#,##0');
+
+  // 슬랙: 담당자에게 승인 요청
+  try {
+    var ss = SpreadsheetApp.getActive();
+    var link = ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=A' + (last + 1);
+    var actionable = diff.filter(function (d) { return !d.info; }).length;
+    var text = ':memo: *발주 수량 변경 요청 · 승인 필요* ' + RSV_CONFIG.CHANGE_NOTIFY_MENTION + '\n' +
+      '*PO* ' + po.poNo + '  ·  *업체* ' + (po.company || '-') + '  ·  ' + po.purpose + '  ·  `' + id + '`\n' +
+      diff.map(function (d) {
+        return '• ' + d.name + ' — ' + rsvFmtNum_(d.oldQty) + ' → *' + rsvFmtNum_(d.newQty) + '* (' + d.type + (d.missing ? ', 발주서에서 빠짐' : '') + ')';
+      }).join('\n') + '\n' +
+      (actionable ? '_이 스레드에 *승인* 또는 *반려* 라고 답글을 달면 시트에 반영됩니다 (또는 [변경요청] 시트 J열에서 선택)_\n' : '') +
+      '<' + link + '|변경요청 시트 열기>  ·  메일: ' + mail.replace(/[<>]/g, '');
+    var sent = rsvPostSlack_(text);
+    if (sent && sent.ts && actionable) {
+      var props = PropertiesService.getScriptProperties();
+      var map = JSON.parse(props.getProperty('RSV_CHANGE_THREADS') || '{}');
+      map[sent.ts] = { id: id, at: Date.now() };
+      props.setProperty('RSV_CHANGE_THREADS', JSON.stringify(map));
+    }
+  } catch (err) {
+    rsvWarnOnce_('변경요청 슬랙 알림 실패: ' + err.message);
+  }
+  if (RSV_CONFIG.NOTIFY_TO) {
+    MailApp.sendEmail(RSV_CONFIG.NOTIFY_TO, '[예약재고] 발주 수량 변경 요청 ' + id + ' (승인 필요)',
+      diff.map(function (d) { return '- ' + d.name + ': ' + d.oldQty + ' → ' + d.newQty + ' (' + d.type + ')'; }).join('\n') +
+      '\n\n' + SpreadsheetApp.getActive().getUrl());
+  }
+  return { dup: false, id: id };
+}
+
+/** 메뉴: [변경요청] 시트에서 승인/반려로 바꿔 둔 건을 지금 반영 */
+function rsvProcessChangesNow() {
+  rsvAssertAllowed_();
+  var n = rsvProcessChangeDecisions_(null, '메뉴');
+  rsvToast_(n ? '변경요청 ' + n + '줄 반영' : '반영할 승인/반려 건이 없습니다');
+}
+
+/**
+ * [변경요청] 시트에서 상태가 승인/반려인데 처리 결과가 비어 있는 줄을 반영한다.
+ * onlyId 를 주면 그 요청만. 반환: 처리한 줄 수
+ */
+function rsvProcessChangeDecisions_(onlyId, by) {
+  var cs = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.CHANGE_SHEET);
+  if (!cs || cs.getLastRow() < 2) return 0;
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return 0;
+  var done = 0;
+  try {
+    var res = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
+    var vals = cs.getRange(2, 1, cs.getLastRow() - 1, RSV_CHG_HEADERS.length).getValues();
+    var stamp = rsvFmtDateTime_(new Date());
+    // 취소(행 삭제)를 먼저 처리해야 이후 변경·추가 결과의 행 번호가 맞다
+    var order = vals.map(function (v, i) { return i; });
+    order.sort(function (a, b) {
+      var ca = /^취소/.test(String(vals[a][RSV_CHG.type - 1])) ? 0 : 1, cb = /^취소/.test(String(vals[b][RSV_CHG.type - 1])) ? 0 : 1;
+      return ca - cb || a - b;
+    });
+    order.forEach(function (i) {
+      var v = vals[i];
+      var status = String(v[RSV_CHG.status - 1]).trim();
+      if ((status !== '승인' && status !== '반려') || String(v[RSV_CHG.result - 1]).trim()) return;
+      if (onlyId && v[RSV_CHG.id - 1] !== onlyId) return;
+      var out;
+      if (status === '반려') {
+        out = '반려 · ' + stamp + (by ? ' · ' + by : '');
+      } else {
+        var data = {};
+        try { data = JSON.parse(v[RSV_CHG.data - 1] || '{}'); } catch (e) { /* 무시 */ }
+        out = rsvApplyChange_(res, String(v[RSV_CHG.type - 1]), Number(v[RSV_CHG.newQty - 1]) || 0, data, stamp, v[RSV_CHG.id - 1]) +
+          ' · ' + stamp + (by ? ' · ' + by : '');
+      }
+      cs.getRange(i + 2, RSV_CHG.result).setValue(out);
+      done++;
+    });
+  } finally {
+    lock.releaseLock();
+  }
+  if (done) rsvRunAllocation({ sort: false });
+  return done;
+}
+
+/** 변경 1줄을 [예약 재고 관리]에 반영. 반환: 처리 결과 문구 */
+function rsvApplyChange_(sh, type, newQty, data, stamp, id) {
+  if (/^확인필요/.test(type)) return '⚠ 자동 반영 대상 아님 (직접 수정)';
+  var rows = rsvReadResRows_(sh);
+  var log = function (row, text) {
+    var c = sh.getRange(row, RSV_COL.log), old = String(c.getValue() || '');
+    c.setValue((old ? old + '\n' : '') + stamp + ' ' + text);
+  };
+  if (/^추가/.test(type)) {
+    var l = data.line || {};
+    var row = new Array(RSV_LAST_COL);
+    for (var k = 0; k < RSV_LAST_COL; k++) row[k] = '';
+    row[RSV_COL.created - 1] = rsvStartOfDay_(new Date());
+    row[RSV_COL.registrant - 1] = RSV_CONFIG.MAIL_REGISTRANT;
+    row[RSV_COL.channel - 1] = RSV_CONFIG.PO_CHANNEL;
+    row[RSV_COL.company - 1] = data.company || '';
+    row[RSV_COL.purpose - 1] = data.purpose || '';
+    row[RSV_COL.code - 1] = l.barcode || '';
+    row[RSV_COL.name - 1] = l.name || '';
+    row[RSV_COL.qty - 1] = newQty;
+    row[RSV_COL.memo - 1] = ['PO ' + data.poNo + ' 변경 추가', l.memo].filter(String).join(' / ');
+    row[RSV_COL.log - 1] = stamp + ' 변경요청 ' + id + ' 승인 → 품목 추가';
+    row[RSV_COL.mailKey - 1] = 'po:' + data.poNo + '|' + (l.sourceRow || '');
+    var at = rsvLastDataRow_(sh) + 1;
+    if (at > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), 50);
+    sh.getRange(at, 1, 1, RSV_LAST_COL).setValues([row]);
+    return '적용: ' + at + '행 추가 (' + rsvFmtNum_(newQty) + ')';
+  }
+  var t = data.target;
+  if (!t) return '⚠ 대상 정보 없음';
+  var isOpen = function (r) { return r.status !== RSV_CONFIG.STATUS_DONE && !/^o$/i.test(r.shipped); };
+  var cands = rows.filter(function (r) { return isOpen(r) && r.name === t.name && r.purpose === t.purpose && r.company === t.company; });
+  var hit = cands.filter(function (r) { return r.qty === t.qty; })[0] || (cands.length === 1 ? cands[0] : null);
+  if (!hit) return '⚠ 대상 행을 찾지 못함 (이미 수정·출고됐는지 확인)';
+  if (newQty > 0) {
+    sh.getRange(hit.row, RSV_COL.qty).setValue(newQty);
+    if (!hit.key && data.line) sh.getRange(hit.row, RSV_COL.mailKey).setValue('po:' + data.poNo + '|' + (data.line.sourceRow || ''));
+    log(hit.row, '변경요청 ' + id + ' 승인 → 수량 ' + rsvFmtNum_(hit.qty) + ' → ' + rsvFmtNum_(newQty));
+    return '적용: ' + hit.row + '행 수량 ' + rsvFmtNum_(hit.qty) + ' → ' + rsvFmtNum_(newQty);
+  }
+  sh.deleteRow(hit.row);
+  return '적용: ' + hit.row + '행 삭제 (취소, 기존 ' + rsvFmtNum_(hit.qty) + ')';
+}
+
+/** 10분마다: 변경요청 슬랙 스레드에서 승인/반려 답글 확인 → 반영. 반환: 처리한 요청 수 */
+function rsvCheckChangeThreads_() {
+  var props = PropertiesService.getScriptProperties();
+  var token = props.getProperty('SLACK_BOT_TOKEN');
+  if (!token) return 0;
+  var map = JSON.parse(props.getProperty('RSV_CHANGE_THREADS') || '{}');
+  var keys = Object.keys(map);
+  if (!keys.length) return 0;
+  var cs = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.CHANGE_SHEET);
+  if (!cs) return 0;
+  var handled = 0, changed = false;
+  keys.forEach(function (ts) {
+    var entry = map[ts];
+    var last = cs.getLastRow();
+    var vals = last >= 2 ? cs.getRange(2, 1, last - 1, RSV_CHG.result).getValues() : [];
+    var pending = [];
+    vals.forEach(function (v, i) { if (v[RSV_CHG.id - 1] === entry.id && v[RSV_CHG.status - 1] === '대기') pending.push(i + 2); });
+    if (!pending.length || Date.now() - entry.at > RSV_CONFIG.SLACK_THREAD_DAYS * 86400000) { delete map[ts]; changed = true; return; }
+    var res = UrlFetchApp.fetch('https://slack.com/api/conversations.replies?channel=' + encodeURIComponent(RSV_CONFIG.SLACK_CHANNEL) +
+      '&ts=' + encodeURIComponent(ts) + '&limit=200', { headers: { Authorization: 'Bearer ' + token }, muteHttpExceptions: true });
+    var body = JSON.parse(res.getContentText() || '{}');
+    if (!body.ok) {
+      rsvWarnOnce_('변경요청 스레드 확인 실패: ' + body.error +
+        (body.error === 'missing_scope' ? ' (슬랙 앱에 channels:history, groups:history 권한 추가 후 재설치 필요)' : ''));
+      return;
+    }
+    var decision = null, who = '';
+    (body.messages || []).slice(1).some(function (m) {
+      if (m.bot_id || (m.subtype && m.subtype !== 'thread_broadcast')) return false;
+      var t = String(m.text || '');
+      if (RSV_CONFIG.CHANGE_APPROVE_REPLY.test(t)) decision = '승인';
+      else if (RSV_CONFIG.CHANGE_REJECT_REPLY.test(t)) decision = '반려';
+      if (decision) who = '슬랙 <@' + m.user + '>';
+      return !!decision;
+    });
+    if (!decision) return;
+    pending.forEach(function (r) { cs.getRange(r, RSV_CHG.status).setValue(decision); });
+    rsvProcessChangeDecisions_(entry.id, who);
+    var results = cs.getRange(2, 1, cs.getLastRow() - 1, RSV_CHG.result).getValues()
+      .filter(function (v) { return v[RSV_CHG.id - 1] === entry.id && v[RSV_CHG.result - 1]; })
+      .map(function (v) { return '• ' + v[RSV_CHG.name - 1] + ' — ' + String(v[RSV_CHG.result - 1]).split(' · ')[0]; });
+    try {
+      rsvPostSlack_((decision === '승인' ? ':white_check_mark: *승인 · 시트에 반영했습니다*' : ':no_entry_sign: *반려 · 시트는 그대로입니다*') +
+        ' (`' + entry.id + '`)\n' + results.join('\n'), ts);
+    } catch (e) { console.error(e); }
+    delete map[ts]; changed = true; handled++;
+  });
+  if (changed) props.setProperty('RSV_CHANGE_THREADS', JSON.stringify(map));
+  return handled;
+}
+
+/** 상품명·수량을 지운 행에 남아 있는 숨김 메일키(V) 정리 (다른 건과 잘못 이어지지 않게) */
+function rsvClearOrphanKeys_(sh) {
+  var lastAll = sh.getLastRow();
+  if (lastAll < RSV_CONFIG.FIRST_ROW) return;
+  var n = lastAll - RSV_CONFIG.FIRST_ROW + 1;
+  var nq = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.name, n, 2).getValues();
+  var keys = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.mailKey, n, 1).getValues();
+  keys.forEach(function (k, i) {
+    if (k[0] && String(nq[i][0]).trim() === '' && String(nq[i][1]).trim() === '') {
+      sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.mailKey).clearContent();
+    }
+  });
+}
+
+// =====================================================================
 // 슬랙 알림
 // =====================================================================
 
@@ -1260,8 +1613,10 @@ function rsvTrackThread_(ts, poNo) {
 function rsvCheckSlackNow() {
   rsvAssertAllowed_();
   var n = rsvCheckSlackThreads_();
+  var c = rsvCheckChangeThreads_();
   if (n) rsvRunAllocation();
-  rsvToast_(n ? n + '행을 출고 완료로 변경' : '새 "출고완료" 답글 없음 (확인 중인 스레드 ' + Object.keys(rsvThreads_()).length + '개)');
+  rsvToast_((n ? n + '행 출고 완료 처리' : '새 "출고완료" 답글 없음') + ' · ' +
+    (c ? '변경요청 ' + c + '건 승인/반려 반영' : '새 승인/반려 답글 없음'));
 }
 
 /** 답글이 출고 완료 신호인지 (순수 함수). 봇이 쓴 글은 제외. */
@@ -1753,5 +2108,5 @@ function rsvFmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { rsvSortOrder: rsvSortOrder, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
+  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
 }
