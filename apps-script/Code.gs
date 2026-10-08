@@ -85,6 +85,8 @@ var RSV_CONFIG = {
   PO_CHANNEL: '수출',
   // 메일 PO 의 빈 사용 예정일(C) 자동 기재: 출고 가능일이 이 일수 안에 모이는 품목끼리 한 번에 출고
   USE_DATE_BUNDLE_DAYS: 10,
+  // 출고 가능 일정 파일: 비고(N)를 넣을지. 내부 메모가 업체에 나가면 안 되면 false
+  SCHEDULE_INCLUDE_MEMO: true,
   // 발주서 업체명 → 업체명(F) 드롭다운 값. 회사명 정리(㈜·코퍼레이션 등 제거) 후 드롭다운과 비슷하면 자동으로 맞춤.
   // 영문명처럼 자동으로 안 맞는 업체만 여기에 추가 (왼쪽: 발주서에 적힌 이름의 일부, 오른쪽: 드롭다운 값)
   COMPANY_ALIASES: {
@@ -177,6 +179,7 @@ function rsvOnOpen() {
     .addItem('지금 재계산 + 정렬', 'rsvRunAllocation')
     .addItem('보기: 출고일 정렬 (출고 묶음)', 'rsvSortByShip')
     .addItem('보기: 업체별 정렬 (업체 → 출고일 → 차수)', 'rsvSortByCompany')
+    .addItem('출고 가능 일정 파일 (업체 선택 → 엑셀)', 'rsvShipScheduleDialog')
     .addItem('메일 발주서 가져오기', 'rsvRunMailImport')
     .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
     .addItem('슬랙 알림 테스트', 'rsvTestSlack')
@@ -2371,7 +2374,243 @@ function rsvFmtDateTime_(d) {
 function rsvFmtYMD_(d) { return d.getFullYear() + '-' + rsvPad_(d.getMonth() + 1) + '-' + rsvPad_(d.getDate()); }
 function rsvFmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
 
+// =====================================================================
+// 출고 가능 일정 파일 (업체 선택 → 엑셀 다운로드)
+// =====================================================================
+
+/** 메뉴: 업체를 골라 출고 가능 일정 엑셀(.xlsx)을 내려받는다 */
+function rsvShipScheduleDialog() {
+  rsvAssertAllowed_();
+  rsvRunAllocation({ sort: false }); // 출고 예정일(D) 최신화
+  var companies = rsvScheduleCompanies(rsvReadScheduleRows_());
+  if (!companies.length) { rsvToast_('출고 전 예약/홀딩 건이 없습니다'); return; }
+  var opts = companies.map(function (c) {
+    var v = String(c.name).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    return '<option value="' + v + '">' + v + '  (' + c.count + '건 · ' + rsvFmtNum_(c.qty) + '개)</option>';
+  }).join('');
+  var html =
+    '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:16px;color:#222}' +
+    'select{width:100%;padding:8px;font-size:14px;margin:8px 0 14px}' +
+    'button{background:#1a73e8;color:#fff;border:0;border-radius:4px;padding:9px 18px;font-size:14px;cursor:pointer}' +
+    'button:disabled{background:#9bbcf0}#msg{margin-top:14px;line-height:1.6}a{color:#1a73e8}</style>' +
+    '<div>업체를 고르면 출고 전(예약·홀딩) 품목의 <b>출고 가능일 · 제품 · 수량 · 출고 차수 · 비고</b>를 엑셀로 내려받습니다.</div>' +
+    '<select id="c">' + opts + '</select>' +
+    '<button id="b" onclick="go()">엑셀 만들기</button><div id="msg"></div>' +
+    '<script>' +
+    'function go(){var b=document.getElementById("b"),m=document.getElementById("msg");b.disabled=true;m.textContent="만드는 중… (10초 정도)";' +
+    'google.script.run.withSuccessHandler(function(r){b.disabled=false;' +
+    'var bin=atob(r.b64),arr=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);' +
+    'var url=URL.createObjectURL(new Blob([arr],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}));' +
+    'var a=document.createElement("a");a.href=url;a.download=r.name;document.body.appendChild(a);a.click();' +
+    'm.innerHTML="✅ <b>"+r.name+"</b> 다운로드<br>"+r.summary+"<br>다운로드가 안 되면 ";' +
+    'var l=document.createElement("a");l.href=r.driveUrl;l.target="_blank";l.textContent="Drive 에서 열기";m.appendChild(l);})' +
+    '.withFailureHandler(function(e){b.disabled=false;m.textContent="⚠ 실패: "+e.message;})' +
+    '.rsvBuildShipSchedule(document.getElementById("c").value);}' +
+    '</script>';
+  SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(460).setHeight(300), '출고 가능 일정 파일');
+}
+
+/** [예약 재고 관리]에서 출고 전 행 읽기 */
+function rsvReadScheduleRows_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(sh);
+  if (last < RSV_CONFIG.FIRST_ROW) return [];
+  return sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues().map(function (v) {
+    return {
+      ship: v[RSV_COL.shipDate - 1], name: String(v[RSV_COL.name - 1] || '').trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
+      purpose: String(v[RSV_COL.purpose - 1] || '').trim(), memo: String(v[RSV_COL.memo - 1] || '').trim(),
+      status: String(v[RSV_COL.status - 1] || '').trim(), shipped: String(v[RSV_COL.shipped - 1] || '').trim(),
+      company: String(v[RSV_COL.company - 1] || '').trim(), channel: String(v[RSV_COL.channel - 1] || '').trim(),
+    };
+  });
+}
+
+function rsvScheduleOpen_(r) {
+  return r.name && r.qty > 0 && /^(예약재고|홀딩재고)/.test(r.status) && !/^o$/i.test(r.shipped);
+}
+
+/** 출고 전 건이 있는 업체 목록 (순수 함수) [{name, count, qty}] — 가장 이른 출고일 순 */
+function rsvScheduleCompanies(rows) {
+  var map = {}, list = [];
+  rows.forEach(function (r) {
+    if (!rsvScheduleOpen_(r)) return;
+    var k = r.company || r.channel;
+    if (!k) return;
+    if (!map[k]) { map[k] = { name: k, count: 0, qty: 0, first: 9e15 }; list.push(map[k]); }
+    map[k].count++; map[k].qty += r.qty;
+    var d = rsvToDate_(r.ship, new Date());
+    if (d && d.getTime() < map[k].first) map[k].first = d.getTime();
+  });
+  return list.sort(function (a, b) { return a.first - b.first || (a.name < b.name ? -1 : 1); });
+}
+
+/** 비고에서 내부용 메모(PO 번호·원문·업체 매칭 메모)를 뺀 나머지 */
+function rsvScheduleMemo_(memo) {
+  if (!RSV_CONFIG.SCHEDULE_INCLUDE_MEMO) return '';
+  return String(memo || '').split(/\s+\/\s+/).filter(function (t) {
+    return t && !/^(PO\s|원문:|업체:)/.test(t);
+  }).join(', ');
+}
+
+/**
+ * 출고 가능 일정 (순수 함수). 같은 출고일 + 같은 제품 + 같은 비고는 한 줄로 합치고 차수를 모두 적는다.
+ * 반환: [{ date: Date|null(미정), items: [{name, qty, purposes:[], memo, merged}] , qty }]  — 날짜순, 미정은 맨 뒤
+ */
+function rsvShipSchedule(rows, company) {
+  var groups = {}, order = [];
+  rows.forEach(function (r) {
+    if (!rsvScheduleOpen_(r) || (r.company || r.channel) !== company) return;
+    var d = rsvToDate_(r.ship, new Date());
+    var dk = d ? d.getTime() : 'x';
+    if (!groups[dk]) { groups[dk] = { date: d, items: [], byKey: {}, qty: 0 }; order.push(dk); }
+    var g = groups[dk], memo = rsvScheduleMemo_(r.memo), key = r.name + '\u0001' + memo;
+    var it = g.byKey[key];
+    if (!it) { it = g.byKey[key] = { name: r.name, qty: 0, purposes: [], memo: memo }; g.items.push(it); }
+    it.qty += r.qty; g.qty += r.qty;
+    if (r.purpose && it.purposes.indexOf(r.purpose) < 0) it.purposes.push(r.purpose);
+  });
+  return order.map(function (k) { return groups[k]; }).sort(function (a, b) {
+    return (a.date ? a.date.getTime() : 9e15) - (b.date ? b.date.getTime() : 9e15);
+  }).map(function (g) {
+    g.items.sort(function (a, b) { var x = rsvNaturalKey_(a.name), y = rsvNaturalKey_(b.name); return x < y ? -1 : x > y ? 1 : 0; });
+    g.items.forEach(function (it) {
+      it.purposes.sort(function (a, b) { var x = rsvNaturalKey_(a), y = rsvNaturalKey_(b); return x < y ? -1 : x > y ? 1 : 0; });
+      it.merged = it.purposes.length > 1;
+    });
+    delete g.byKey;
+    return g;
+  });
+}
+
+/** 선택한 업체의 출고 가능 일정 엑셀을 만들어 {name, b64, driveUrl, summary} 로 돌려준다 (대화상자에서 호출) */
+function rsvBuildShipSchedule(company) {
+  rsvAssertAllowed_();
+  var groups = rsvShipSchedule(rsvReadScheduleRows_(), company);
+  if (!groups.length) throw new Error(company + ' 의 출고 전 예약/홀딩 건이 없습니다');
+  var now = new Date(), today = rsvStartOfDay_(now), DAY = 86400000;
+  var fname = String(company).replace(/[\\\/:*?"<>|]/g, '_') + '_출고 가능 일정_' + rsvPad_(now.getMonth() + 1) + rsvPad_(now.getDate());
+  var totalQty = 0, totalItems = 0;
+  groups.forEach(function (g) { totalQty += g.qty; totalItems += g.items.length; });
+
+  var tmp = SpreadsheetApp.create(fname);
+  try {
+    var C = { title: '#1f3864', head: '#1f4e78', sub: '#f2f2f2', merged: '#ddebf7', line: '#bfbfbf', thick: '#1f4e78', muted: '#7f7f7f', bandA: '#ffffff', bandB: '#f7f9fc' };
+    var dday = function (d) { if (!d) return '미정'; var n = Math.round((d - today) / DAY); return n === 0 ? 'D-DAY' : n > 0 ? 'D-' + n : 'D+' + (-n); };
+
+    // ── 시트 1: 출고 리스트 ──
+    var sh = tmp.getSheets()[0];
+    sh.setName('출고 리스트');
+    var COLS = 6;
+    sh.getRange(1, 1, 1, COLS).merge().setValue(company + '  출고 가능 일정')
+      .setFontSize(16).setFontWeight('bold').setFontColor(C.title);
+    sh.getRange(2, 1, 1, COLS).merge().setValue(
+      '기준일 ' + rsvFmtYMD_(now) + '   ·   출고 ' + groups.length + '회   ·   총 ' + totalItems + '종 / ' + rsvFmtNum_(totalQty) + '개')
+      .setFontColor(C.muted);
+    var head = ['출고 가능일', 'D-day', '제품명', '수량', '출고 차수', '비고'];
+    sh.getRange(4, 1, 1, COLS).setValues([head]).setBackground(C.head).setFontColor('#ffffff').setFontWeight('bold')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle');
+    sh.setRowHeight(4, 30);
+
+    var data = [], fmt = [];
+    groups.forEach(function (g, gi) {
+      var start = data.length;
+      g.items.forEach(function (it, k) {
+        data.push([g.date || '미정', k === 0 ? dday(g.date) : '', it.name, it.qty, it.purposes.join('\n'),
+          it.memo || (g.date ? '' : '재고 확보일 미정')]);
+        fmt.push({ type: it.merged ? 'merged' : 'item', band: gi % 2, undecided: !g.date });
+      });
+      data.push(['', '', '소계  ' + g.items.length + '종', g.qty, '', '']);
+      fmt.push({ type: 'sub', start: start });
+    });
+    var F = 5, n = data.length;
+    var body = sh.getRange(F, 1, n, COLS);
+    body.setValues(data).setVerticalAlignment('middle').setFontSize(10)
+      .setBorder(true, true, true, true, true, true, C.line, SpreadsheetApp.BorderStyle.SOLID);
+    sh.getRange(F, 1, n, 1).setNumberFormat('yyyy-mm-dd').setHorizontalAlignment('center');
+    sh.getRange(F, 2, n, 1).setHorizontalAlignment('center').setFontColor('#c00000').setFontWeight('bold');
+    sh.getRange(F, 3, n, 1).setHorizontalAlignment('left');
+    sh.getRange(F, 4, n, 1).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    sh.getRange(F, 5, n, 1).setHorizontalAlignment('center').setWrap(true);
+    sh.getRange(F, 6, n, 1).setHorizontalAlignment('center').setWrap(true);
+
+    var bands = [[], []], merged = [], subs = [], tops = [], undecided = [];
+    fmt.forEach(function (f, i) {
+      var a1 = 'A' + (F + i) + ':F' + (F + i);
+      if (f.type === 'sub') subs.push(a1);
+      else {
+        bands[f.band].push(a1);
+        if (f.type === 'merged') merged.push(a1);
+        if (f.undecided) undecided.push(a1);
+      }
+      if (i === 0 || fmt[i - 1].type === 'sub') tops.push(a1);
+    });
+    if (bands[0].length) sh.getRangeList(bands[0]).setBackground(C.bandA);
+    if (bands[1].length) sh.getRangeList(bands[1]).setBackground(C.bandB);
+    if (merged.length) sh.getRangeList(merged).setBackground(C.merged).setFontWeight('bold');
+    if (undecided.length) sh.getRangeList(undecided).setFontColor(C.muted).setFontStyle('italic');
+    if (subs.length) sh.getRangeList(subs).setBackground(C.sub).setFontWeight('bold').setFontColor('#404040');
+    if (tops.length) sh.getRangeList(tops).setBorder(true, null, null, null, null, null, C.thick, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    // 같은 출고일의 날짜·D-day 칸은 세로로 합침
+    var at = 0;
+    groups.forEach(function (g) {
+      var cnt = g.items.length;
+      if (cnt > 1) {
+        sh.getRange(F + at, 1, cnt, 1).merge();
+        sh.getRange(F + at, 2, cnt, 1).merge();
+      }
+      sh.getRange(F + at, 1, cnt, 2).setFontWeight('bold');
+      at += cnt + 1;
+    });
+    sh.getRange(F + n, 1, 1, COLS).merge().setValue('※ 파란 행: 같은 제품이 여러 차수에 걸쳐 있어 합산한 수량입니다. 출고 가능일은 재고·입고 일정 기준 예상일로 변동될 수 있습니다.')
+      .setFontColor(C.muted).setFontSize(9);
+    [110, 70, 380, 90, 300, 160].forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
+    sh.setFrozenRows(4);
+    sh.setHiddenGridlines(true);
+
+    // ── 시트 2: 출고 일정 요약 ──
+    var sm = tmp.insertSheet('출고 일정 요약', 0);
+    sm.getRange(1, 1, 1, 5).merge().setValue(company + '  출고 일정 요약').setFontSize(16).setFontWeight('bold').setFontColor(C.title);
+    sm.getRange(2, 1, 1, 5).merge().setValue('기준일 ' + rsvFmtYMD_(now) + '   ·   상세 품목은 [출고 리스트] 탭').setFontColor(C.muted);
+    sm.getRange(4, 1, 1, 5).setValues([['출고 가능일', 'D-day', '품목 수', '총 수량', '출고 차수']])
+      .setBackground(C.head).setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center');
+    sm.setRowHeight(4, 30);
+    var srows = groups.map(function (g) {
+      var ps = [];
+      g.items.forEach(function (it) { it.purposes.forEach(function (p) { if (ps.indexOf(p) < 0) ps.push(p); }); });
+      ps.sort(function (a, b) { var x = rsvNaturalKey_(a), y = rsvNaturalKey_(b); return x < y ? -1 : x > y ? 1 : 0; });
+      return [g.date || '미정', dday(g.date), g.items.length, g.qty, ps.join('\n')];
+    });
+    srows.push(['합계', '', totalItems, totalQty, '']);
+    var sr = sm.getRange(5, 1, srows.length, 5);
+    sr.setValues(srows).setVerticalAlignment('middle').setHorizontalAlignment('center')
+      .setBorder(true, true, true, true, true, true, C.line, SpreadsheetApp.BorderStyle.SOLID);
+    sm.getRange(5, 1, srows.length, 1).setNumberFormat('yyyy-mm-dd').setFontWeight('bold');
+    sm.getRange(5, 2, srows.length, 1).setFontColor('#c00000').setFontWeight('bold');
+    sm.getRange(5, 4, srows.length, 1).setNumberFormat('#,##0');
+    sm.getRange(5, 5, srows.length, 1).setWrap(true);
+    for (var i = 0; i < srows.length - 1; i++) sm.getRange(5 + i, 1, 1, 5).setBackground(i % 2 ? C.bandB : C.bandA);
+    sm.getRange(5 + srows.length - 1, 1, 1, 5).setBackground(C.sub).setFontWeight('bold');
+    [110, 70, 80, 100, 320].forEach(function (w, i) { sm.setColumnWidth(i + 1, w); });
+    sm.setFrozenRows(4);
+    sm.setHiddenGridlines(true);
+    SpreadsheetApp.flush();
+
+    var res = UrlFetchApp.fetch('https://docs.google.com/spreadsheets/d/' + tmp.getId() + '/export?format=xlsx', {
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) throw new Error('엑셀 변환 실패 (' + res.getResponseCode() + ')');
+    var blob = res.getBlob().setName(fname + '.xlsx');
+    var saved = DriveApp.createFile(blob);
+    return {
+      name: fname + '.xlsx', b64: Utilities.base64Encode(blob.getBytes()), driveUrl: saved.getUrl(),
+      summary: '출고 ' + groups.length + '회 · ' + totalItems + '종 / ' + rsvFmtNum_(totalQty) + '개 (내 Drive 에도 저장됨)',
+    };
+  } finally {
+    try { DriveApp.getFileById(tmp.getId()).setTrashed(true); } catch (e) { /* 임시 파일 정리 실패는 무시 */ }
+  }
+}
+
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
+  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
 }
