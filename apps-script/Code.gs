@@ -244,6 +244,9 @@ function rsvRetryFailedMail() {
   if (failLabel) {
     failLabel.getThreads(0, 100).forEach(function (t) { t.removeLabel(failLabel); n++; });
   }
+  var seen = rsvMailSeen_();
+  Object.keys(seen).forEach(function (id) { if (seen[id][1] === 'fail') delete seen[id]; });
+  rsvSaveMailSeen_(seen);
   var res = rsvImportMail_();
   rsvNotifySlack_(res.pos, rsvRunAllocation().conversions);
   rsvToast_('실패 메일 ' + n + '건 재시도 → ' + res.added + '행 등록');
@@ -875,9 +878,11 @@ function rsvImportMail_() {
   var failLabel = GmailApp.getUserLabelByName(RSV_CONFIG.FAIL_LABEL) || GmailApp.createLabel(RSV_CONFIG.FAIL_LABEL);
   // Gmail 의 after:YYYY/MM/DD 는 미국 태평양 시간 기준이라 한국 오전 메일이 빠질 수 있음 → 한국 시간 자정의 초 단위로 검색
   var after = RSV_CONFIG.MAIL_AFTER ? rsvToDate_(RSV_CONFIG.MAIL_AFTER, null) : null;
-  var q = RSV_CONFIG.MAIL_QUERY + (after ? ' after:' + Math.floor(after.getTime() / 1000) : '') +
-    ' -label:' + RSV_CONFIG.DONE_LABEL + ' -label:' + RSV_CONFIG.FAIL_LABEL;
-  var threads = GmailApp.search(q, 0, 30);
+  // 스레드에 처리 라벨이 있어도 그 뒤에 온 답장(수정 발주서 등)은 읽어야 하므로 라벨로 제외하지 않고,
+  // 이미 처리한 메일(메시지)은 RSV_MAIL_SEEN 에 기억해 건너뛴다.
+  var q = RSV_CONFIG.MAIL_QUERY + (after ? ' after:' + Math.floor(after.getTime() / 1000) : '');
+  var seen = rsvMailSeen_();
+  var threads = GmailApp.search(q, 0, 50);
   if (!threads.length) return none;
 
   var processed = {}; // 이번 실행에서 이미 처리한 PO (같은 첨부가 답장 메일에 또 붙은 경우)
@@ -887,13 +892,15 @@ function rsvImportMail_() {
   threads.forEach(function (th) {
     var threadOk = true, touched = false;
     th.getMessages().forEach(function (msg) {
+      if (seen[msg.getId()]) return;
       if (!rsvSenderAllowed_(msg.getFrom())) return;
+      var msgTouched = false, msgOk = true;
       msg.getAttachments().forEach(function (att) {
         // 맥에서 보낸 파일은 한글이 자모 분리(NFD)돼 있어 "[로지킴]"과 안 맞음 → NFC 로 정규화
         var fname = String(att.getName()).normalize('NFC');
         if (!RSV_CONFIG.ATTACHMENT_NAME_PATTERN.test(fname)) return;
         if (!/\.(xlsx|xls|xlsm)$/i.test(fname)) return;
-        touched = true;
+        touched = true; msgTouched = true;
         try {
           var grids = rsvAttachmentToGrids_(att);
           var po = rsvPickPurchaseOrder(grids);
@@ -935,7 +942,6 @@ function rsvImportMail_() {
             row[RSV_COL.mailKey - 1] = poKey + '|' + ln.sourceRow;
             return row;
           });
-          existingKeys[poKey] = true;
           var at = rsvLastDataRow_(sh) + 1;
           if (at + newRows.length - 1 > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), newRows.length + 50);
           // A~O, V 만 기록 (P~U·D 는 재계산이 채움)
@@ -948,14 +954,17 @@ function rsvImportMail_() {
           rsvWriteLog_(msg, fname, '등록 ' + newRows.length + '행 · PO ' + po.poNo + ' · ' + po.purpose +
             (unmatched ? ' · ⚠ 상품명 매칭 실패 ' + unmatched + '건' : ''));
         } catch (err) {
-          threadOk = false;
+          threadOk = false; msgOk = false;
           rsvWriteLog_(msg, fname, '⚠ 실패: ' + err.message);
         }
       });
+      // 대상 첨부가 있었던 메일만 처리 완료로 기억 (실패도 반복 시도 안 함 → 메뉴 "실패한 메일 다시 시도")
+      if (msgTouched) seen[msg.getId()] = [Date.now(), msgOk ? 'ok' : 'fail'];
     });
-    // 대상 첨부가 있었던 메일만 라벨 (실패는 실패 라벨 → 반복 시도 안 함, 라벨을 지우면 다시 시도)
+    // 라벨은 Gmail 에서 보기 쉽게 붙이는 표시 (처리 여부 판단은 메일 단위 기록으로)
     if (touched) th.addLabel(threadOk ? label : failLabel);
   });
+  rsvSaveMailSeen_(seen);
 
   if (added && RSV_CONFIG.NOTIFY_TO) {
     MailApp.sendEmail(RSV_CONFIG.NOTIFY_TO, '[예약재고] 메일 발주서 ' + added + '행 등록', ss.getUrl());
@@ -1720,8 +1729,8 @@ function rsvTestSlack() {
 function rsvDiagnoseMail() {
   rsvAssertAllowed_();
   var after = RSV_CONFIG.MAIL_AFTER ? rsvToDate_(RSV_CONFIG.MAIL_AFTER, null) : null;
-  var q = RSV_CONFIG.MAIL_QUERY + (after ? ' after:' + Math.floor(after.getTime() / 1000) : '') +
-    ' -label:' + RSV_CONFIG.DONE_LABEL + ' -label:' + RSV_CONFIG.FAIL_LABEL;
+  var q = RSV_CONFIG.MAIL_QUERY + (after ? ' after:' + Math.floor(after.getTime() / 1000) : '');
+  var seen = rsvMailSeen_();
   var inQuery = {};
   GmailApp.search(q, 0, 50).forEach(function (t) { inQuery[t.getId()] = true; });
   var log = rsvLogSheet_();
@@ -1732,7 +1741,8 @@ function rsvDiagnoseMail() {
       msg.getAttachments().forEach(function (att) {
         var raw = att.getName(), fname = String(raw).normalize('NFC');
         var notes = [
-          inQuery[t.getId()] ? '검색 포함' : '검색 제외(날짜/라벨)',
+          inQuery[t.getId()] ? '검색 포함' : '검색 제외(날짜)',
+          seen[msg.getId()] ? '이미 처리한 메일(' + seen[msg.getId()][1] + ')' : '',
           RSV_CONFIG.ATTACHMENT_NAME_PATTERN.test(fname) ? '파일명 OK' : '파일명 규칙 불일치',
           raw !== fname ? '한글 자모분리(NFD) 파일명' : '',
           rsvSenderAllowed_(msg.getFrom()) ? '' : '보낸사람 필터 제외',
@@ -1743,6 +1753,35 @@ function rsvDiagnoseMail() {
     });
   });
   rsvToast_('진단 완료: [메일수신로그] 시트를 확인하세요');
+}
+
+/**
+ * 처리한 메일 기록 {메시지ID: [시각, 'ok'|'fail']} (30일 지나면 정리).
+ * 처음 쓸 때는 이미 처리 라벨이 붙은 스레드의 메일을 전부 처리한 것으로 기록 (예전 메일을 다시 읽지 않게).
+ */
+function rsvMailSeen_() {
+  var props = PropertiesService.getScriptProperties();
+  var raw = props.getProperty('RSV_MAIL_SEEN');
+  if (raw) return JSON.parse(raw);
+  var seen = {};
+  [RSV_CONFIG.DONE_LABEL, RSV_CONFIG.FAIL_LABEL].forEach(function (name, k) {
+    var lb = GmailApp.getUserLabelByName(name);
+    if (!lb) return;
+    lb.getThreads(0, 200).forEach(function (t) {
+      t.getMessages().forEach(function (m) { seen[m.getId()] = [Date.now(), k ? 'fail' : 'ok']; });
+    });
+  });
+  rsvSaveMailSeen_(seen);
+  return seen;
+}
+
+function rsvSaveMailSeen_(seen) {
+  var cut = Date.now() - 30 * 86400000;
+  Object.keys(seen).forEach(function (id) { if (seen[id][0] < cut) delete seen[id]; });
+  // 스크립트 속성 한 칸 용량(약 9KB)을 넘지 않게 오래된 것부터 정리
+  var ids = Object.keys(seen).sort(function (x, y) { return seen[x][0] - seen[y][0]; });
+  while (ids.length && JSON.stringify(seen).length > 8500) delete seen[ids.shift()];
+  PropertiesService.getScriptProperties().setProperty('RSV_MAIL_SEEN', JSON.stringify(seen));
 }
 
 function rsvSenderAllowed_(from) {
