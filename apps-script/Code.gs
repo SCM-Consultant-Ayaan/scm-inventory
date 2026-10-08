@@ -77,6 +77,14 @@ var RSV_CONFIG = {
   MAIL_REGISTRANT: '메일자동',
   // PO 로 등록하는 건의 입고처(E)
   PO_CHANNEL: '수출',
+  // 발주서 업체명 → 업체명(F) 드롭다운 값. 회사명 정리(㈜·코퍼레이션 등 제거) 후 드롭다운과 비슷하면 자동으로 맞춤.
+  // 영문명처럼 자동으로 안 맞는 업체만 여기에 추가 (왼쪽: 발주서에 적힌 이름의 일부, 오른쪽: 드롭다운 값)
+  COMPANY_ALIASES: {
+    'plugo': '플루고',
+    'beautyridge': '뷰릿지',
+    'lihoo': '리호',
+    'oliveyoung': '올리브영',
+  },
 
   // 알림 받을 메일 (비우면 알림 없음). 홀딩→예약 전환, 메일 등록 결과를 보냄.
   NOTIFY_TO: '',
@@ -888,6 +896,7 @@ function rsvImportMail_() {
   var processed = {}; // 이번 실행에서 이미 처리한 PO (같은 첨부가 답장 메일에 또 붙은 경우)
   var products = rsvReadProducts_(ss);
   var added = 0, pos = [], changes = 0;
+  var companyList = rsvCompanyList_(sh);
 
   threads.forEach(function (th) {
     var threadOk = true, touched = false;
@@ -926,6 +935,9 @@ function rsvImportMail_() {
             rsvWriteLog_(msg, fname, '변경요청 ' + req.id + ' · ' + diff.length + '건 · PO ' + po.poNo + ' · ' + po.purpose + ' → 승인 대기');
             return;
           }
+          var company = rsvMatchCompany(po.company, companyList, RSV_CONFIG.COMPANY_ALIASES);
+          var companyNote = (company === null && companyList) ? '업체: ' + po.company + ' (업체명 드롭다운에 없음)' : '';
+          if (company === null) company = companyList ? '' : po.company;
           var newRows = po.lines.map(function (ln) {
             var prod = rsvResolveProduct(ln, products);
             var row = new Array(RSV_LAST_COL);
@@ -933,12 +945,12 @@ function rsvImportMail_() {
             row[RSV_COL.created - 1] = rsvStartOfDay_(msg.getDate());
             row[RSV_COL.registrant - 1] = RSV_CONFIG.MAIL_REGISTRANT;
             row[RSV_COL.channel - 1] = RSV_CONFIG.PO_CHANNEL;
-            row[RSV_COL.company - 1] = po.company;
+            row[RSV_COL.company - 1] = company;
             row[RSV_COL.purpose - 1] = po.purpose;
             row[RSV_COL.code - 1] = prod.barcode || '';
             row[RSV_COL.name - 1] = prod.name || ln.name;
             row[RSV_COL.qty - 1] = ln.qty;
-            row[RSV_COL.memo - 1] = ['PO ' + po.poNo, ln.memo].filter(String).join(' / ');
+            row[RSV_COL.memo - 1] = ['PO ' + po.poNo, companyNote, ln.memo].filter(String).join(' / ');
             row[RSV_COL.mailKey - 1] = poKey + '|' + ln.sourceRow;
             return row;
           });
@@ -948,11 +960,12 @@ function rsvImportMail_() {
           sh.getRange(at, 1, newRows.length, RSV_COL.priority).setValues(newRows.map(function (r) { return r.slice(0, RSV_COL.priority); }));
           sh.getRange(at, RSV_COL.mailKey, newRows.length, 1).setValues(newRows.map(function (r) { return [r[RSV_COL.mailKey - 1]]; }));
           added += newRows.length;
-          pos.push({ poNo: po.poNo, company: po.company, purpose: po.purpose, fname: fname,
+          pos.push({ poNo: po.poNo, company: company || po.company, purpose: po.purpose, fname: fname,
             from: msg.getFrom(), firstRow: at, count: newRows.length });
           var unmatched = po.lines.filter(function (ln) { return !rsvResolveProduct(ln, products).name; }).length;
           rsvWriteLog_(msg, fname, '등록 ' + newRows.length + '행 · PO ' + po.poNo + ' · ' + po.purpose +
-            (unmatched ? ' · ⚠ 상품명 매칭 실패 ' + unmatched + '건' : ''));
+            (unmatched ? ' · ⚠ 상품명 매칭 실패 ' + unmatched + '건' : '') +
+            (companyNote ? ' · ⚠ 업체명 \'' + po.company + '\' 드롭다운에 없음 → F 비워둠 (COMPANY_ALIASES 에 추가)' : ''));
         } catch (err) {
           threadOk = false; msgOk = false;
           rsvWriteLog_(msg, fname, '⚠ 실패: ' + err.message);
@@ -1209,6 +1222,53 @@ function rsvReadResRows_(sh) {
     });
 }
 
+/** 업체명 비교용 정리: ㈜·주식회사·코퍼레이션·Co.,Ltd·공백·괄호 제거 + 소문자 */
+function rsvCompanyNorm(s) {
+  return String(s || '').toLowerCase().replace(/\(주\)|㈜|주식회사|코퍼레이션|인터내셔널|corporation|international|co\.?,?\s*ltd\.?|inc\.?|[\s.,()\-_]/g, '');
+}
+
+/**
+ * 발주서 업체명 → 드롭다운 값 (순수 함수). list 가 null 이면(드롭다운 없음) 원래 이름 그대로.
+ * 반환: 드롭다운 값 / 못 찾으면 null
+ */
+function rsvMatchCompany(name, list, aliases) {
+  if (!list) return name || '';
+  var raw = String(name || '').trim();
+  if (!raw) return '';
+  if (list.indexOf(raw) >= 0) return raw;
+  var n = rsvCompanyNorm(raw);
+  var keys = Object.keys(aliases || {});
+  for (var i = 0; i < keys.length; i++) {
+    var a = rsvCompanyNorm(keys[i]);
+    if (a && n.indexOf(a) >= 0 && list.indexOf(aliases[keys[i]]) >= 0) return aliases[keys[i]];
+  }
+  var exact = list.filter(function (v) { return rsvCompanyNorm(v) === n; });
+  if (exact.length) return exact[0];
+  // 포함 관계 — 가장 긴 값 우선 (예: '올리브영 US' 가 '올리브영' 보다 먼저)
+  var best = null, bestLen = 0;
+  list.forEach(function (v) {
+    var vn = rsvCompanyNorm(v);
+    if (vn.length < 2) return;
+    if ((n.indexOf(vn) >= 0 || vn.indexOf(n) >= 0) && vn.length > bestLen) { best = v; bestLen = vn.length; }
+  });
+  return best;
+}
+
+/** 업체명(F) 드롭다운 값 목록. 드롭다운(목록/범위) 이 없으면 null */
+function rsvCompanyList_(sh) {
+  try {
+    var dv = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.company).getDataValidation();
+    if (!dv) return null;
+    var type = dv.getCriteriaType(), vals = dv.getCriteriaValues();
+    if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) return vals[0].map(String);
+    if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE) {
+      return vals[0].getValues().reduce(function (a, r) { return a.concat(r); }, [])
+        .map(function (v) { return String(v).trim(); }).filter(String);
+    }
+  } catch (e) { /* 읽기 실패 시 드롭다운 없음으로 */ }
+  return null;
+}
+
 /**
  * 시트에서 이 PO 의 행 찾기 (순수 함수).
  *  1) 메일키가 같은 PO No. 인 행  2) 없으면 용도가 같고(차수 포함) 업체명이 비슷한 행 (예: 뷰릿지 ↔ (주)뷰릿지코퍼레이션)
@@ -1218,9 +1278,7 @@ function rsvFindPoRows(rows, po) {
   var byKey = rows.filter(function (r) { return r.name && r.key.indexOf(key) === 0; });
   if (byKey.length) return byKey;
   if (!/\d+차/.test(po.purpose)) return [];
-  var norm = function (s) {
-    return String(s || '').toLowerCase().replace(/\(주\)|㈜|주식회사|코퍼레이션|corporation|co\.?,?\s*ltd\.?|inc\.?|[\s.,()]/g, '');
-  };
+  var norm = rsvCompanyNorm;
   var pc = norm(po.company);
   return rows.filter(function (r) {
     if (!r.name || r.purpose !== String(po.purpose).trim()) return false;
@@ -1413,7 +1471,8 @@ function rsvApplyChange_(sh, type, newQty, data, stamp, id) {
     row[RSV_COL.created - 1] = rsvStartOfDay_(new Date());
     row[RSV_COL.registrant - 1] = RSV_CONFIG.MAIL_REGISTRANT;
     row[RSV_COL.channel - 1] = RSV_CONFIG.PO_CHANNEL;
-    row[RSV_COL.company - 1] = data.company || '';
+    var cl = rsvCompanyList_(sh), cm = rsvMatchCompany(data.company, cl, RSV_CONFIG.COMPANY_ALIASES);
+    row[RSV_COL.company - 1] = cm !== null ? cm : (cl ? '' : (data.company || ''));
     row[RSV_COL.purpose - 1] = data.purpose || '';
     row[RSV_COL.code - 1] = l.barcode || '';
     row[RSV_COL.name - 1] = l.name || '';
