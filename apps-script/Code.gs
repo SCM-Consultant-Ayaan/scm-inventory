@@ -2862,6 +2862,52 @@ function rsvAddRunoutColumn() {
   rsvToast_('[재고관리] X열(권장수량 발주 시 소진 예상일) ' + n + '행 · 2개월치 재고(Z) 0 제외 수식 적용 완료');
 }
 
+// =====================================================================
+// [재고관리] 자동 계산 열을 100행까지 확장 + SKU CODE 기준 바코드 매칭 (한 번만 실행)
+// =====================================================================
+
+/**
+ * 편집기에서 한 번 실행. [재고관리] 4행에서 아래로 펼쳐지는 수식(MAP/MAKEARRAY)을 100행까지 넓히고,
+ * A열(SKU CODE) → [상품 마스터 시트] K열(바코드)로 바꿔 수불부·통합_일평균_산출(바코드 기준)을 찾게 한다.
+ *  - 마스터에 바코드가 없으면 A열 값을 그대로 쓰고(예전 바코드 행), 빈 바코드로 엉뚱한 행이 잡히지 않게 막는다.
+ *  - 펼쳐질 자리(5~100행)에 직접 적힌 값·수식은 지운다 (남아 있으면 #REF!). 지운 행은 실행 로그·알림으로 알려 줌.
+ *  대상: V 일평균 출고량 / AA~AT 월별 판매 / BA B2C 일평균 / BB B2B 과거 일평균 / BC 발주 권장수량 / BD 발주 검토 메모
+ */
+function rsvExtendInventoryArrays() {
+  var END = 100;
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.INV_SHEET);
+  if (String(sh.getRange('V3').getValue()).indexOf('일평균 출고량') < 0 || String(sh.getRange('BC3').getDisplayValue()).indexOf('발주 권장수량') < 0) {
+    throw new Error('[재고관리] V3/BC3 머리글이 예상과 다릅니다. 열 구조를 확인해 주세요.');
+  }
+  if (sh.getMaxRows() < END) sh.insertRowsAfter(sh.getMaxRows(), END - sh.getMaxRows());
+  var F = {
+    V4: "=MAP($BA$4:$BA$100,$BB$4:$BB$100,$G$4:$G$100,$E$4:$E$100,LAMBDA(a,b,g,nm,IF(nm=\"\",\"\",IFERROR(ROUND(N(a)+MAX(N(b),(N(g)-SUMIFS('예약 재고 관리'!$J:$J,'예약 재고 관리'!$I:$I,nm,'예약 재고 관리'!$K:$K,\"예약재고(현재고 제외)\",'예약 재고 관리'!$M:$M,\"<>O\",'예약 재고 관리'!$C:$C,\">\"&(TODAY()+40)))/40),0),0))))",
+    AA4: "=MAKEARRAY(ROWS($A$4:$A$100),20,LAMBDA(r,c,LET(bc,INDEX($A$4:$A$100,r),IF(bc=\"\",\"\",LET(x,XLOOKUP(bc,'상품 마스터 시트'!$E:$E,'상품 마스터 시트'!$K:$K,\"\"),bx,IF(LEN(x)=0,bc,x),ym,INDEX($AA$3:$AT$3,1,c),d0,DATE(2000+INT(ym/100),MOD(ym,100),1),IFERROR(SUMIFS('통합_일평균_산출'!$G:$G,'통합_일평균_산출'!$B:$B,bx,'통합_일평균_산출'!$A:$A,\">=\"&d0,'통합_일평균_산출'!$A:$A,\"<\"&EDATE(d0,1)),0))))))",
+    BA4: "=MAP($A$4:$A$100,LAMBDA(bc,IF(bc=\"\",\"\",IFERROR(LET(ld,MAX('이지어드민 수불부_Raw'!$F:$F),dt,'통합_일평균_산출'!$A$2:$A$10550,x,XLOOKUP(bc,'상품 마스터 시트'!$E:$E,'상품 마스터 시트'!$K:$K,\"\"),key,IFERROR(IF(LEN(x)=0,bc,x)*1,-1),mk,IFERROR('통합_일평균_산출'!$B$2:$B$10550*1,0)=key,cc,IFERROR(IF(('통합_일평균_산출'!$E$2:$E$10550>0)*('통합_일평균_산출'!$C$2:$C$10550>'통합_일평균_산출'!$E$2:$E$10550),'통합_일평균_산출'!$E$2:$E$10550,'통합_일평균_산출'!$C$2:$C$10550)*1,0),recent,SUMPRODUCT(mk*(dt>ld-14)*(dt<ld+1)*cc)/14,prevm,SUMPRODUCT(mk*(dt>=EOMONTH(ld,-2)+1)*(dt<EOMONTH(ld,-1)+1)*cc)/DAY(EOMONTH(ld,-1)),ROUND(MAX(recent,prevm),1)),0))))",
+    BB4: "=MAP($E$4:$E$100,LAMBDA(nm,IF(nm=\"\",\"\",LET(dd,IF(ISNUMBER('예약 재고 관리'!$A$3:$A4222),'예약 재고 관리'!$A$3:$A4222,IF(ISNUMBER('예약 재고 관리'!$C$3:$C4222),'예약 재고 관리'!$C$3:$C4222,0)),m,('예약 재고 관리'!$I$3:$I4222=nm)*('예약 재고 관리'!$K$3:$K4222=\"출고 완료\")*(dd>=TODAY()-180)*(dd<=TODAY()),IF(SUM(m)<2,0,ROUND(SUMPRODUCT(m,'예약 재고 관리'!$J$3:$J4222)/180,1))))))",
+    BC4: "=MAP($A$4:$A$100,$E$4:$E$100,$U$4:$U$100,$V$4:$V$100,$R$4:$R$100,$C$4:$C$100,$BA$4:$BA$100,$BB$4:$BB$100,LAMBDA(bc,nm,u,v,r,c,ay,az,IF(OR(nm=\"\",N(v)<=0),\"\",IF(NOT(OR(u=\"결품\",AND(ISNUMBER(u),N(u)<=0))),\"\",IF(REGEXMATCH(TO_TEXT(c),\"단종|운영 종료\"),\"발주 보류\",LET(base,N(ay)+N(az),IF(base<1,\"수동 판단\",LET(x,XLOOKUP(bc,'상품 마스터 시트'!$E:$E,'상품 마스터 시트'!$K:$K,\"\"),bx,IF(LEN(x)=0,bc,x),ld,MAX('이지어드민 수불부_Raw'!$F:$F),pace,(SUMIFS('이지어드민 수불부_Raw'!$H:$H,'이지어드민 수불부_Raw'!$M:$M,bx, '이지어드민 수불부_Raw'!$F:$F,\">=\"&(ld-59),'이지어드민 수불부_Raw'!$F:$F,\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!$I:$I,'이지어드민 수불부_Raw'!$M:$M,bx,'이지어드민 수불부_Raw'!$F:$F,\">=\"&(ld-59),'이지어드민 수불부_Raw'!$F:$F,\"<=\"&ld))/60,lt,IF(ISNUMBER(SEARCH(\"비비에센스\",nm)),120,70),rk,COUNTIF($V$4:$V$100,\">\"&v)+1,tg,IF(rk<=10,90,IF(rk<=20,80,70)),raw,ROUNDUP(v*(lt+tg)-N(r),0),cap,ROUNDUP(MAX(base,pace)*(lt+120)-N(r),0),qq,MIN(raw,cap),mq,IFERROR(VLOOKUP(bc,'상품 마스터 시트'!$E:$M,9,FALSE)*1,0),IF(raw<=0,\"\",IF(qq<=0,\"보류(재고 충분)\",MAX(CEILING(qq,5000),mq)))))))))))",
+    BD4: "=MAP($BC$4:$BC$100,$A$4:$A$100,$E$4:$E$100,$V$4:$V$100,$R$4:$R$100,$BA$4:$BA$100,$BB$4:$BB$100,$AW$4:$AW$100,$K$4:$K$100,$C$4:$C$100,LAMBDA(q,bc,nm,v,r,ay,az,st,k,c,IF(q=\"\",\"\",LET(x,XLOOKUP(bc,'상품 마스터 시트'!$E:$E,'상품 마스터 시트'!$K:$K,\"\"),bx,IF(LEN(x)=0,bc,x),base,N(ay)+N(az),ld,MAX('이지어드민 수불부_Raw'!$F:$F),pace,(SUMIFS('이지어드민 수불부_Raw'!$H:$H,'이지어드민 수불부_Raw'!$M:$M,bx,'이지어드민 수불부_Raw'!$F:$F,\">=\"&(ld-59),'이지어드민 수불부_Raw'!$F:$F,\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!$I:$I,'이지어드민 수불부_Raw'!$M:$M,bx,'이지어드민 수불부_Raw'!$F:$F,\">=\"&(ld-59),'이지어드민 수불부_Raw'!$F:$F,\"<=\"&ld))/60,lt,IF(ISNUMBER(SEARCH(\"비비에센스\",nm)),120,70),rk,COUNTIF($V$4:$V$100,\">\"&v)+1,tg,IF(rk<=10,90,IF(rk<=20,80,70)),raw,ROUNDUP(v*(lt+tg)-N(r),0),cap,ROUNDUP(MAX(base,pace)*(lt+120)-N(r),0),kk,IFERROR(TO_TEXT(k),\"\"),IF(q=\"발주 보류\",TO_TEXT(c)&\" 품목·재발주 여부 확인\",IF(q=\"수동 판단\",\"판매이력 없음(예약 기준 계산 \"&TEXT(raw,\"#,##0\")&\")·기획 수량으로 결정\",IF(q=\"보류(재고 충분)\",\"실제 출고 기준 \"&(lt+120)&\"일치 이상 확보(계산 \"&TEXT(raw,\"#,##0\")&\")\",TEXTJOIN(\" / \",TRUE,IF(cap<raw,\"상한 적용(계산 \"&TEXT(raw,\"#,##0\")&\" → \"&TEXT(MAX(cap,0),\"#,##0\")&\")\",\"계산 \"&TEXT(raw,\"#,##0\")),IF(q>MIN(raw,cap),\"5,000단위 올림\",\"\"),IF(AND(REGEXMATCH(TO_TEXT(st),\"발주 완료\"),kk=\"\"),\"발주완료·입고예정 미입력\",\"\"),IF(REGEXMATCH(TO_TEXT(st),\"용기부터\"),\"용기 먼저 발주\",\"\")))))))))"
+  };
+  // 기존 4행 수식을 먼저 지워 펼쳐진 결과를 걷어낸 뒤, 남아 있는 '직접 입력' 값·수식만 확인하고 지운다
+  Object.keys(F).forEach(function (a1) { sh.getRange(a1).clearContent(); });
+  SpreadsheetApp.flush();
+  var cleared = [];
+  ['V5:V' + END, 'AA5:AT' + END, 'BA5:BD' + END].forEach(function (a1) {
+    var rg = sh.getRange(a1), fs = rg.getFormulas(), vs = rg.getValues();
+    vs.forEach(function (row, i) {
+      row.forEach(function (v, j) {
+        if (fs[i][j] || (v !== '' && v !== null)) cleared.push(rg.getCell(i + 1, j + 1).getA1Notation());
+      });
+    });
+    rg.clearContent();
+  });
+  Object.keys(F).forEach(function (a1) { sh.getRange(a1).setFormula(F[a1]); });
+  SpreadsheetApp.flush();
+  var msg = '[재고관리] 자동 계산 열을 ' + END + '행까지 확장했습니다.' + (cleared.length ? ' 직접 입력돼 있던 칸 ' + cleared.length + '개를 지웠습니다.' : '');
+  console.log(msg + (cleared.length ? '\n' + cleared.join(', ') : ''));
+  rsvToast_(msg);
+}
+
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
   module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvManualGroups: rsvManualGroups, rsvPlanFoc: rsvPlanFoc, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
