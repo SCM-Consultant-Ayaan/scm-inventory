@@ -2908,6 +2908,34 @@ function rsvExtendInventoryArrays() {
   rsvToast_(msg);
 }
 
+/**
+ * 편집기에서 한 번 실행 (rsvExtendInventoryArrays 보완판).
+ *  AZ열(비어 있던 열)에 "바코드(자동)"를 한 번만 계산해 두고, BA·AA~AT·BC·BD 가 그 열을 쓰게 바꾼다.
+ *   - SKU → 마스터 바코드 조회를 행마다 1번만 하므로 계산이 훨씬 가벼워짐 (월별 판매는 1,900여 번 → 97번)
+ *   - 월별 판매(AA4) 수식의 #ERROR!(LET 이름 d0 이 셀 주소로 읽힘) 수정
+ */
+function rsvFixInventoryBarcode() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.INV_SHEET);
+  var azHead = String(sh.getRange('AZ3').getValue()).trim();
+  if (azHead && azHead.indexOf('바코드(자동') !== 0) {
+    throw new Error('[재고관리] AZ3 에 "' + azHead + '" 가 있습니다. AZ열을 다른 용도로 쓰고 있다면 알려 주세요.');
+  }
+  var G = {
+    AZ3: "바코드(자동: SKU→마스터 K열, 없으면 A열)",
+    AZ4: "=MAP($A$4:$A$100,LAMBDA(sku,IF(sku=\"\",\"\",LET(found,XLOOKUP(sku,'상품 마스터 시트'!$E:$E,'상품 마스터 시트'!$K:$K,\"\"),IF(LEN(found)=0,TO_TEXT(sku),TO_TEXT(found))))))",
+    BA4: "=MAP($AZ$4:$AZ$100,LAMBDA(bc,IF(bc=\"\",\"\",IFERROR(LET(ld,MAX('이지어드민 수불부_Raw'!$F:$F),dt,'통합_일평균_산출'!$A$2:$A$10550,key,IFERROR(VALUE(bc),-1),mk,IFERROR('통합_일평균_산출'!$B$2:$B$10550*1,0)=key,cc,IFERROR(IF(('통합_일평균_산출'!$E$2:$E$10550>0)*('통합_일평균_산출'!$C$2:$C$10550>'통합_일평균_산출'!$E$2:$E$10550),'통합_일평균_산출'!$E$2:$E$10550,'통합_일평균_산출'!$C$2:$C$10550)*1,0),recent,SUMPRODUCT(mk*(dt>ld-14)*(dt<ld+1)*cc)/14,prevm,SUMPRODUCT(mk*(dt>=EOMONTH(ld,-2)+1)*(dt<EOMONTH(ld,-1)+1)*cc)/DAY(EOMONTH(ld,-1)),ROUND(MAX(recent,prevm),1)),0))))",
+    AA4: "=MAKEARRAY(ROWS($A$4:$A$100),20,LAMBDA(r,c,LET(bc,INDEX($AZ$4:$AZ$100,r),IF(bc=\"\",\"\",LET(yymm,INDEX($AA$3:$AT$3,1,c),mstart,DATE(2000+INT(yymm/100),MOD(yymm,100),1),IFERROR(SUMIFS('통합_일평균_산출'!$G:$G,'통합_일평균_산출'!$B:$B,IFERROR(VALUE(bc),bc),'통합_일평균_산출'!$A:$A,\">=\"&mstart,'통합_일평균_산출'!$A:$A,\"<\"&EDATE(mstart,1)),0))))))",
+    BC4: "=MAP($A$4:$A$100,$E$4:$E$100,$U$4:$U$100,$V$4:$V$100,$R$4:$R$100,$C$4:$C$100,$BA$4:$BA$100,$BB$4:$BB$100,$AZ$4:$AZ$100,LAMBDA(bc,nm,u,v,r,c,ay,az,bk,IF(OR(nm=\"\",N(v)<=0),\"\",IF(NOT(OR(u=\"결품\",AND(ISNUMBER(u),N(u)<=0))),\"\",IF(REGEXMATCH(TO_TEXT(c),\"단종|운영 종료\"),\"발주 보류\",LET(base,N(ay)+N(az),IF(base<1,\"수동 판단\",LET(ld,MAX('이지어드민 수불부_Raw'!$F:$F),pace,(SUMIFS('이지어드민 수불부_Raw'!$H:$H,'이지어드민 수불부_Raw'!$M:$M,IFERROR(VALUE(bk),bk), '이지어드민 수불부_Raw'!$F:$F,\">=\"&(ld-59),'이지어드민 수불부_Raw'!$F:$F,\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!$I:$I,'이지어드민 수불부_Raw'!$M:$M,IFERROR(VALUE(bk),bk),'이지어드민 수불부_Raw'!$F:$F,\">=\"&(ld-59),'이지어드민 수불부_Raw'!$F:$F,\"<=\"&ld))/60,lt,IF(ISNUMBER(SEARCH(\"비비에센스\",nm)),120,70),rk,COUNTIF($V$4:$V$100,\">\"&v)+1,tg,IF(rk<=10,90,IF(rk<=20,80,70)),raw,ROUNDUP(v*(lt+tg)-N(r),0),cap,ROUNDUP(MAX(base,pace)*(lt+120)-N(r),0),qq,MIN(raw,cap),mq,IFERROR(VLOOKUP(bc,'상품 마스터 시트'!$E:$M,9,FALSE)*1,0),IF(raw<=0,\"\",IF(qq<=0,\"보류(재고 충분)\",MAX(CEILING(qq,5000),mq)))))))))))",
+    BD4: "=MAP($BC$4:$BC$100,$A$4:$A$100,$E$4:$E$100,$V$4:$V$100,$R$4:$R$100,$BA$4:$BA$100,$BB$4:$BB$100,$AW$4:$AW$100,$K$4:$K$100,$C$4:$C$100,$AZ$4:$AZ$100,LAMBDA(q,bc,nm,v,r,ay,az,st,k,c,bk,IF(q=\"\",\"\",LET(base,N(ay)+N(az),ld,MAX('이지어드민 수불부_Raw'!$F:$F),pace,(SUMIFS('이지어드민 수불부_Raw'!$H:$H,'이지어드민 수불부_Raw'!$M:$M,IFERROR(VALUE(bk),bk),'이지어드민 수불부_Raw'!$F:$F,\">=\"&(ld-59),'이지어드민 수불부_Raw'!$F:$F,\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!$I:$I,'이지어드민 수불부_Raw'!$M:$M,IFERROR(VALUE(bk),bk),'이지어드민 수불부_Raw'!$F:$F,\">=\"&(ld-59),'이지어드민 수불부_Raw'!$F:$F,\"<=\"&ld))/60,lt,IF(ISNUMBER(SEARCH(\"비비에센스\",nm)),120,70),rk,COUNTIF($V$4:$V$100,\">\"&v)+1,tg,IF(rk<=10,90,IF(rk<=20,80,70)),raw,ROUNDUP(v*(lt+tg)-N(r),0),cap,ROUNDUP(MAX(base,pace)*(lt+120)-N(r),0),kk,IFERROR(TO_TEXT(k),\"\"),IF(q=\"발주 보류\",TO_TEXT(c)&\" 품목·재발주 여부 확인\",IF(q=\"수동 판단\",\"판매이력 없음(예약 기준 계산 \"&TEXT(raw,\"#,##0\")&\")·기획 수량으로 결정\",IF(q=\"보류(재고 충분)\",\"실제 출고 기준 \"&(lt+120)&\"일치 이상 확보(계산 \"&TEXT(raw,\"#,##0\")&\")\",TEXTJOIN(\" / \",TRUE,IF(cap<raw,\"상한 적용(계산 \"&TEXT(raw,\"#,##0\")&\" → \"&TEXT(MAX(cap,0),\"#,##0\")&\")\",\"계산 \"&TEXT(raw,\"#,##0\")),IF(q>MIN(raw,cap),\"5,000단위 올림\",\"\"),IF(AND(REGEXMATCH(TO_TEXT(st),\"발주 완료\"),kk=\"\"),\"발주완료·입고예정 미입력\",\"\"),IF(REGEXMATCH(TO_TEXT(st),\"용기부터\"),\"용기 먼저 발주\",\"\")))))))))"
+  };
+  ['BA4', 'AA4', 'BC4', 'BD4', 'AZ4'].forEach(function (a1) { sh.getRange(a1).clearContent(); });
+  SpreadsheetApp.flush();
+  sh.getRange('AZ3').setValue(G.AZ3);
+  ['AZ4', 'BA4', 'AA4', 'BC4', 'BD4'].forEach(function (a1) { sh.getRange(a1).setFormula(G[a1]); });
+  SpreadsheetApp.flush();
+  rsvToast_('[재고관리] 바코드(자동) AZ열 추가 · B2C 일평균/월별 판매/발주 권장수량 수식 갱신 완료');
+}
+
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
   module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvManualGroups: rsvManualGroups, rsvPlanFoc: rsvPlanFoc, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
