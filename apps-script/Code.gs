@@ -2942,7 +2942,7 @@ function rsvFixInventoryBarcode() {
 
 /**
  * 편집기에서 실행. 이지어드민 원본의 열 위치는 1행 머리글 이름으로 찾는다 (붙여 넣는 형식이 바뀌어도 다시 실행하면 맞춰짐).
- *  [이지어드민 수불부_Raw] 상품 키 = 연동코드, 비어 있으면 공급처옵션 / 날짜 = 일자 / B2B = 출고 / B2C = 배송
+ *  [이지어드민 수불부_Raw] 상품 키 = 연동코드 → 공급처옵션 → 바코드 (앞이 비어 있으면 다음) / 날짜 = 일자 / B2B = 출고 / B2C = 배송
  *  [이지어드민 재고_RD]   상품 키 = 연동코드 → 연동코드2 → 공급처옵션 순서로 찾아 가용재고
  *  [통합_일평균_산출] A·B(날짜·SKU), C(배송), F(출고 보정) 와 [재고관리] F(현재고)·BA·AA~AT·BC·BD 를 SKU 기준으로 다시 쓴다.
  */
@@ -2977,7 +2977,7 @@ function rsvSwitchToSku() {
   if (String(inv.getRange('V3').getValue()).indexOf('일평균 출고량') < 0) throw new Error('[재고관리] 열 구조가 예상과 다릅니다 (V3)');
 
   // 1) 통합_일평균_산출: 날짜·SKU 목록과 배송/출고 합계를 SKU 기준으로
-  tg.getRange('B1').setValue('SKU(연동코드·없으면 공급처옵션)');
+  tg.getRange('B1').setValue('SKU(연동코드→공급처옵션→바코드)');
   tg.getRange('A2').setFormula(fill(T['통합A2']));
   tg.getRange('C2').setFormula(fill(T['통합C2']));
   tg.getRange('F2').setFormula(fill(T['통합F2']));
