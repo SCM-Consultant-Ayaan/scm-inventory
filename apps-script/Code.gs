@@ -2936,6 +2936,74 @@ function rsvFixInventoryBarcode() {
   rsvToast_('[재고관리] 바코드(자동) AZ열 추가 · B2C 일평균/월별 판매/발주 권장수량 수식 갱신 완료');
 }
 
+// =====================================================================
+// SKU CODE 기준으로 일평균·월별 판매·발주 권장 계산 전환 (한 번만 실행, 다시 실행해도 됨)
+// =====================================================================
+
+/**
+ * 편집기에서 실행. 이지어드민 원본의 열 위치는 1행 머리글 이름으로 찾는다 (붙여 넣는 형식이 바뀌어도 다시 실행하면 맞춰짐).
+ *  [이지어드민 수불부_Raw] 상품 키 = 연동코드, 비어 있으면 공급처옵션 / 날짜 = 일자 / B2B = 출고 / B2C = 배송
+ *  [이지어드민 재고_RD]   상품 키 = 연동코드 → 연동코드2 → 공급처옵션 순서로 찾아 가용재고
+ *  [통합_일평균_산출] A·B(날짜·SKU), C(배송), F(출고 보정) 와 [재고관리] F(현재고)·BA·AA~AT·BC·BD 를 SKU 기준으로 다시 쓴다.
+ */
+function rsvSwitchToSku() {
+  var ss = SpreadsheetApp.getActive();
+  var colOf = function (sheetName, names) {
+    var sh = ss.getSheetByName(sheetName);
+    if (!sh) throw new Error('[' + sheetName + '] 시트가 없습니다');
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function (v) { return String(v).trim(); });
+    var out = {};
+    Object.keys(names).forEach(function (k) {
+      var i = head.indexOf(names[k]);
+      if (i < 0) throw new Error('[' + sheetName + '] 1행에서 "' + names[k] + '" 머리글을 찾지 못했습니다');
+      out[k] = rsvColumnLetter_(i + 1);
+    });
+    return out;
+  };
+  var sb = colOf('이지어드민 수불부_Raw', { DATE: '일자', OUT: '출고', SHIP: '배송', LINK: '연동코드', OPT: '공급처옵션' });
+  var rd = colOf('이지어드민 재고_RD', { LINK: '연동코드', LINK2: '연동코드2', OPT: '공급처옵션', AVAIL: '가용재고' });
+  var fill = function (t) { return t.replace(/\{(\w+)\}/g, function (m, k) { if (!sb[k]) throw new Error('알 수 없는 열 ' + k); return sb[k]; }); };
+  var T = {
+    "통합A2": "=SORT(UNIQUE(FILTER({'이지어드민 수불부_Raw'!${DATE}$2:${DATE}$15000,IF('이지어드민 수불부_Raw'!${LINK}$2:${LINK}$15000<>\"\",'이지어드민 수불부_Raw'!${LINK}$2:${LINK}$15000,'이지어드민 수불부_Raw'!${OPT}$2:${OPT}$15000)},('이지어드민 수불부_Raw'!${DATE}$2:${DATE}$15000<>\"\")*(('이지어드민 수불부_Raw'!${LINK}$2:${LINK}$15000<>\"\")+('이지어드민 수불부_Raw'!${OPT}$2:${OPT}$15000<>\"\")>0))),1,TRUE)",
+    "통합C2": "=IFERROR(MAP($A$2:INDEX($A:$A,1+$J$2),$B$2:INDEX($B:$B,1+$J$2),LAMBDA(d,b,SUMIFS('이지어드민 수불부_Raw'!${SHIP}$2:${SHIP}$15000,'이지어드민 수불부_Raw'!${DATE}$2:${DATE}$15000,d,'이지어드민 수불부_Raw'!${LINK}$2:${LINK}$15000,b)+SUMIFS('이지어드민 수불부_Raw'!${SHIP}$2:${SHIP}$15000,'이지어드민 수불부_Raw'!${DATE}$2:${DATE}$15000,d,'이지어드민 수불부_Raw'!${LINK}$2:${LINK}$15000,\"\",'이지어드민 수불부_Raw'!${OPT}$2:${OPT}$15000,b))),0)",
+    "통합F2": "=IFERROR(MAP($A$2:INDEX($A:$A,1+$J$2),$B$2:INDEX($B:$B,1+$J$2),$E$2:INDEX($E:$E,1+$J$2),LAMBDA(d,b,e,LET(h,SUMIFS('이지어드민 수불부_Raw'!${OUT}$2:${OUT}$15000,'이지어드민 수불부_Raw'!${DATE}$2:${DATE}$15000,d,'이지어드민 수불부_Raw'!${LINK}$2:${LINK}$15000,b)+SUMIFS('이지어드민 수불부_Raw'!${OUT}$2:${OUT}$15000,'이지어드민 수불부_Raw'!${DATE}$2:${DATE}$15000,d,'이지어드민 수불부_Raw'!${LINK}$2:${LINK}$15000,\"\",'이지어드민 수불부_Raw'!${OPT}$2:${OPT}$15000,b),h-0.8*MAX(h-e,0)))),0)",
+    "BA4": "=MAP($A$4:$A$100,LAMBDA(bc,IF(bc=\"\",\"\",IFERROR(LET(ld,MAX('이지어드민 수불부_Raw'!${DATE}:${DATE}),dt,'통합_일평균_산출'!$A$2:$A$10550,mk,TO_TEXT('통합_일평균_산출'!$B$2:$B$10550)=TO_TEXT(bc),cc,IFERROR(IF(('통합_일평균_산출'!$E$2:$E$10550>0)*('통합_일평균_산출'!$C$2:$C$10550>'통합_일평균_산출'!$E$2:$E$10550),'통합_일평균_산출'!$E$2:$E$10550,'통합_일평균_산출'!$C$2:$C$10550)*1,0),recent,SUMPRODUCT(mk*(dt>ld-14)*(dt<ld+1)*cc)/14,prevm,SUMPRODUCT(mk*(dt>=EOMONTH(ld,-2)+1)*(dt<EOMONTH(ld,-1)+1)*cc)/DAY(EOMONTH(ld,-1)),ROUND(MAX(recent,prevm),1)),0))))",
+    "AA4": "=MAKEARRAY(ROWS($A$4:$A$100),20,LAMBDA(r,c,LET(bc,INDEX($A$4:$A$100,r),IF(bc=\"\",\"\",LET(yymm,INDEX($AA$3:$AT$3,1,c),mstart,DATE(2000+INT(yymm/100),MOD(yymm,100),1),IFERROR(SUMIFS('통합_일평균_산출'!$G:$G,'통합_일평균_산출'!$B:$B,bc,'통합_일평균_산출'!$A:$A,\">=\"&mstart,'통합_일평균_산출'!$A:$A,\"<\"&EDATE(mstart,1)),0))))))",
+    "BC4": "=MAP($A$4:$A$100,$E$4:$E$100,$U$4:$U$100,$V$4:$V$100,$R$4:$R$100,$C$4:$C$100,$BA$4:$BA$100,$BB$4:$BB$100,LAMBDA(bc,nm,u,v,r,c,ay,az,IF(OR(nm=\"\",N(v)<=0),\"\",IF(NOT(OR(u=\"결품\",AND(ISNUMBER(u),N(u)<=0))),\"\",IF(REGEXMATCH(TO_TEXT(c),\"단종|운영 종료\"),\"발주 보류\",LET(base,N(ay)+N(az),IF(base<1,\"수동 판단\",LET(ld,MAX('이지어드민 수불부_Raw'!${DATE}:${DATE}),pace,(SUMIFS('이지어드민 수불부_Raw'!${OUT}:${OUT},'이지어드민 수불부_Raw'!${LINK}:${LINK},bc,'이지어드민 수불부_Raw'!${DATE}:${DATE},\">=\"&(ld-59),'이지어드민 수불부_Raw'!${DATE}:${DATE},\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!${OUT}:${OUT},'이지어드민 수불부_Raw'!${LINK}:${LINK},\"\",'이지어드민 수불부_Raw'!${OPT}:${OPT},bc,'이지어드민 수불부_Raw'!${DATE}:${DATE},\">=\"&(ld-59),'이지어드민 수불부_Raw'!${DATE}:${DATE},\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!${SHIP}:${SHIP},'이지어드민 수불부_Raw'!${LINK}:${LINK},bc,'이지어드민 수불부_Raw'!${DATE}:${DATE},\">=\"&(ld-59),'이지어드민 수불부_Raw'!${DATE}:${DATE},\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!${SHIP}:${SHIP},'이지어드민 수불부_Raw'!${LINK}:${LINK},\"\",'이지어드민 수불부_Raw'!${OPT}:${OPT},bc,'이지어드민 수불부_Raw'!${DATE}:${DATE},\">=\"&(ld-59),'이지어드민 수불부_Raw'!${DATE}:${DATE},\"<=\"&ld))/60,lt,IF(ISNUMBER(SEARCH(\"비비에센스\",nm)),120,70),rk,COUNTIF($V$4:$V$100,\">\"&v)+1,tg,IF(rk<=10,90,IF(rk<=20,80,70)),raw,ROUNDUP(v*(lt+tg)-N(r),0),cap,ROUNDUP(MAX(base,pace)*(lt+120)-N(r),0),qq,MIN(raw,cap),mq,IFERROR(VLOOKUP(bc,'상품 마스터 시트'!$E:$M,9,FALSE)*1,0),IF(raw<=0,\"\",IF(qq<=0,\"보류(재고 충분)\",MAX(CEILING(qq,5000),mq)))))))))))",
+    "BD4": "=MAP($BC$4:$BC$100,$A$4:$A$100,$E$4:$E$100,$V$4:$V$100,$R$4:$R$100,$BA$4:$BA$100,$BB$4:$BB$100,$AW$4:$AW$100,$K$4:$K$100,$C$4:$C$100,LAMBDA(q,bc,nm,v,r,ay,az,st,k,c,IF(q=\"\",\"\",LET(base,N(ay)+N(az),ld,MAX('이지어드민 수불부_Raw'!${DATE}:${DATE}),pace,(SUMIFS('이지어드민 수불부_Raw'!${OUT}:${OUT},'이지어드민 수불부_Raw'!${LINK}:${LINK},bc,'이지어드민 수불부_Raw'!${DATE}:${DATE},\">=\"&(ld-59),'이지어드민 수불부_Raw'!${DATE}:${DATE},\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!${OUT}:${OUT},'이지어드민 수불부_Raw'!${LINK}:${LINK},\"\",'이지어드민 수불부_Raw'!${OPT}:${OPT},bc,'이지어드민 수불부_Raw'!${DATE}:${DATE},\">=\"&(ld-59),'이지어드민 수불부_Raw'!${DATE}:${DATE},\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!${SHIP}:${SHIP},'이지어드민 수불부_Raw'!${LINK}:${LINK},bc,'이지어드민 수불부_Raw'!${DATE}:${DATE},\">=\"&(ld-59),'이지어드민 수불부_Raw'!${DATE}:${DATE},\"<=\"&ld)+SUMIFS('이지어드민 수불부_Raw'!${SHIP}:${SHIP},'이지어드민 수불부_Raw'!${LINK}:${LINK},\"\",'이지어드민 수불부_Raw'!${OPT}:${OPT},bc,'이지어드민 수불부_Raw'!${DATE}:${DATE},\">=\"&(ld-59),'이지어드민 수불부_Raw'!${DATE}:${DATE},\"<=\"&ld))/60,lt,IF(ISNUMBER(SEARCH(\"비비에센스\",nm)),120,70),rk,COUNTIF($V$4:$V$100,\">\"&v)+1,tg,IF(rk<=10,90,IF(rk<=20,80,70)),raw,ROUNDUP(v*(lt+tg)-N(r),0),cap,ROUNDUP(MAX(base,pace)*(lt+120)-N(r),0),kk,IFERROR(TO_TEXT(k),\"\"),IF(q=\"발주 보류\",TO_TEXT(c)&\" 품목·재발주 여부 확인\",IF(q=\"수동 판단\",\"판매이력 없음(예약 기준 계산 \"&TEXT(raw,\"#,##0\")&\")·기획 수량으로 결정\",IF(q=\"보류(재고 충분)\",\"실제 출고 기준 \"&(lt+120)&\"일치 이상 확보(계산 \"&TEXT(raw,\"#,##0\")&\")\",TEXTJOIN(\" / \",TRUE,IF(cap<raw,\"상한 적용(계산 \"&TEXT(raw,\"#,##0\")&\" → \"&TEXT(MAX(cap,0),\"#,##0\")&\")\",\"계산 \"&TEXT(raw,\"#,##0\")),IF(q>MIN(raw,cap),\"5,000단위 올림\",\"\"),IF(AND(REGEXMATCH(TO_TEXT(st),\"발주 완료\"),kk=\"\"),\"발주완료·입고예정 미입력\",\"\"),IF(REGEXMATCH(TO_TEXT(st),\"용기부터\"),\"용기 먼저 발주\",\"\")))))))))"
+  };
+  var tg = ss.getSheetByName('통합_일평균_산출');
+  var inv = ss.getSheetByName(RSV_CONFIG.INV_SHEET);
+  if (String(inv.getRange('V3').getValue()).indexOf('일평균 출고량') < 0) throw new Error('[재고관리] 열 구조가 예상과 다릅니다 (V3)');
+
+  // 1) 통합_일평균_산출: 날짜·SKU 목록과 배송/출고 합계를 SKU 기준으로
+  tg.getRange('B1').setValue('SKU(연동코드·없으면 공급처옵션)');
+  tg.getRange('A2').setFormula(fill(T['통합A2']));
+  tg.getRange('C2').setFormula(fill(T['통합C2']));
+  tg.getRange('F2').setFormula(fill(T['통합F2']));
+
+  // 2) 재고관리 F(현재고): 연동코드 → 연동코드2 → 공급처옵션 순서
+  var last = inv.getLastRow(), fRows = 0;
+  var names = inv.getRange(4, 5, Math.max(last - 3, 1), 1).getValues();
+  var R = "'이지어드민 재고_RD'!";
+  names.forEach(function (v, i) {
+    if (String(v[0]).trim() === '') return;
+    var r = 4 + i, a = '$A' + r, col = function (c) { return R + '$' + c + ':$' + c; };
+    inv.getRange(r, 6).setFormula('=XLOOKUP(' + a + ',' + col(rd.LINK) + ',' + col(rd.AVAIL) + ',XLOOKUP(' + a + ',' + col(rd.LINK2) + ',' +
+      col(rd.AVAIL) + ',XLOOKUP(' + a + ',' + col(rd.OPT) + ',' + col(rd.AVAIL) + ',"입고 확인")))');
+    fRows++;
+  });
+
+  // 3) 재고관리 펼침 수식 (4~100행): 바코드 변환 없이 A열 SKU 그대로
+  if (String(inv.getRange('AZ3').getValue()).indexOf('바코드(자동') === 0) inv.getRange('AZ3:AZ100').clearContent();
+  ['BA4', 'AA4', 'BC4', 'BD4'].forEach(function (a1) { inv.getRange(a1).setFormula(fill(T[a1])); });
+  SpreadsheetApp.flush();
+  var msg = 'SKU 기준 전환 완료 · 수불부(일자 ' + sb.DATE + ', 출고 ' + sb.OUT + ', 배송 ' + sb.SHIP + ', 연동코드 ' + sb.LINK + ', 공급처옵션 ' + sb.OPT +
+    ') · 재고_RD(연동코드 ' + rd.LINK + '/' + rd.LINK2 + ', 공급처옵션 ' + rd.OPT + ', 가용재고 ' + rd.AVAIL + ') · 현재고 수식 ' + fRows + '행';
+  console.log(msg);
+  rsvToast_(msg);
+}
+
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
   module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvManualGroups: rsvManualGroups, rsvPlanFoc: rsvPlanFoc, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
