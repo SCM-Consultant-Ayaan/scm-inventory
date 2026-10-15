@@ -138,6 +138,8 @@ var RSV_CONFIG = {
   SHIP_ALERT_HOUR: 9,
   // 출고일까지 남은 일수가 이 값일 때 알림 (0 = 당일)
   SHIP_ALERT_DAYS: [5, 3, 0],
+  // 출고 예정 알림에서 태그할 담당자 (슬랙 사용자 ID)
+  SHIP_ALERT_MENTIONS: ['U07MZUZRLH5', 'U0C1HDSU5NJ', 'U0ACEJ0LKPW'],
   // 공휴일·회사 휴무일 목록 시트 (A열 날짜). 없으면 2026~2027 공휴일로 자동 생성
   HOLIDAY_SHEET: '휴무일',
 };
@@ -1275,7 +1277,8 @@ function rsvSendShipAlert_() {
   var dd = {};
   targets.forEach(function (b) { var k = b.dday === 0 ? '오늘 출고' : 'D-' + b.dday; dd[k] = (dd[k] || 0) + 1; });
   var notReady = targets.filter(function (b) { return b.notReady; }).length;
-  var head = ':calendar: *출고 예정 알림* (' + rsvFmtMD_(new Date()) + ')\n' +
+  var mention = (RSV_CONFIG.SHIP_ALERT_MENTIONS || []).map(function (u) { return '<@' + u + '>'; }).join(' ');
+  var head = ':calendar: *출고 예정 알림* (' + rsvFmtMD_(new Date()) + ')' + (mention ? ' ' + mention : '') + '\n' +
     (targets.length ? '• ' + Object.keys(dd).map(function (k) { return k + ' *' + dd[k] + '묶음*'; }).join(' · ') +
       (notReady ? ' · :warning: 재고 미확보 ' + notReady + '묶음' : '') + '\n' : '') +
     (overdue.length ? '• :rotating_light: 사용 예정일 지났는데 미출고 *' + overdue.length + '묶음*\n' : '') +
