@@ -85,6 +85,20 @@ var RSV_CONFIG = {
   PO_CHANNEL: '수출',
   // 메일 PO 의 빈 사용 예정일(C) 자동 기재: 출고 가능일이 이 일수 안에 모이는 품목끼리 한 번에 출고
   USE_DATE_BUNDLE_DAYS: 10,
+
+  // ---- FOC 자동 할당 (메일 PO 신규 등록 시) ----
+  // company: 업체명(F) 드롭다운 값 / from: 이 차수부터 적용 / rate: 발주 금액 대비 비율
+  // choices: 우선순위 순서. 각 후보 상품군에서 [재고관리] 가용재고(H)가 가장 많은 컬러를 고르고, 수량은 카톤 단위 내림.
+  //   1순위 상품군에 FOC 수량만큼 가용재고가 있는 컬러가 없으면 다음 순위로. 전부 없으면 1순위에서 가용 최다 컬러(홀딩).
+  FOC_RULES: [
+    {
+      company: '뷰릿지', from: '26-10차', rate: 0.05,
+      choices: [
+        { label: '블러셔 지정 컬러', match: /VOL 멜로우 블러싱 세럼 4\.2g/, price: 7000, carton: 250 },
+        { label: '립 앰플 랜덤 컬러', match: /PDRN 틴티드 립 앰플 10ml_/, price: 7200, carton: 266 },
+      ],
+    },
+  ],
   // 발주서 업체명 → 업체명(F) 드롭다운 값. 회사명 정리(㈜·코퍼레이션 등 제거) 후 드롭다운과 비슷하면 자동으로 맞춤.
   // 영문명처럼 자동으로 안 맞는 업체만 여기에 추가 (왼쪽: 발주서에 적힌 이름의 일부, 오른쪽: 드롭다운 값)
   COMPANY_ALIASES: {
@@ -784,7 +798,8 @@ function rsvReadInventory_(ss) {
       var d = rsvToDate_(r[p[0]], null), q = rsvToNum_(r[p[1]]);
       if (d && q > 0) inbound.push({ date: d, qty: q });
     });
-    map[name] = { barcode: String(r[0] || '').trim(), stock: rsvToNum_(r[5]), inbound: inbound };
+    map[name] = { barcode: String(r[0] || '').trim(), stock: rsvToNum_(r[5]), inbound: inbound,
+      avail: rsvToNum_(r[7]), category: String(r[2] || '').trim() }; // H 가용재고, C 카테고리(단종·운영 종료 확인)
   });
   return map;
 }
@@ -1044,6 +1059,18 @@ function rsvImportMail_() {
             row[RSV_COL.mailKey - 1] = poKey + '|' + ln.sourceRow;
             return row;
           });
+          // FOC 자동 할당 (업체·차수 규칙에 맞으면 한 행 추가)
+          var foc = rsvPlanFoc(company, po, rsvReadInventory_(ss), RSV_CONFIG.FOC_RULES);
+          if (foc) {
+            var fr = newRows[0].slice();
+            fr[RSV_COL.code - 1] = foc.barcode || '';
+            fr[RSV_COL.name - 1] = foc.name;
+            fr[RSV_COL.qty - 1] = foc.qty;
+            fr[RSV_COL.status - 1] = '';
+            fr[RSV_COL.memo - 1] = 'FOC · ' + foc.note;
+            fr[RSV_COL.mailKey - 1] = poKey + '|foc';
+            newRows.push(fr);
+          }
           var at = rsvLastDataRow_(sh) + 1;
           if (at + newRows.length - 1 > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), newRows.length + 50);
           // A~O, V 만 기록 (P~U·D 는 재계산이 채움)
@@ -1054,6 +1081,7 @@ function rsvImportMail_() {
             from: msg.getFrom(), firstRow: at, count: newRows.length });
           var unmatched = po.lines.filter(function (ln) { return !rsvResolveProduct(ln, products).name; }).length;
           rsvWriteLog_(msg, fname, '등록 ' + newRows.length + '행 · PO ' + po.poNo + ' · ' + po.purpose +
+            (foc ? ' · FOC ' + foc.name.replace(/^로지킴\s*/, '') + ' ' + rsvFmtNum_(foc.qty) + '개' : '') +
             (unmatched ? ' · ⚠ 상품명 매칭 실패 ' + unmatched + '건' : '') +
             (companyNote ? ' · ⚠ 업체명 \'' + po.company + '\' 드롭다운에 없음 → F 비워둠 (COMPANY_ALIASES 에 추가)' : ''));
         } catch (err) {
@@ -1367,7 +1395,7 @@ function rsvReadResRows_(sh) {
         company: String(v[RSV_COL.company - 1] || '').trim(), purpose: String(v[RSV_COL.purpose - 1] || '').trim(),
         name: String(v[RSV_COL.name - 1] || '').trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
         status: String(v[RSV_COL.status - 1] || '').trim(), shipped: String(v[RSV_COL.shipped - 1] || '').trim(),
-        key: String(v[RSV_COL.mailKey - 1] || ''),
+        key: String(v[RSV_COL.mailKey - 1] || ''), memo: String(v[RSV_COL.memo - 1] || ''),
       };
     });
 }
@@ -1423,6 +1451,42 @@ function rsvCompanyList_(sh) {
   return null;
 }
 
+/** 용도에서 'YY-N차' → YY*1000+N (없으면 null) */
+function rsvRoundKey_(purpose) {
+  var m = String(purpose || '').match(/(\d{2})\s*-\s*(\d+)\s*차/);
+  return m ? Number(m[1]) * 1000 + Number(m[2]) : null;
+}
+
+/**
+ * FOC 할당 계획 (순수 함수). 규칙에 맞지 않거나 수량이 0 이면 null.
+ *  금액 = 발주서 공급가액 합계 × rate → 후보 단가로 나눈 뒤 카톤 단위 내림.
+ *  컬러 = 후보 상품군 중 [재고관리] 가용재고(H)가 가장 많은 SKU (단종·운영 종료 제외).
+ * 반환: {name, barcode, qty, choice, note}
+ */
+function rsvPlanFoc(company, po, inventory, rules) {
+  var rule = (rules || []).filter(function (x) { return x.company === company; })[0];
+  if (!rule || !(po.amount > 0)) return null;
+  var rk = rsvRoundKey_(po.purpose), from = rsvRoundKey_(rule.from);
+  if (rk == null || (from != null && rk < from)) return null;
+  var budget = po.amount * rule.rate;
+  var plans = rule.choices.map(function (ch, i) {
+    var qty = Math.floor(budget / ch.price / ch.carton) * ch.carton;
+    var skus = Object.keys(inventory).filter(function (nm) {
+      return ch.match.test(nm) && !/단종|운영\s*종료/.test(inventory[nm].category || '');
+    }).sort(function (a, b) { return inventory[b].avail - inventory[a].avail || (a < b ? -1 : 1); });
+    return { i: i, ch: ch, qty: qty, best: skus[0] || null };
+  }).filter(function (p) { return p.qty > 0 && p.best; });
+  if (!plans.length) return null;
+  var pick = plans.filter(function (p) { return inventory[p.best].avail >= p.qty; })[0] || plans[0];
+  var inv = inventory[pick.best];
+  return {
+    name: pick.best, barcode: inv.barcode, qty: pick.qty, choice: pick.ch.label,
+    note: (pick.i + 1) + '순위 ' + pick.ch.label + ' · 발주금액 ' + rsvFmtNum_(po.amount) + '원×' + Math.round(rule.rate * 100) +
+      '% = ' + rsvFmtNum_(budget) + '원 ÷ ' + rsvFmtNum_(pick.ch.price) + '원 → ' + pick.ch.carton + '개 단위 내림 · 가용 최다 컬러 자동(가용 ' +
+      rsvFmtNum_(inv.avail) + ') · 업체 협의 후 변경 가능',
+  };
+}
+
 /**
  * 시트에서 이 PO 의 행 찾기 (순수 함수).
  *  메일키가 같은 PO No. 인 행 + 용도가 같고(차수 포함) 업체명이 비슷한 행 (예: 뷰릿지 ↔ (주)뷰릿지코퍼레이션)
@@ -1433,7 +1497,7 @@ function rsvFindPoRows(rows, po) {
   var pc = rsvCompanyNorm(po.company);
   // 메일키가 있는 행 + (차수가 있으면) 같은 용도·비슷한 업체명 행을 모두 — 일부 행에만 메일키가 있어도 나머지를 놓치지 않게
   return rows.filter(function (r) {
-    if (!r.name) return false;
+    if (!r.name || /\|foc/.test(r.key) || /^FOC/.test(r.memo || '')) return false; // FOC 행은 발주서 비교 대상 아님
     if (r.key.indexOf(key) === 0) return true;
     if (!hasRound || r.purpose !== String(po.purpose).trim()) return false;
     var rc = rsvCompanyNorm(r.company);
@@ -1754,7 +1818,7 @@ function rsvNotifySlack_(pos, conversions) {
       });
       if (!firstRow) firstRow = p.firstRow;
       var lines = rows.map(function (v) {
-        return '• ' + v[RSV_COL.name - 1] + ' — *' + rsvFmtNum_(rsvToNum_(v[RSV_COL.qty - 1])) + '개* → ' + (v[RSV_COL.verdict - 1] || v[RSV_COL.status - 1] || '판정 대기');
+        return '• ' + (/^FOC/.test(String(v[RSV_COL.memo - 1])) ? '🎁 *FOC* ' : '') + v[RSV_COL.name - 1] + ' — *' + rsvFmtNum_(rsvToNum_(v[RSV_COL.qty - 1])) + '개* → ' + (v[RSV_COL.verdict - 1] || v[RSV_COL.status - 1] || '판정 대기');
       });
       var total = rows.reduce(function (s, v) { return s + rsvToNum_(v[RSV_COL.qty - 1]); }, 0);
       var nRes = rows.filter(function (v) { return String(v[RSV_COL.status - 1]).indexOf('예약재고') === 0; }).length;
@@ -1872,7 +1936,7 @@ function rsvManualSig_(v) {
 function rsvRegistrationMessage_(o) {
   var rows = o.rows;
   var lines = rows.map(function (v) {
-    return '• ' + v[RSV_COL.name - 1] + ' — *' + rsvFmtNum_(rsvToNum_(v[RSV_COL.qty - 1])) + '개* → ' + (v[RSV_COL.verdict - 1] || v[RSV_COL.status - 1] || '판정 대기');
+    return '• ' + (/^FOC/.test(String(v[RSV_COL.memo - 1])) ? '🎁 *FOC* ' : '') + v[RSV_COL.name - 1] + ' — *' + rsvFmtNum_(rsvToNum_(v[RSV_COL.qty - 1])) + '개* → ' + (v[RSV_COL.verdict - 1] || v[RSV_COL.status - 1] || '판정 대기');
   });
   var total = rows.reduce(function (s, v) { return s + rsvToNum_(v[RSV_COL.qty - 1]); }, 0);
   var nRes = rows.filter(function (v) { return String(v[RSV_COL.status - 1]).indexOf('예약재고') === 0; }).length;
@@ -2298,12 +2362,13 @@ function rsvParsePurchaseOrder(grid) {
     var cName = find('품목명'), cQty = find('총수량');
     if (cName >= 0 && cQty >= 0) {
       hdr = r;
-      col = { code: find('품목코드'), name: cName, qty: cQty, perBox: find('입수량'), box: find('주문박스수량'), memo: find('비고') };
+      col = { code: find('품목코드'), name: cName, qty: cQty, perBox: find('입수량'), box: find('주문박스수량'), memo: find('비고'),
+        price: find('단가'), amount: find('공급가액') };
     }
   }
   var yy = poDate ? String(poDate.getFullYear()).slice(2) : (poNo.match(/_(\d{2})\d{4}_/) || [])[1] || '';
   var out = {
-    poNo: poNo, poDate: poDate, round: round, company: company, country: country, lines: [],
+    poNo: poNo, poDate: poDate, round: round, company: company, country: country, lines: [], amount: 0,
     purpose: [country ? country + ' 수출' : '수출', yy && round ? yy + '-' + Number(round) + '차' : ''].filter(String).join(' '),
   };
   if (hdr < 0) return out;
@@ -2317,9 +2382,12 @@ function rsvParsePurchaseOrder(grid) {
     var qty = rsvToNum_(get(col.qty));
     if (!(qty > 0)) qty = rsvToNum_(get(col.perBox)) * rsvToNum_(get(col.box));
     if (!(qty > 0)) continue;
+    var price = rsvToNum_(get(col.price)), amount = rsvToNum_(get(col.amount));
+    if (!(amount > 0) && price > 0) amount = price * qty;
+    out.amount += amount > 0 ? amount : 0;
     out.lines.push({
       sourceRow: i + 1, code: String(get(col.code) || '').trim(), barcode: '', name: name, qty: qty,
-      memo: String(get(col.memo) || '').trim(),
+      memo: String(get(col.memo) || '').trim(), price: price, amount: amount > 0 ? amount : 0,
     });
   }
   return out;
@@ -2583,15 +2651,19 @@ function rsvShipSchedule(rows, company) {
     var d = rsvToDate_(r.ship, new Date());
     var dk = d ? d.getTime() : 'x';
     if (!groups[dk]) { groups[dk] = { date: d, items: [], byKey: {}, qty: 0 }; order.push(dk); }
-    var g = groups[dk], it = g.byKey[r.name];
-    if (!it) { it = g.byKey[r.name] = { name: r.name, qty: 0, purposes: [] }; g.items.push(it); }
+    var isFoc = /^FOC/.test(r.memo || ''), key = r.name + (isFoc ? '\u0001FOC' : '');
+    var g = groups[dk], it = g.byKey[key];
+    if (!it) { it = g.byKey[key] = { name: r.name, qty: 0, purposes: [], foc: isFoc }; g.items.push(it); }
     it.qty += r.qty; g.qty += r.qty;
     if (r.purpose && it.purposes.indexOf(r.purpose) < 0) it.purposes.push(r.purpose);
   });
   return order.map(function (k) { return groups[k]; }).sort(function (a, b) {
     return (a.date ? a.date.getTime() : 9e15) - (b.date ? b.date.getTime() : 9e15);
   }).map(function (g) {
-    g.items.sort(function (a, b) { var x = rsvNaturalKey_(a.name), y = rsvNaturalKey_(b.name); return x < y ? -1 : x > y ? 1 : 0; });
+    g.items.sort(function (a, b) {
+      if (a.foc !== b.foc) return a.foc ? 1 : -1; // FOC 는 그 날짜의 맨 아래
+      var x = rsvNaturalKey_(a.name), y = rsvNaturalKey_(b.name); return x < y ? -1 : x > y ? 1 : 0;
+    });
     g.items.forEach(function (it) {
       it.purposes.sort(function (a, b) { var x = rsvNaturalKey_(a), y = rsvNaturalKey_(b); return x < y ? -1 : x > y ? 1 : 0; });
       it.merged = it.purposes.length > 1;
@@ -2640,7 +2712,7 @@ function rsvBuildShipSchedule(company) {
     groups.forEach(function (g, gi) {
       var start = data.length;
       g.items.forEach(function (it, k) {
-        data.push([g.date || '미정', k === 0 ? dday(g.date) : '', it.name, it.qty, it.purposes.join('\n'), '']);
+        data.push([g.date || '미정', k === 0 ? dday(g.date) : '', it.name, it.qty, it.purposes.join('\n'), it.foc ? 'FOC' : '']);
         fmt.push({ type: it.merged ? 'merged' : 'item', band: gi % 2, undecided: !g.date });
       });
       data.push(['', '', '소계  ' + g.items.length + '종', g.qty, '', '']);
@@ -2792,5 +2864,5 @@ function rsvAddRunoutColumn() {
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvManualGroups: rsvManualGroups, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
+  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvManualGroups: rsvManualGroups, rsvPlanFoc: rsvPlanFoc, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
 }
