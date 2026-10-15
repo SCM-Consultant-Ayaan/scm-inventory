@@ -3004,6 +3004,44 @@ function rsvSwitchToSku() {
   rsvToast_(msg);
 }
 
+/**
+ * 편집기에서 실행 (rsvSwitchToSku 보완). [재고관리] BA(B2C 일평균)·BB(B2B 과거 일평균) 계산을 가볍게 다시 쓴다.
+ *  - 공통 배열(날짜·SKU·하한 적용 수량, 출고완료·180일 조건)을 MAP 밖에서 한 번만 만들고, 상품마다 비교만 한다
+ *  - TO_TEXT(범위) 대신 범위&"" 로 비교 (TO_TEXT 는 범위 전체에 적용되지 않음)
+ *  - [재고관리] F(현재고): 연동코드 → 연동코드2 → 공급처옵션 → 바코드 순서로 찾기
+ */
+function rsvFixDailyAverages() {
+  var ss = SpreadsheetApp.getActive();
+  var headCol = function (sheetName, name) {
+    var sh = ss.getSheetByName(sheetName);
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function (v) { return String(v).trim(); });
+    var i = head.indexOf(name);
+    if (i < 0) throw new Error('[' + sheetName + '] 1행에서 "' + name + '" 머리글을 찾지 못했습니다');
+    return rsvColumnLetter_(i + 1);
+  };
+  var DATE = headCol('이지어드민 수불부_Raw', '일자');
+  var rd = {};
+  [['LINK', '연동코드'], ['LINK2', '연동코드2'], ['OPT', '공급처옵션'], ['BAR', '바코드'], ['AVAIL', '가용재고']].forEach(function (p) { rd[p[0]] = headCol('이지어드민 재고_RD', p[1]); });
+  var inv = ss.getSheetByName(RSV_CONFIG.INV_SHEET);
+  if (String(inv.getRange('V3').getValue()).indexOf('일평균 출고량') < 0) throw new Error('[재고관리] 열 구조가 예상과 다릅니다 (V3)');
+  var BA = "=ARRAYFORMULA(LET(ld,MAX('이지어드민 수불부_Raw'!${DATE}:${DATE}),dt,'통합_일평균_산출'!$A$2:$A$10550,keys,'통합_일평균_산출'!$B$2:$B$10550&\"\",cap,'통합_일평균_산출'!$E$2:$E$10550,dayqty,'통합_일평균_산출'!$C$2:$C$10550,cc,IFERROR(IF((cap>0)*(dayqty>cap),cap,dayqty)*1,0),recentwin,(dt>ld-14)*(dt<ld+1),prevwin,(dt>=EOMONTH(ld,-2)+1)*(dt<EOMONTH(ld,-1)+1),prevdays,DAY(EOMONTH(ld,-1)),MAP($A$4:$A$100,LAMBDA(bc,IF(bc=\"\",\"\",IFERROR(ROUND(MAX(SUMPRODUCT((keys=bc&\"\")*recentwin*cc)/14,SUMPRODUCT((keys=bc&\"\")*prevwin*cc)/prevdays),1),0))))))";
+  var BB = "=ARRAYFORMULA(LET(dd,IF(ISNUMBER('예약 재고 관리'!$A$3:$A4222),'예약 재고 관리'!$A$3:$A4222,IF(ISNUMBER('예약 재고 관리'!$C$3:$C4222),'예약 재고 관리'!$C$3:$C4222,0)),shipped,('예약 재고 관리'!$K$3:$K4222=\"출고 완료\")*(dd>=TODAY()-180)*(dd<=TODAY()),names,'예약 재고 관리'!$I$3:$I4222,MAP($E$4:$E$100,LAMBDA(nm,IF(nm=\"\",\"\",LET(m,(names=nm)*shipped,IF(SUM(m)<2,0,ROUND(SUMPRODUCT(m,'예약 재고 관리'!$J$3:$J4222)/180,1))))))))";
+  inv.getRange('BA4').setFormula(BA.replace(/\{DATE\}/g, DATE));
+  inv.getRange('BB4').setFormula(BB);
+
+  var last = inv.getLastRow(), n = 0, R = "'이지어드민 재고_RD'!";
+  var col = function (c) { return R + '$' + c + ':$' + c; };
+  inv.getRange(4, 5, Math.max(last - 3, 1), 1).getValues().forEach(function (v, i) {
+    if (String(v[0]).trim() === '') return;
+    var a = '$A' + (4 + i);
+    var look = function (key, rest) { return 'XLOOKUP(' + a + ',' + col(rd[key]) + ',' + col(rd.AVAIL) + ',' + rest + ')'; };
+    inv.getRange(4 + i, 6).setFormula('=' + look('LINK', look('LINK2', look('OPT', look('BAR', '"입고 확인"')))));
+    n++;
+  });
+  SpreadsheetApp.flush();
+  rsvToast_('[재고관리] B2C·B2B 일평균 수식 갱신 · 현재고 수식 ' + n + '행 (바코드까지 찾기)');
+}
+
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
   module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvManualGroups: rsvManualGroups, rsvPlanFoc: rsvPlanFoc, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
