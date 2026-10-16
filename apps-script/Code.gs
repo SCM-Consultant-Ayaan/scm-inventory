@@ -191,22 +191,28 @@ var RSV_NEW_HEADERS = {
 // =====================================================================
 
 function rsvOnOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('📦 예약재고 자동화')
-    .addItem('지금 재계산 + 정렬', 'rsvRunAllocation')
-    .addItem('보기: 출고일 정렬 (출고 묶음)', 'rsvSortByShip')
-    .addItem('보기: 업체별 정렬 (업체 → 출고일 → 차수)', 'rsvSortByCompany')
-    .addItem('출고 가능 일정 파일 (업체 선택 → 엑셀)', 'rsvShipScheduleDialog')
-    .addItem('메일 발주서 가져오기', 'rsvRunMailImport')
-    .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
-    .addItem('슬랙 알림 테스트', 'rsvTestSlack')
-    .addItem('출고 예정 알림 지금 보내기', 'rsvSendShipAlertNow')
-    .addItem('슬랙 답글 지금 확인 (출고완료 · 변경 승인)', 'rsvCheckSlackNow')
-    .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow')
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('📦 예약재고 자동화')
+    // 자주 쓰는 기능
+    .addItem('🔄 지금 재계산 + 정렬', 'rsvRunAllocation')
+    .addItem('📄 출고 가능 일정 파일 (업체 선택 → 엑셀)', 'rsvShipScheduleDialog')
+    .addItem('📅 출고 예정 알림 지금 보내기', 'rsvSendShipAlertNow')
     .addSeparator()
-    .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'rsvSetup')
-    .addItem('트리거만 다시 설치', 'rsvInstallTriggers')
-    .addItem('자동화 중지 (트리거 삭제)', 'rsvRemoveTriggers')
+    .addSubMenu(ui.createMenu('👀 보기 (정렬)')
+      .addItem('출고일 정렬 (출고 묶음)', 'rsvSortByShip')
+      .addItem('업체별 정렬 (업체 → 출고일 → 차수)', 'rsvSortByCompany'))
+    .addSubMenu(ui.createMenu('✉️ 메일 발주')
+      .addItem('메일 발주서 지금 가져오기', 'rsvRunMailImport')
+      .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
+      .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow'))
+    .addSubMenu(ui.createMenu('💬 슬랙')
+      .addItem('슬랙 답글 지금 확인 (출고완료 · 변경 승인)', 'rsvCheckSlackNow')
+      .addItem('슬랙 알림 테스트', 'rsvTestSlack'))
+    .addSeparator()
+    .addSubMenu(ui.createMenu('⚙️ 설정')
+      .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'rsvSetup')
+      .addItem('트리거만 다시 설치', 'rsvInstallTriggers')
+      .addItem('자동화 중지 (트리거 삭제)', 'rsvRemoveTriggers'))
     .addToUi();
 }
 
