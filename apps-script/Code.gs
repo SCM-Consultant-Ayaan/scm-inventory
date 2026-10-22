@@ -32,6 +32,11 @@ var RSV_CONFIG = {
   STATUS_RES: '예약재고(현재고 제외)',
   STATUS_HOLD: '홀딩재고(추가발주 제외)',
   STATUS_DONE: '출고 완료',
+  // 사용 예정일이 지나고 OVERDUE_RELEASE_DAYS 일이 넘도록 출고 완료가 안 된 예약 → 재고에서 빼고 이 상태로 (행은 남김)
+  STATUS_CHECK: '확인 필요(출고 미확인)',
+  OVERDUE_RELEASE_DAYS: 7,
+  // 사용 예정일이 이 일수 이내면 판정에 '🚚 출고 임박' 표시 (행 색도 진하게)
+  IMMINENT_DAYS: 15,
 
   // 올리브영 판정: 입고처(D) 값 또는 업체명(E)에 포함된 키워드
   OLIVEYOUNG_CHANNEL: '올리브영',
@@ -44,7 +49,8 @@ var RSV_CONFIG = {
   //  created  : 작성일자 빠른 순
   //  useDate  : 사용 예정일 빠른 순
   //  volume   : 업체 누적 출고량 많은 순
-  PRIORITY_ORDER: ['urgent', 'oliveyoung', 'manual', 'created', 'useDate', 'volume'],
+  // 배분 순서: 긴급/0순위 → 사용 예정일 빠른 순 → 1·2순위 → 올리브영 → 등록일 → 업체 누적 출고량
+  PRIORITY_ORDER: ['urgent', 'useDate', 'manual', 'oliveyoung', 'created', 'volume'],
 
   // 홀딩 대기열을 순위대로 엄격하게 처리 (앞 순위 홀딩이 전환되기 전에는 뒷 순위가 먼저 전환되지 않음)
   STRICT_QUEUE: true,
@@ -818,7 +824,7 @@ function rsvReadInventory_(ss) {
  * 반환: rows 와 같은 순서의 결과 배열.
  */
 function rsvAllocate(rows, inventory, now, cfg) {
-  var today = rsvStartOfDay_(now);
+  var today = rsvStartOfDay_(now), DAY = 86400000;
   var stamp = rsvFmtDateTime_(now);
 
   // 업체 누적 출고량 (출고 완료 기준, 업체명 없으면 입고처로 집계)
@@ -836,113 +842,99 @@ function rsvAllocate(rows, inventory, now, cfg) {
     return {
       row: r.row, name: r.name, qty: rsvToNum_(r.qty), company: r.company, channel: r.channel,
       order: '', verdict: '', freeNow: '', supply: '',
-      volume: r.name && k ? (volume[k] || 0) : '', newStatus: null, converted: false, logAppend: '',
+      volume: r.name && k ? (volume[k] || 0) : '', newStatus: null, converted: false, demoted: false, released: false, logAppend: '',
       active: false, avail: null, // avail: 이 건을 출고할 수 있는 날짜 (null = 재고 확보 시점 모름)
     };
   });
 
-  // 활성 건 (출고 전, 예약/홀딩/미판정)
+  // 활성 건: 예약 / 홀딩 / 미판정. 사용 예정일 + OVERDUE_RELEASE_DAYS 가 지난 예약은 '확인 필요'로 빼낸다
   var groups = {};
   rows.forEach(function (r, i) {
     if (!r.name) return;
-    if (r.status === cfg.STATUS_DONE || rsvIsShipped_(r)) {
-      results[i].verdict = '출고 완료';
-      return;
-    }
+    var res = results[i];
+    if (r.status === cfg.STATUS_DONE || rsvIsShipped_(r)) { res.verdict = '출고 완료'; return; }
     var kind = r.status.indexOf('예약재고') === 0 ? 'res'
       : r.status.indexOf('홀딩재고') === 0 ? 'hold'
       : r.status === '' ? 'new' : 'other';
-    if (kind === 'other') { results[i].verdict = '⚠ 재고 분류 값 확인 필요'; return; }
-    if (!(rsvToNum_(r.qty) > 0)) { results[i].verdict = '⚠ 수량 입력 필요'; return; }
-    if (!inventory[r.name]) { results[i].verdict = '⚠ [재고관리]에 없는 상품명 (상품명 확인)'; return; }
-    results[i].active = true;
-    (groups[r.name] = groups[r.name] || []).push({ i: i, r: r, kind: kind, key: rsvPriorityKey_(r, volume, today, cfg) });
+    if (r.status === cfg.STATUS_CHECK) { res.verdict = '❓ 출고 여부 확인 필요 — 출고했으면 출고 완료, 아직이면 재고 분류를 비우거나 예약으로 (재고에서 제외 중)'; return; }
+    if (kind === 'other') { res.verdict = '재고 계산 제외 (' + r.status + ')'; return; }
+    if (!(rsvToNum_(r.qty) > 0)) { res.verdict = '⚠ 수량 입력 필요'; return; }
+    if (!inventory[r.name]) { res.verdict = '⚠ [재고관리]에 없는 상품명 (상품명 확인)'; return; }
+    var useDate = rsvToDate_(r.useDate, today);
+    var late = useDate ? Math.round((today - useDate) / DAY) : 0;
+    if (kind === 'res' && late >= cfg.OVERDUE_RELEASE_DAYS) {
+      res.newStatus = cfg.STATUS_CHECK; res.released = true;
+      res.verdict = '❓ 사용예정일 ' + late + '일 경과 · 출고 완료 표시 없음 → 재고에서 제외 (출고했으면 출고 완료로)';
+      res.logAppend = stamp + ' 사용예정일 ' + late + '일 경과 · 출고 미확인 → 확인 필요 (재고 해제)';
+      return;
+    }
+    res.active = true;
+    (groups[r.name] = groups[r.name] || []).push({ i: i, r: r, kind: kind, useDate: useDate, late: late, key: rsvPriorityKey_(r, volume, today, cfg) });
   });
 
+  // 상품별: 우선순위(사용 예정일 빠른 순) 대로 현재고를 배분. 모자라면 그 건부터 뒤는 홀딩
   Object.keys(groups).forEach(function (name) {
     var list = groups[name].sort(function (a, b) { return rsvCmpKey_(a.key, b.key); });
     var inv = inventory[name];
     var stock = inv.stock;
     var inbound = inv.inbound.slice().sort(function (a, b) { return a.date - b.date; });
+    var left = stock, blocked = false, ahead = 0; // ahead: 앞 순위 수요 합계 (예약+홀딩)
 
-    list.forEach(function (x, idx) { results[x.i].order = idx + 1; });
+    list.forEach(function (x, idx) {
+      var q = rsvToNum_(x.r.qty), res = results[x.i];
+      res.order = idx + 1;
+      res.freeNow = left;
+      var dday = x.useDate ? Math.round((x.useDate - today) / DAY) : null;
 
-    // 1) 확정 예약: 순위대로 현재고 점유. 초과분 경고.
-    var firm = 0;
-    list.forEach(function (x) {
-      if (x.kind !== 'res') return;
-      var q = rsvToNum_(x.r.qty);
-      firm += q;
-      var res = results[x.i];
-      res.freeNow = stock - firm;
-      res.avail = firm <= stock ? today : null;
-      res.verdict = firm <= stock
-        ? '✅ 예약 확정'
-        : '⚠ 확정 예약이 현재고 초과 (' + rsvFmtNum_(Math.min(firm - stock, q)) + '개 부족)';
-    });
-
-    // 2) 홀딩 + 신규: 순위대로 지금 가용재고로 출고 가능하면 예약으로
-    var freeNow = stock - firm;
-    var blocked = false;
-    var aheadHold = 0;
-    list.forEach(function (x) {
-      if (x.kind === 'res') return;
-      var q = rsvToNum_(x.r.qty);
-      var res = results[x.i];
-      res.freeNow = freeNow;
-
-      if (!blocked && freeNow >= q) {
-        freeNow -= q;
-        res.newStatus = cfg.STATUS_RES;
+      if (!blocked && left >= q) {
+        left -= q;
         res.avail = today;
-        if (x.kind === 'hold') {
-          res.converted = true;
-          res.verdict = '🔄 홀딩→예약 자동 전환 (' + stamp + ')';
-          res.logAppend = stamp + ' 홀딩→예약 자동 전환 (가용 ' + rsvFmtNum_(freeNow + q) + ' ≥ ' + rsvFmtNum_(q) + ')';
-        } else {
-          res.verdict = '✅ 예약 확정 (자동 판정)';
-          res.logAppend = stamp + ' 신규 → 예약재고 자동 판정';
+        if (x.kind !== 'res') {
+          res.newStatus = cfg.STATUS_RES;
+          res.converted = x.kind === 'hold';
+          res.logAppend = stamp + (x.kind === 'hold' ? ' 홀딩→예약 자동 전환' : ' 신규 → 예약재고 자동 판정') +
+            ' (가용 ' + rsvFmtNum_(left + q) + ' ≥ ' + rsvFmtNum_(q) + ')';
         }
+        res.verdict = (x.kind === 'hold' ? '🔄 홀딩→예약 전환' : '✅ 예약') +
+          (dday !== null && dday >= 0 && dday <= cfg.IMMINENT_DAYS ? ' · 🚚 D-' + dday + ' 출고 임박' : '') +
+          (x.late > 0 ? ' · ⚠ 사용예정일 ' + x.late + '일 경과 — 출고했으면 출고 완료로' : '');
+        ahead += q;
         return;
       }
 
-      // 홀딩 유지/지정
-      if (x.kind === 'new') {
-        res.newStatus = cfg.STATUS_HOLD;
-        res.logAppend = stamp + ' 신규 → 홀딩재고 자동 판정 (지금 가용 ' + rsvFmtNum_(Math.max(freeNow, 0)) + ' < ' + rsvFmtNum_(q) + ')';
-      }
+      // 홀딩: 재고 부족 (앞선 출고일 우선)
       if (cfg.STRICT_QUEUE) blocked = true;
-
-      var useDate = rsvToDate_(x.r.useDate, today);
-      // 지금 가용에서 앞 순위 홀딩분을 뺀 뒤, 입고예정을 날짜순으로 더해 확보 시점 계산
-      var base = freeNow - aheadHold;
-      var cum = base, okDate = base >= q ? today : null;
-      var supplyByUse = base;
+      if (x.kind !== 'hold') {
+        res.newStatus = cfg.STATUS_HOLD;
+        res.demoted = x.kind === 'res';
+        res.logAppend = stamp + (x.kind === 'res' ? ' 예약→홀딩 (재고 부족 · 사용 예정일이 더 빠른 건 우선)' : ' 신규 → 홀딩재고 자동 판정') +
+          ' (지금 가용 ' + rsvFmtNum_(Math.max(left, 0)) + ' < ' + rsvFmtNum_(q) + ')';
+      }
+      // 확보 시점: 현재고 + 입고예정(날짜순) 이 앞 순위 수요 + 이 건을 덮는 첫 날
+      var cum = stock, need = ahead + q, okDate = cum >= need ? today : null, supplyByUse = stock;
       inbound.forEach(function (b) {
         cum += b.qty;
-        if (!okDate && cum >= q) okDate = b.date;
-        if (!useDate || b.date <= useDate) supplyByUse += b.qty;
+        if (!okDate && cum >= need) okDate = b.date;
+        if (!x.useDate || b.date <= x.useDate) supplyByUse += b.qty;
       });
+      supplyByUse -= ahead;
       res.supply = supplyByUse;
       res.avail = okDate;
-
-      var why = freeNow >= q ? '앞 순위 홀딩 대기 중' : '지금 가용 ' + rsvFmtNum_(Math.max(freeNow, 0)) + '개';
+      var why = left >= q ? '앞 순위 홀딩 대기 중' : '지금 가용 ' + rsvFmtNum_(Math.max(left, 0)) + '개';
       if (supplyByUse >= q) {
         res.verdict = '⏳ 홀딩 · ' + why + ' · 입고 후 출고 가능 (예상 ' + rsvFmtMD_(okDate) + ')';
       } else if (okDate) {
         res.verdict = '⚠ 홀딩 · 사용예정일까지 ' + rsvFmtNum_(q - supplyByUse) + '개 부족 · 입고 후 ' + rsvFmtMD_(okDate) + ' 가능';
       } else {
-        res.verdict = '⚠ 홀딩 · 입고예정 포함 ' + rsvFmtNum_(q - cum) + '개 부족 · 추가 발주 필요';
+        res.verdict = '⚠ 홀딩 · 입고예정 포함 ' + rsvFmtNum_(need - cum) + '개 부족 · 추가 발주 필요';
       }
-      var lowerFirm = list.filter(function (y) {
-        return y.kind === 'res' && rsvCmpKey_(y.key, x.key) > 0;
-      }).reduce(function (s, y) { return s + rsvToNum_(y.r.qty); }, 0);
-      if (lowerFirm > 0) res.verdict += ' · 하위 순위 확정예약 ' + rsvFmtNum_(lowerFirm) + '개 점유 중';
+      if (x.kind === 'res') res.verdict = '🔻 예약→홀딩 · ' + res.verdict.replace(/^(⏳|⚠) 홀딩 · /, '');
+      if (x.late > 0) res.verdict += ' · ⚠ 사용예정일 ' + x.late + '일 경과';
       var created = rsvToDate_(x.r.created, today);
-      if (created && (today - created) / 86400000 >= cfg.HOLD_WARN_DAYS) {
-        res.verdict += ' · ⚠ 홀딩 ' + Math.floor((today - created) / 86400000) + '일 경과';
+      if (created && (today - created) / DAY >= cfg.HOLD_WARN_DAYS) {
+        res.verdict += ' · ⚠ 홀딩 ' + Math.floor((today - created) / DAY) + '일 경과';
       }
-      aheadHold += q;
+      ahead += q;
     });
   });
 
