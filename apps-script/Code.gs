@@ -37,6 +37,15 @@ var RSV_CONFIG = {
   OVERDUE_RELEASE_DAYS: 7,
   // 사용 예정일이 이 일수 이내면 판정에 '🚚 출고 임박' 표시 (행 색도 진하게)
   IMMINENT_DAYS: 15,
+  // 사용자가 '취소' 답글을 달면 쓰는 재고 분류 (재고 계산에서 제외)
+  STATUS_CANCEL: '발주취소',
+  // 사용 예정일이 지났는데 출고 완료가 안 된 예약 → 경과 일수가 이 값인 날 아침 슬랙 알림 (영업일만, 주말에 걸리면 다음 영업일)
+  OVERDUE_ALERT_DAYS_OY: [1, 3, 5],   // 올리브영
+  OVERDUE_ALERT_DAYS: [3, 5],         // 그 외 업체
+  OVERDUE_MENTIONS: ['U0C1HDSU5NJ', 'U0ACEJ0LKPW'],
+  // 수불부 자동 출고 완료: 사용 예정일 ±이 일수 안의 실제 출고량이 같은 기간 예약 합계와 정확히 같을 때만
+  AUTO_COMPLETE_WINDOW_DAYS: 3,
+  LEDGER_SHEET: '이지어드민 수불부_Raw',
 
   // 올리브영 판정: 입고처(D) 값 또는 업체명(E)에 포함된 키워드
   OLIVEYOUNG_CHANNEL: '올리브영',
@@ -211,14 +220,16 @@ function rsvOnOpen() {
       .addItem('메일 발주서 지금 가져오기', 'rsvRunMailImport')
       .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
       .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow'))
-    .addSubMenu(ui.createMenu('💬 슬랙')
-      .addItem('슬랙 답글 지금 확인 (출고완료 · 변경 승인)', 'rsvCheckSlackNow')
-      .addItem('슬랙 알림 테스트', 'rsvTestSlack'))
+    .addSubMenu(ui.createMenu('🚚 출고 확인')
+      .addItem('슬랙 답글 지금 확인 (출고완료 · 취소 · 변경 승인)', 'rsvCheckSlackNow')
+      .addItem('출고일 지난 건 알림 지금 보내기', 'rsvSendOverdueNow')
+      .addItem('수불부와 대조해 출고 완료 자동 처리', 'rsvAutoCompleteNow'))
     .addSeparator()
     .addSubMenu(ui.createMenu('⚙️ 설정')
       .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'rsvSetup')
       .addItem('트리거만 다시 설치', 'rsvInstallTriggers')
-      .addItem('자동화 중지 (트리거 삭제)', 'rsvRemoveTriggers'))
+      .addItem('자동화 중지 (트리거 삭제)', 'rsvRemoveTriggers')
+      .addItem('슬랙 알림 테스트', 'rsvTestSlack'))
     .addToUi();
 }
 
@@ -436,51 +447,7 @@ function rsvApplyLayout_(sh) {
   rsvHeaderNotes_(sh);
   sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.freeNow, dataRows, 3).setNumberFormat('#,##0');
 
-  // 입력 규칙: 우선순위 드롭다운, 재고 분류 드롭다운(빈칸 허용 = 자동 판정)
-  sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.priority, dataRows, 1).setDataValidation(
-    SpreadsheetApp.newDataValidation()
-      .requireValueInList(['긴급', '0순위', '1순위', '2순위'], true)
-      .setAllowInvalid(false).build());
-  sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.status, dataRows, 1).setDataValidation(
-    SpreadsheetApp.newDataValidation()
-      .requireValueInList([RSV_CONFIG.STATUS_RES, RSV_CONFIG.STATUS_HOLD, RSV_CONFIG.STATUS_DONE], true)
-      .setAllowInvalid(false)
-      .setHelpText('비워두면 스크립트가 예약/홀딩을 자동 판정합니다.').build());
-
-  // 조건부 서식: 사용자 규칙(A~M, 자동화 규칙 아님)은 유지하고 자동화 규칙은 다시 생성
-  var pRange = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.verdict, dataRows, 1);
-  var rowRange = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, dataRows, RSV_COL.memo);
-  var pr = rsvColumnLetter_(RSV_COL.priority);
-  var kc = '$' + rsvColumnLetter_(RSV_COL.status) + RSV_CONFIG.FIRST_ROW;
-  // 재고 분류(K)별 행 색상: 비고(N, 손으로 칠한 강조 유지)와 판정(Q, 판정 색상 유지)은 제외
-  var statusRanges = [
-    sh.getRange(RSV_CONFIG.FIRST_ROW, 1, dataRows, RSV_COL.shipped),                              // A~M
-    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.priority, dataRows, RSV_COL.order - RSV_COL.priority + 1), // O~P
-    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.freeNow, dataRows, RSV_COL.log - RSV_COL.freeNow + 1),    // R~U
-  ];
-  var statusRule = function (formula, bg, fg) {
-    var b = SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(formula).setBackground(bg).setRanges(statusRanges);
-    if (fg) b.setFontColor(fg);
-    return b.build();
-  };
-  var keep = sh.getConditionalFormatRules().filter(function (r) {
-    var bc = r.getBooleanCondition();
-    var vals = bc ? bc.getCriteriaValues().join(' ') : '';
-    if (/긴급|예약재고|홀딩재고|출고 완료/.test(vals)) return false;
-    return r.getRanges().every(function (rg) { return rg.getLastColumn() < RSV_COL.priority; });
-  });
-  sh.setConditionalFormatRules(keep.concat([
-    rsvRule_(pRange, '⚠', '#f4cccc', '#990000'),
-    rsvRule_(pRange, '🔄', '#cfe2f3', '#073763'),
-    rsvRule_(pRange, '⏳', '#fff2cc', '#7f6000'),
-    rsvRule_(pRange, '✅', '#d9ead3', '#274e13'),
-    SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=OR($' + pr + RSV_CONFIG.FIRST_ROW + '="긴급",$' + pr + RSV_CONFIG.FIRST_ROW + '="0순위")')
-      .setFontColor('#cc0000').setBold(true).setRanges([rowRange]).build(),
-    statusRule('=LEFT(' + kc + ',4)="예약재고"', '#ebf5e8'),          // 예약재고: 연초록
-    statusRule('=LEFT(' + kc + ',4)="홀딩재고"', '#efefef'),          // 홀딩재고: 연회색
-    statusRule('=' + kc + '="' + RSV_CONFIG.STATUS_DONE + '"', '#b7b7b7', '#434343'), // 출고 완료: 진회색
-  ]));
+  rsvApplyStatusRules_(sh);
 
   var f = sh.getFilter();
   if (f) f.remove();
@@ -502,6 +469,68 @@ function rsvColumnLetter_(c) {
   return s;
 }
 
+var RSV_RULES_VERSION = '3'; // 재고 분류 드롭다운·조건부 서식을 바꾸면 올린다 (재계산 때 한 번 자동 적용)
+
+/** 재고 분류(K) 드롭다운과 판정·행 색상 규칙. 사용자가 추가한 드롭다운 값(예: 발주취소)과 직접 만든 서식은 유지 */
+function rsvApplyStatusRules_(sh) {
+  var dataRows = sh.getMaxRows() - RSV_CONFIG.FIRST_ROW + 1;
+  sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.priority, dataRows, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList(['긴급', '0순위', '1순위', '2순위'], true)
+      .setAllowInvalid(false).build());
+  var list = [RSV_CONFIG.STATUS_RES, RSV_CONFIG.STATUS_HOLD, RSV_CONFIG.STATUS_DONE, RSV_CONFIG.STATUS_CHECK, RSV_CONFIG.STATUS_CANCEL];
+  try {
+    var old = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.status).getDataValidation();
+    if (old && old.getCriteriaType() === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+      old.getCriteriaValues()[0].forEach(function (v) { if (v && list.indexOf(v) < 0) list.push(v); });
+    }
+  } catch (e) { /* 기존 규칙 읽기 실패 시 기본 목록 */ }
+  sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.status, dataRows, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList(list, true)
+      .setAllowInvalid(false)
+      .setHelpText('비워두면 스크립트가 예약/홀딩을 자동 판정합니다. 예약·홀딩은 사용 예정일 순으로 매번 다시 배분됩니다.').build());
+
+  var pRange = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.verdict, dataRows, 1);
+  var rowRange = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, dataRows, RSV_COL.memo);
+  var pr = rsvColumnLetter_(RSV_COL.priority);
+  var kc = '$' + rsvColumnLetter_(RSV_COL.status) + RSV_CONFIG.FIRST_ROW;
+  var cc = '$' + rsvColumnLetter_(RSV_COL.useDate) + RSV_CONFIG.FIRST_ROW;
+  var statusRanges = [
+    sh.getRange(RSV_CONFIG.FIRST_ROW, 1, dataRows, RSV_COL.shipped),                              // A~M
+    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.priority, dataRows, RSV_COL.order - RSV_COL.priority + 1), // O~P
+    sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.freeNow, dataRows, RSV_COL.log - RSV_COL.freeNow + 1),    // R~U
+  ];
+  var statusRule = function (formula, bg, fg) {
+    var b = SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(formula).setBackground(bg).setRanges(statusRanges);
+    if (fg) b.setFontColor(fg);
+    return b.build();
+  };
+  var keep = sh.getConditionalFormatRules().filter(function (r) {
+    var bc = r.getBooleanCondition();
+    var vals = bc ? bc.getCriteriaValues().join(' ') : '';
+    if (/긴급|예약재고|홀딩재고|출고 완료|확인 필요|❓|🔻/.test(vals)) return false;
+    return r.getRanges().every(function (rg) { return rg.getLastColumn() < RSV_COL.priority; });
+  });
+  sh.setConditionalFormatRules(keep.concat([
+    rsvRule_(pRange, '❓', '#fce5cd', '#783f04'),
+    rsvRule_(pRange, '🔻', '#f4cccc', '#990000'),
+    rsvRule_(pRange, '⚠', '#f4cccc', '#990000'),
+    rsvRule_(pRange, '🔄', '#cfe2f3', '#073763'),
+    rsvRule_(pRange, '⏳', '#fff2cc', '#7f6000'),
+    rsvRule_(pRange, '✅', '#d9ead3', '#274e13'),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=OR($' + pr + RSV_CONFIG.FIRST_ROW + '="긴급",$' + pr + RSV_CONFIG.FIRST_ROW + '="0순위")')
+      .setFontColor('#cc0000').setBold(true).setRanges([rowRange]).build(),
+    // 예약 + 사용 예정일 IMMINENT_DAYS 이내: 진한 초록 (출고 임박)
+    statusRule('=AND(LEFT(' + kc + ',4)="예약재고",ISNUMBER(' + cc + '),' + cc + '-TODAY()<=' + RSV_CONFIG.IMMINENT_DAYS + ')', '#c9e5bf'),
+    statusRule('=LEFT(' + kc + ',4)="예약재고"', '#ebf5e8'),          // 예약재고: 연초록
+    statusRule('=LEFT(' + kc + ',4)="홀딩재고"', '#efefef'),          // 홀딩재고: 연회색
+    statusRule('=' + kc + '="' + RSV_CONFIG.STATUS_CHECK + '"', '#fce5cd', '#783f04'), // 확인 필요: 연주황
+    statusRule('=' + kc + '="' + RSV_CONFIG.STATUS_DONE + '"', '#b7b7b7', '#434343'), // 출고 완료: 진회색
+  ]));
+}
+
 function rsvRule_(range, text, bg, fg) {
   return SpreadsheetApp.newConditionalFormatRule()
     .whenTextContains(text).setBackground(bg).setFontColor(fg).setRanges([range]).build();
@@ -521,6 +550,11 @@ function rsvRunAllocation(opts) {
     var ss = SpreadsheetApp.getActive();
     var sh = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
     if (!rsvLayoutOk_(sh)) { rsvToast_('구조가 최신이 아닙니다. 메뉴에서 "초기 설정"을 먼저 실행하세요.'); return { conversions: [], bundles: [] }; }
+    var props0 = PropertiesService.getScriptProperties();
+    if (props0.getProperty('RSV_RULES_VERSION') !== RSV_RULES_VERSION) {
+      rsvApplyStatusRules_(sh);
+      props0.setProperty('RSV_RULES_VERSION', RSV_RULES_VERSION);
+    }
     var last = rsvLastDataRow_(sh);
     rsvClearOrphanKeys_(sh);
     if (last < RSV_CONFIG.FIRST_ROW) return { conversions: [], bundles: [] };
@@ -1251,8 +1285,219 @@ function rsvDailyShipAlert() {
   var props = PropertiesService.getScriptProperties();
   var todayKey = rsvFmtYMD_(now);
   if (props.getProperty('SHIP_ALERT_SENT') === todayKey) return; // 하루 한 번
+  try { rsvAutoCompleteFromLedger_(); } catch (e) { console.error('수불부 자동 출고 완료 오류', e); }
   rsvSendShipAlert_();
+  try { rsvSendOverdueAlerts_(now); } catch (e) { console.error('출고 경과 알림 오류', e); }
   props.setProperty('SHIP_ALERT_SENT', todayKey);
+}
+
+/** 메뉴: 출고일 지난 미완료 건 알림을 지금 보내기 (오늘 알림 대상만) */
+function rsvSendOverdueNow() {
+  rsvAssertAllowed_();
+  var n = rsvSendOverdueAlerts_(new Date());
+  rsvToast_(n ? '출고 경과 알림 ' + n + '건 전송' : '오늘 알림할 출고 경과 건이 없습니다 (올리브영 +' + RSV_CONFIG.OVERDUE_ALERT_DAYS_OY.join('/') +
+    '일, 그 외 +' + RSV_CONFIG.OVERDUE_ALERT_DAYS.join('/') + '일)');
+}
+
+/** 메뉴: 수불부와 대조해 출고 완료 자동 처리 */
+function rsvAutoCompleteNow() {
+  rsvAssertAllowed_();
+  var n = rsvAutoCompleteFromLedger_();
+  rsvToast_(n ? '수불부 출고량이 일치한 ' + n + '행을 출고 완료로 바꿨습니다' : '수불부와 정확히 일치하는 출고 건이 없습니다');
+}
+
+/**
+ * 오늘 알릴 출고 경과 묶음 (순수 함수). rows: {i, name, qty, status, useDate, company, channel, purpose, key, oy}
+ *  예약 상태이면서 사용 예정일이 지난 행 → 경과 일수가 알림 일수(올리브영/그 외)에 해당하면 대상.
+ *  주말·휴무일에 걸린 알림일은 다음 영업일에 함께 보낸다. 업체+용도로 묶어 반환.
+ */
+function rsvOverdueTargets(rows, now, holidays, cfg) {
+  var DAY = 86400000, today = rsvStartOfDay_(now), from = today;
+  for (var k = 0; k < 14; k++) {
+    var prev = new Date(from.getFullYear(), from.getMonth(), from.getDate() - 1);
+    if (rsvIsBusinessDay_(prev, holidays)) break;
+    from = prev;
+  }
+  var groups = {}, list = [];
+  rows.forEach(function (r) {
+    if (!r.name || r.status.indexOf('예약재고') !== 0 || !r.useDate) return;
+    var late = Math.round((today - r.useDate) / DAY);
+    if (late <= 0) return;
+    var days = r.oy ? cfg.OVERDUE_ALERT_DAYS_OY : cfg.OVERDUE_ALERT_DAYS;
+    var hit = days.filter(function (d) {
+      var t = new Date(r.useDate.getFullYear(), r.useDate.getMonth(), r.useDate.getDate() + d);
+      return t >= from && t <= today;
+    });
+    if (!hit.length) return;
+    var key = (r.company || r.channel) + '\u0001' + r.purpose;
+    if (!groups[key]) { groups[key] = { company: r.company || r.channel, purpose: r.purpose, oy: r.oy, late: late, rows: [] }; list.push(groups[key]); }
+    groups[key].rows.push(r);
+    groups[key].late = Math.max(groups[key].late, late);
+  });
+  return list.sort(function (a, b) { return b.late - a.late; });
+}
+
+/** 출고 경과 알림 보내기. 반환: 보낸 묶음 수 */
+function rsvSendOverdueAlerts_(now) {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(sh);
+  if (last < RSV_CONFIG.FIRST_ROW) return 0;
+  var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
+  var today = rsvStartOfDay_(now);
+  var rows = values.map(function (v, i) {
+    var r = rsvRowFromValues_(v, RSV_CONFIG.FIRST_ROW + i);
+    r.i = i; r.useDate = rsvToDate_(v[RSV_COL.useDate - 1], today);
+    r.key = String(v[RSV_COL.mailKey - 1] || ''); r.oy = rsvIsOliveYoung_(r, RSV_CONFIG);
+    return r;
+  });
+  var groups = rsvOverdueTargets(rows, now, rsvHolidays_(), RSV_CONFIG);
+  if (!groups.length) return 0;
+  var ledger = rsvReadLedger_(ss), inv = rsvReadInventory_(ss);
+  var base = ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=';
+  var mention = (RSV_CONFIG.OVERDUE_MENTIONS || []).map(function (u) { return '<@' + u + '>'; }).join(' ');
+  var stamp = rsvFmtYMD_(today).slice(2).replace(/-/g, '');
+  var sent = 0;
+  groups.forEach(function (g, gi) {
+    // 행마다 고유 키가 없으면 붙여서 스레드 답글로 정확히 그 행들만 처리
+    var keys = g.rows.map(function (r, k) {
+      if (!r.key || r.key.indexOf('mn:old|') === 0) {
+        r.key = 'od:' + stamp + '-' + (gi + 1) + '|' + (k + 1);
+        sh.getRange(r.row, RSV_COL.mailKey).setValue(r.key);
+      }
+      return r.key;
+    });
+    var total = g.rows.reduce(function (s, r) { return s + rsvToNum_(r.qty); }, 0);
+    var head = ':alarm_clock: *출고 확인 필요* · ' + g.purpose + ' / ' + g.company + ' ' + mention + '\n' +
+      '• 사용 예정일 ' + rsvFmtMD_(g.rows[0].useDate) + ' (+' + g.late + '일) 지났는데 출고 완료 표시가 없어요 · ' + g.rows.length + '종 / ' + rsvFmtNum_(total) + '개\n' +
+      '• 스레드에 *출고완료* (수량이 다른 품목만 *출고완료 새틴 250* 처럼) / 안 나갔으면 *취소* 답글 · +' + RSV_CONFIG.OVERDUE_RELEASE_DAYS + '일이면 재고에서 자동 제외';
+    var detail = g.rows.map(function (r) {
+      var sku = inv[r.name] ? inv[r.name].barcode : '';
+      var out = rsvLedgerSum_(ledger, sku, new Date(r.useDate.getTime() - RSV_CONFIG.AUTO_COMPLETE_WINDOW_DAYS * 86400000), today);
+      return '• ' + r.name + ' — *' + rsvFmtNum_(rsvToNum_(r.qty)) + '개*' + (sku ? '  (수불부 출고 ' + rsvFmtMD_(r.useDate) + '±: ' + rsvFmtNum_(out) + '개, 다른 업체 포함)' : '');
+    }).join('\n') + '\n<' + base + 'A' + g.rows[0].row + '|시트에서 보기>';
+    var res;
+    try { res = rsvPostSlackThreaded_(head, detail); } catch (e) { rsvWarnOnce_('출고 경과 알림 실패: ' + e.message); return; }
+    if (res && res.ts) rsvTrackThread_(res.ts, '', { keys: keys, label: g.purpose + ' (' + g.company + ')' });
+    sent++;
+  });
+  return sent;
+}
+
+/** [이지어드민 수불부_Raw] → { SKU: { 'yyyy-mm-dd': 출고 } }  (SKU = 연동코드 → 공급처옵션 → 바코드) */
+function rsvReadLedger_(ss) {
+  var sh = ss.getSheetByName(RSV_CONFIG.LEDGER_SHEET);
+  if (!sh || sh.getLastRow() < 2) return {};
+  var v = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  var head = v[0].map(function (x) { return String(x).trim(); });
+  var c = function (n) { return head.indexOf(n); };
+  var cd = c('일자'), co = c('출고'), cl = c('연동코드'), cp = c('공급처옵션'), cb = c('바코드');
+  if (cd < 0 || co < 0) return {};
+  var map = {};
+  for (var i = 1; i < v.length; i++) {
+    var d = rsvToDate_(v[i][cd], null);
+    var q = rsvToNum_(v[i][co]);
+    if (!d || !(q > 0)) continue;
+    var bar = cb >= 0 ? v[i][cb] : '';
+    if (typeof bar === 'number') bar = String(Math.round(bar));
+    var k = String((cl >= 0 && v[i][cl]) || (cp >= 0 && v[i][cp]) || bar || '').trim();
+    if (!k) continue;
+    var dk = rsvFmtYMD_(d);
+    map[k] = map[k] || {};
+    map[k][dk] = (map[k][dk] || 0) + q;
+  }
+  return map;
+}
+
+function rsvLedgerSum_(ledger, sku, from, to) {
+  var m = ledger[sku];
+  if (!m) return 0;
+  var s = 0, f = rsvFmtYMD_(rsvStartOfDay_(from)), t = rsvFmtYMD_(rsvStartOfDay_(to));
+  Object.keys(m).forEach(function (dk) { if (dk >= f && dk <= t) s += m[dk]; });
+  return s;
+}
+
+/**
+ * 수불부 대조 (순수 함수). rows: {i, name, qty, status, useDate, sku, done}
+ *  SKU 별로 사용 예정일이 오늘 이전인 행(완료 포함)을 날짜가 WINDOW 일 이내로 이어지는 묶음으로 나누고,
+ *  묶음 기간(첫 날 −WINDOW ~ 마지막 날 +WINDOW, 오늘까지)의 실제 출고 합계 = 그 기간 예약 합계(완료 포함) 이면
+ *  아직 열린 예약을 출고 완료 대상으로 반환. 예약에 없는 출고가 섞이면 합계가 달라져 자동 처리하지 않는다.
+ */
+function rsvLedgerMatches(rows, ledger, now, cfg) {
+  var DAY = 86400000, W = cfg.AUTO_COMPLETE_WINDOW_DAYS, today = rsvStartOfDay_(now);
+  var bySku = {};
+  rows.forEach(function (r) {
+    if (!r.name || !r.sku || !r.useDate || r.useDate > today || !(rsvToNum_(r.qty) > 0)) return;
+    if (!r.done && r.status.indexOf('예약재고') !== 0 && r.status !== cfg.STATUS_CHECK) return;
+    if ((today - r.useDate) / DAY > 45) return;
+    (bySku[r.sku] = bySku[r.sku] || []).push(r);
+  });
+  var out = [];
+  Object.keys(bySku).forEach(function (sku) {
+    var list = bySku[sku].sort(function (a, b) { return a.useDate - b.useDate; });
+    var clusters = [], cur = null;
+    list.forEach(function (r) {
+      if (cur && (r.useDate - cur.end) / DAY <= W) { cur.rows.push(r); cur.end = r.useDate; }
+      else { cur = { start: r.useDate, end: r.useDate, rows: [r] }; clusters.push(cur); }
+    });
+    clusters.forEach(function (c) {
+      var open = c.rows.filter(function (r) { return !r.done; });
+      if (!open.length) return;
+      var from = new Date(c.start.getTime() - W * DAY), to = new Date(Math.min(c.end.getTime() + W * DAY, today.getTime()));
+      var shipped = rsvLedgerSum_(ledger, sku, from, to);
+      var reserved = c.rows.reduce(function (s, r) { return s + rsvToNum_(r.qty); }, 0);
+      if (shipped > 0 && shipped === reserved) {
+        open.forEach(function (r) { out.push({ i: r.i, from: from, to: to, shipped: shipped, reserved: reserved }); });
+      }
+    });
+  });
+  return out;
+}
+
+/** 수불부와 정확히 일치하는 예약을 출고 완료로. 반환: 처리한 행 수 */
+function rsvAutoCompleteFromLedger_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(sh);
+  if (last < RSV_CONFIG.FIRST_ROW) return 0;
+  var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
+  var inv = rsvReadInventory_(ss), ledger = rsvReadLedger_(ss), now = new Date(), today = rsvStartOfDay_(now);
+  var rows = values.map(function (v, i) {
+    var r = rsvRowFromValues_(v, RSV_CONFIG.FIRST_ROW + i);
+    r.i = i; r.useDate = rsvToDate_(v[RSV_COL.useDate - 1], today);
+    r.sku = inv[r.name] ? inv[r.name].barcode : '';
+    r.done = r.status === RSV_CONFIG.STATUS_DONE || rsvIsShipped_(r);
+    return r;
+  });
+  var hits = rsvLedgerMatches(rows, ledger, now, RSV_CONFIG);
+  if (!hits.length) return 0;
+  var stamp = rsvFmtDateTime_(now), lines = [];
+  hits.forEach(function (h) {
+    var row = RSV_CONFIG.FIRST_ROW + h.i, log = String(values[h.i][RSV_COL.log - 1] || '');
+    sh.getRange(row, RSV_COL.status).setValue(RSV_CONFIG.STATUS_DONE);
+    sh.getRange(row, RSV_COL.log).setValue((log ? log + '\n' : '') + stamp + ' 수불부 출고 일치 (' + rsvFmtMD_(h.from) + '~' + rsvFmtMD_(h.to) +
+      ' 출고 ' + rsvFmtNum_(h.shipped) + ' = 예약 ' + rsvFmtNum_(h.reserved) + ') → 자동 출고 완료');
+    lines.push('• ' + (rows[h.i].company || rows[h.i].channel) + ' · ' + rows[h.i].purpose + ' — ' + rows[h.i].name + ' ' + rsvFmtNum_(rsvToNum_(rows[h.i].qty)) + '개');
+  });
+  try { rsvPostSlackThreaded_(':white_check_mark: *수불부 출고량 일치 → 자동 출고 완료 ' + hits.length + '행*\n• 품목은 스레드에 :point_down:', lines.join('\n')); }
+  catch (e) { console.error(e); }
+  return hits.length;
+}
+
+/**
+ * 출고완료 답글 해석 (순수 함수). '출고완료' 뒤에 '상품명일부 수량' 이 있으면 그 품목만 그 수량으로.
+ *  예) '출고완료' → {all:true} / '출고완료 새틴 250, 자나 100' → {all:false, items:[{token:'새틴',qty:250},…]}
+ */
+function rsvParseShipReply(text) {
+  var t = String(text || '');
+  var m = t.match(/출고\s*완료([\s\S]*)$/);
+  if (!m) return null;
+  var items = [], re = /([^\d,\n]+?)\s*([\d][\d,]*)\s*개?/g, x;
+  while ((x = re.exec(m[1])) !== null) {
+    var token = x[1].replace(/[:：\-\s]/g, '');
+    if (token) items.push({ token: token, qty: rsvToNum_(x[2]) });
+  }
+  return { all: !items.length, items: items };
 }
 
 /** 메뉴: 오늘 보낼 출고 예정 알림을 바로 보내기 (테스트용, 하루 한 번·휴무일 제한 없음) */
@@ -2021,6 +2266,7 @@ function rsvTrackThread_(ts, poNo, opts) {
     map[ts] = { po: poNo, at: Date.now() };
     if (opts && opts.key) map[ts].key = opts.key;
     if (opts && opts.label) map[ts].label = opts.label;
+    if (opts && opts.keys) map[ts].keys = opts.keys;
     rsvSaveThreads_(map);
   } finally {
     lock.releaseLock();
@@ -2066,7 +2312,10 @@ function rsvCheckSlackThreads_() {
     var ts = keys[k], entry = map[ts];
     var prefix = entry.key || ('po:' + entry.po + '|');
     var idx = [];
-    values.forEach(function (v, i) { if (String(v[RSV_COL.mailKey - 1]).indexOf(prefix) === 0) idx.push(i); });
+    values.forEach(function (v, i) {
+      var key = String(v[RSV_COL.mailKey - 1]);
+      if (entry.keys ? entry.keys.indexOf(key) >= 0 : key.indexOf(prefix) === 0) idx.push(i);
+    });
     var open = idx.filter(function (i) { return String(values[i][RSV_COL.status - 1]).trim() !== RSV_CONFIG.STATUS_DONE; });
     if (!idx.length || !open.length || Date.now() - entry.at > RSV_CONFIG.SLACK_THREAD_DAYS * 86400000) {
       delete map[ts]; changed = true; continue;
@@ -2081,23 +2330,65 @@ function rsvCheckSlackThreads_() {
         (body.error === 'missing_scope' ? ' (슬랙 앱에 channels:history, groups:history 권한 추가 후 재설치 필요)' : ''));
       break;
     }
-    var hit = (body.messages || []).slice(1).filter(function (m) { return rsvIsShipDoneReply(m, RSV_CONFIG); })[0];
-    if (!hit) continue;
+    var human = (body.messages || []).slice(1).filter(function (m) { return !m.bot_id && !(m.subtype && m.subtype !== 'thread_broadcast'); });
+    var hit = human.filter(function (m) { return rsvIsShipDoneReply(m, RSV_CONFIG); })[0];
+    var cancel = !hit && human.filter(function (m) { return /^\s*(발주\s*)?취소/.test(String(m.text || '')); })[0];
+    if (!hit && !cancel) continue;
 
-    var stamp = rsvFmtDateTime_(new Date());
-    open.forEach(function (i) {
-      var row = RSV_CONFIG.FIRST_ROW + i;
-      var log = String(values[i][RSV_COL.log - 1] || '');
-      sh.getRange(row, RSV_COL.status).setValue(RSV_CONFIG.STATUS_DONE);
-      sh.getRange(row, RSV_COL.log).setValue((log ? log + '\n' : '') + stamp + ' 슬랙 스레드 답글("' +
-        String(hit.text).slice(0, 30) + '")로 출고 완료 처리');
-      values[i][RSV_COL.status - 1] = RSV_CONFIG.STATUS_DONE;
-    });
+    var stamp = rsvFmtDateTime_(new Date()), msgs = [];
+    var log = function (i, text) {
+      var old = String(values[i][RSV_COL.log - 1] || '');
+      sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.log).setValue((old ? old + '\n' : '') + stamp + ' ' + text);
+    };
+    if (cancel) {
+      open.forEach(function (i) {
+        sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.status).setValue(RSV_CONFIG.STATUS_CANCEL);
+        log(i, '슬랙 스레드 답글("' + String(cancel.text).slice(0, 30) + '")로 ' + RSV_CONFIG.STATUS_CANCEL);
+        values[i][RSV_COL.status - 1] = RSV_CONFIG.STATUS_CANCEL;
+      });
+      msgs.push(open.length + '행 *' + RSV_CONFIG.STATUS_CANCEL + '* (재고 계산 제외)');
+    } else {
+      var reply = rsvParseShipReply(hit.text) || { all: true, items: [] };
+      var norm = function (s) { return String(s || '').replace(/\s/g, '').toLowerCase(); };
+      // '출고완료' = 이 묶음 전부 출고. 뒤에 '품목 수량'을 적으면 그 품목만 실제 수량으로 (나머지는 그대로 전부 출고)
+      var targets = open, used = [];
+      if (!reply.all) {
+        reply.items.forEach(function (it) {
+          var i = open.filter(function (j) { return norm(values[j][RSV_COL.name - 1]).indexOf(norm(it.token)) >= 0 && used.indexOf(j) < 0; })[0];
+          if (i === undefined) { msgs.push('⚠ "' + it.token + '" 품목을 찾지 못함'); return; }
+          used.push(i);
+          var qty = rsvToNum_(values[i][RSV_COL.qty - 1]);
+          if (it.qty > 0 && it.qty < qty) {
+            // 일부 출고: 이 행은 출고 수량으로 완료, 남은 수량은 새 행(예약 대기)으로
+            var copy = values[i].slice();
+            copy[RSV_COL.qty - 1] = qty - it.qty;
+            copy[RSV_COL.status - 1] = '';
+            copy[RSV_COL.shipped - 1] = '';
+            copy[RSV_COL.log - 1] = stamp + ' 일부 출고(' + rsvFmtNum_(it.qty) + '/' + rsvFmtNum_(qty) + ') 후 남은 수량';
+            copy[RSV_COL.mailKey - 1] = String(values[i][RSV_COL.mailKey - 1] || 'od:') + 'r';
+            var at = rsvLastDataRow_(sh) + 1;
+            if (at > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), 50);
+            sh.getRange(at, 1, 1, RSV_COL.priority).setValues([copy.slice(0, RSV_COL.priority)]);
+            sh.getRange(at, RSV_COL.log).setValue(copy[RSV_COL.log - 1]);
+            sh.getRange(at, RSV_COL.mailKey).setValue(copy[RSV_COL.mailKey - 1]);
+            sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.qty).setValue(it.qty);
+            msgs.push(values[i][RSV_COL.name - 1] + ' ' + rsvFmtNum_(it.qty) + '개 출고 완료 · 남은 ' + rsvFmtNum_(qty - it.qty) + '개는 ' + at + '행(예약 대기)');
+          } else if (it.qty > qty) {
+            sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.qty).setValue(it.qty);
+            msgs.push(values[i][RSV_COL.name - 1] + ' ' + rsvFmtNum_(qty) + ' → 실제 ' + rsvFmtNum_(it.qty) + '개로 기록');
+          }
+        });
+      }
+      targets.forEach(function (i) {
+        sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.status).setValue(RSV_CONFIG.STATUS_DONE);
+        log(i, '슬랙 스레드 답글("' + String(hit.text).slice(0, 30) + '")로 출고 완료 처리');
+        values[i][RSV_COL.status - 1] = RSV_CONFIG.STATUS_DONE;
+      });
+      msgs.unshift(targets.length + '행 *출고 완료* (' + targets.map(function (i) { return (RSV_CONFIG.FIRST_ROW + i) + '행'; }).join(', ') + ')');
+      open = targets;
+    }
     doneCount += open.length;
-    try {
-      rsvPostSlack_(':white_check_mark: ' + (entry.label || 'PO ' + entry.po) + ' — ' + open.length + '행을 *출고 완료* 로 바꿨습니다 (' +
-        open.map(function (i) { return (RSV_CONFIG.FIRST_ROW + i) + '행'; }).join(', ') + ')', ts);
-    } catch (e) { console.error(e); }
+    try { rsvPostSlack_(':white_check_mark: ' + (entry.label || 'PO ' + entry.po) + ' — ' + msgs.join('\n'), ts); } catch (e) { console.error(e); }
     delete map[ts]; changed = true;
   }
   if (changed) {
@@ -3045,5 +3336,5 @@ function rsvFixDailyAverages() {
 
 // 로컬 테스트(Node)용. Apps Script 에서는 무시된다.
 if (typeof module !== 'undefined') {
-  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvManualGroups: rsvManualGroups, rsvPlanFoc: rsvPlanFoc, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
+  module.exports = { rsvFindPoRows: rsvFindPoRows, rsvDiffPo: rsvDiffPo, rsvSortOrder: rsvSortOrder, rsvSortPlan: rsvSortPlan, rsvShipSchedule: rsvShipSchedule, rsvScheduleCompanies: rsvScheduleCompanies, rsvScheduleRounds: rsvScheduleRounds, rsvManualGroups: rsvManualGroups, rsvPlanFoc: rsvPlanFoc, rsvOverdueTargets: rsvOverdueTargets, rsvLedgerMatches: rsvLedgerMatches, rsvParseShipReply: rsvParseShipReply, rsvIsShipDoneReply: rsvIsShipDoneReply, rsvShipAlertTargets: rsvShipAlertTargets, rsvPickPurchaseOrder: rsvPickPurchaseOrder, rsvPoCatalog: rsvPoCatalog, rsvTranslateLines: rsvTranslateLines, rsvColumnLetter_: rsvColumnLetter_, rsvAllocate: rsvAllocate, rsvPlanBundles: rsvPlanBundles, rsvParsePurchaseOrder: rsvParsePurchaseOrder, rsvXlsxGrids: rsvXlsxGrids, rsvResolveProduct: rsvResolveProduct, rsvToDate_: rsvToDate_, RSV_CONFIG: RSV_CONFIG };
 }
