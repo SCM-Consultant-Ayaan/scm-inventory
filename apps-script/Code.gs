@@ -63,6 +63,10 @@ var RSV_CONFIG = {
 
   // 홀딩 대기열을 순위대로 엄격하게 처리 (앞 순위 홀딩이 전환되기 전에는 뒷 순위가 먼저 전환되지 않음)
   STRICT_QUEUE: true,
+  // 우선순위(O)에 이 값이 있으면 재고가 모자라도 예약 유지 (맨 앞 순위로 배정 — [재고관리] 예약차감재고가 마이너스가 될 수 있음)
+  FORCE_LABEL: '강제예약',
+  // 예약→홀딩으로 바뀐 건이 생기면 알림창(예약 유지 / 홀딩 선택). 시간 트리거에서 생긴 건은 다음에 시트를 열거나 편집할 때 표시
+  DEMOTE_POPUP: true,
   // 홀딩 장기 경고 일수
   HOLD_WARN_DAYS: 80,
 
@@ -231,6 +235,7 @@ function rsvOnOpen() {
       .addItem('자동화 중지 (트리거 삭제)', 'rsvRemoveTriggers')
       .addItem('슬랙 알림 테스트', 'rsvTestSlack'))
     .addToUi();
+  try { if (rsvIsAllowed_()) rsvShowPendingDemotions_(); } catch (e) { /* 메뉴만 */ }
 }
 
 function rsvInstallTriggers() {
@@ -277,7 +282,7 @@ function rsvOnEditTrigger(e) {
     if (e.range.getLastRow() < RSV_CONFIG.FIRST_ROW) return;
     if (e.range.getColumn() > RSV_COL.priority) return;
     PropertiesService.getScriptProperties().setProperty('RSV_LAST_EDIT', String(Date.now()));
-    rsvRunAllocation({ sort: false }); // 입력 중에는 행을 움직이지 않음 (정렬은 10분 주기·메뉴에서)
+    rsvRunAllocation({ sort: false, interactive: true }); // 입력 중에는 행을 움직이지 않음 (정렬은 10분 주기·메뉴에서)
   } catch (err) {
     console.error(err);
   }
@@ -469,15 +474,16 @@ function rsvColumnLetter_(c) {
   return s;
 }
 
-var RSV_RULES_VERSION = '3'; // 재고 분류 드롭다운·조건부 서식을 바꾸면 올린다 (재계산 때 한 번 자동 적용)
+var RSV_RULES_VERSION = '4'; // 재고 분류 드롭다운·조건부 서식을 바꾸면 올린다 (재계산 때 한 번 자동 적용)
 
 /** 재고 분류(K) 드롭다운과 판정·행 색상 규칙. 사용자가 추가한 드롭다운 값(예: 발주취소)과 직접 만든 서식은 유지 */
 function rsvApplyStatusRules_(sh) {
   var dataRows = sh.getMaxRows() - RSV_CONFIG.FIRST_ROW + 1;
   sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.priority, dataRows, 1).setDataValidation(
     SpreadsheetApp.newDataValidation()
-      .requireValueInList(['긴급', '0순위', '1순위', '2순위'], true)
-      .setAllowInvalid(false).build());
+      .requireValueInList(['긴급', '0순위', '1순위', '2순위', RSV_CONFIG.FORCE_LABEL], true)
+      .setAllowInvalid(false)
+      .setHelpText(RSV_CONFIG.FORCE_LABEL + ': 재고가 모자라도 예약으로 유지 (맨 앞 순위)').build());
   var list = [RSV_CONFIG.STATUS_RES, RSV_CONFIG.STATUS_HOLD, RSV_CONFIG.STATUS_DONE, RSV_CONFIG.STATUS_CHECK, RSV_CONFIG.STATUS_CANCEL];
   try {
     var old = sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.status).getDataValidation();
@@ -509,11 +515,12 @@ function rsvApplyStatusRules_(sh) {
   var keep = sh.getConditionalFormatRules().filter(function (r) {
     var bc = r.getBooleanCondition();
     var vals = bc ? bc.getCriteriaValues().join(' ') : '';
-    if (/긴급|예약재고|홀딩재고|출고 완료|확인 필요|❓|🔻/.test(vals)) return false;
+    if (/긴급|예약재고|홀딩재고|출고 완료|확인 필요|❓|🔻|📌/.test(vals)) return false;
     return r.getRanges().every(function (rg) { return rg.getLastColumn() < RSV_COL.priority; });
   });
   sh.setConditionalFormatRules(keep.concat([
     rsvRule_(pRange, '❓', '#fce5cd', '#783f04'),
+    rsvRule_(pRange, '📌', '#d9d2e9', '#20124d'),
     rsvRule_(pRange, '🔻', '#f4cccc', '#990000'),
     rsvRule_(pRange, '⚠', '#f4cccc', '#990000'),
     rsvRule_(pRange, '🔄', '#cfe2f3', '#073763'),
@@ -540,8 +547,18 @@ function rsvRule_(range, text, bg, fg) {
 // 배분 (우선순위 + 예약/홀딩 판정 + 자동 전환)
 // =====================================================================
 
-/** opts.sort: false 면 정렬하지 않음 (기본: 정렬). 메뉴에서 실행하면 opts 가 없으므로 정렬한다. */
+/**
+ * opts.sort: false 면 정렬하지 않음 (기본: 정렬). 메뉴에서 실행하면 opts 가 없으므로 정렬한다.
+ * opts.interactive: true(또는 opts 없음 = 메뉴) 면 예약→홀딩 바뀐 건을 바로 알림창으로 보여 준다.
+ * 시간 트리거 등 알림창을 못 띄우는 실행이면 모아 두었다가 다음 편집·메뉴·열기 때 보여 준다.
+ */
 function rsvRunAllocation(opts) {
+  var out = rsvRunAllocation_(opts);
+  rsvHandleDemotions_(out.demotions || [], !opts || opts.interactive === true);
+  return out;
+}
+
+function rsvRunAllocation_(opts) {
   rsvAssertAllowed_();
   var doSort = (opts && opts.sort === true) || (RSV_CONFIG.AUTO_SORT && !(opts && opts.sort === false));
   var lock = LockService.getDocumentLock();
@@ -633,10 +650,149 @@ function rsvRunAllocation(opts) {
           return '- ' + r.row + '행 ' + r.name + ' ' + r.qty + '개 (' + (r.company || r.channel) + ')';
         }).join('\n') + '\n\n' + ss.getUrl());
     }
-    return { conversions: conversions, bundles: bundles };
+    var demotions = result.filter(function (r) { return r.demoted; }).map(function (r) {
+      var src = rows.filter(function (x) { return x.row === r.row; })[0] || {};
+      return {
+        row: r.row, sig: rsvDemoteSig_(src), name: r.name, qty: r.qty, who: r.company || r.channel, purpose: src.purpose || '',
+        useDate: src.useDate instanceof Date ? rsvFmtMD_(src.useDate) : String(src.useDate || ''),
+        stock: r.stock, left: r.left, shortage: r.shortage, takenBy: r.takenBy || [], at: rsvFmtDateTime_(now),
+      };
+    });
+    return { conversions: conversions, bundles: bundles, demotions: demotions };
   } finally {
     lock.releaseLock();
   }
+}
+
+// =====================================================================
+// 예약→홀딩 알림창 (예약 유지 / 홀딩 선택)
+// =====================================================================
+
+/** 행을 다시 찾기 위한 서명 (정렬로 행 번호가 바뀌어도 찾을 수 있게) */
+function rsvDemoteSig_(r) {
+  return [r.company || r.channel || '', r.purpose || '', r.name || '', rsvToNum_(r.qty)].join('|');
+}
+
+/** 새로 생긴 예약→홀딩 건 + 쌓여 있던 건을 알림창으로. 못 띄우면 다음 기회까지 보관 */
+function rsvHandleDemotions_(events, interactive) {
+  if (!RSV_CONFIG.DEMOTE_POPUP) return;
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var pending = [];
+    try { pending = JSON.parse(props.getProperty('RSV_DEMOTE_PENDING') || '[]'); } catch (e) { pending = []; }
+    if (!events.length && !pending.length) return;
+    var bySig = {};
+    pending.concat(events).forEach(function (ev) { bySig[ev.sig] = ev; }); // 같은 건은 최신 내용으로
+    var all = Object.keys(bySig).map(function (k) { return bySig[k]; });
+    if (interactive && rsvShowDemoteDialog_(all)) { props.deleteProperty('RSV_DEMOTE_PENDING'); return; }
+    if (events.length) props.setProperty('RSV_DEMOTE_PENDING', JSON.stringify(all.slice(-40)));
+  } catch (err) {
+    console.error('예약→홀딩 알림 오류', err);
+  }
+}
+
+/** 시트를 열 때: 시간 트리거 실행 중 생긴 예약→홀딩 건이 있으면 보여 준다 */
+function rsvShowPendingDemotions_() {
+  rsvHandleDemotions_([], true);
+}
+
+/** 이벤트의 현재 행 번호 (못 찾으면 0). 서명이 같고 아직 홀딩인 행만 */
+function rsvLocateDemoted_(ev, rows) {
+  var ok = function (r) { return r && rsvDemoteSig_(r) === ev.sig && r.status.indexOf('홀딩재고') === 0; };
+  var hit = rows.filter(function (r) { return r.row === ev.row; })[0];
+  if (ok(hit)) return hit.row;
+  hit = rows.filter(ok)[0];
+  return hit ? hit.row : 0;
+}
+
+function rsvReadResRows_(sh) {
+  var last = rsvLastDataRow_(sh);
+  if (last < RSV_CONFIG.FIRST_ROW) return [];
+  return sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues()
+    .map(function (v, i) { return rsvRowFromValues_(v, RSV_CONFIG.FIRST_ROW + i); });
+}
+
+/** 알림창 표시. 성공하면 true (트리거 실행 등 화면이 없으면 false) */
+function rsvShowDemoteDialog_(events) {
+  var ui;
+  try { ui = SpreadsheetApp.getUi(); } catch (e) { return false; }
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
+  var rows = rsvReadResRows_(sh);
+  var list = events.map(function (ev) { ev.row = rsvLocateDemoted_(ev, rows); return ev; })
+    .filter(function (ev) { return ev.row > 0; }); // 이미 예약으로 돌렸거나 출고된 건은 제외
+  if (!list.length) return true;
+
+  var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); };
+  var short = function (n) { return esc(String(n).replace(/^로지킴 /, '').replace(/PDRN 틴티드 립 앰플 10ml_/, '립앰플 ')); };
+  var items = list.map(function (ev, i) {
+    var why = ev.shortage > 0
+      ? '현재고 <b>' + rsvFmtNum_(ev.stock) + '</b>개 · 앞 순위 예약 후 남은 <b>' + rsvFmtNum_(ev.left) + '</b>개 → <b class="red">' + rsvFmtNum_(ev.shortage) + '개 부족</b>'
+      : '재고는 있지만 앞 순위 <b>홀딩</b> 건이 먼저라 대기 (순서 유지)';
+    var taken = (ev.takenBy || []).map(function (t) {
+      return (t.forced ? '📌' : t.urgent ? '🔴' : '') + esc(t.who) + ' ' + esc(t.purpose) + (t.useDate ? ' (' + esc(t.useDate) + ')' : '') + ' ' + rsvFmtNum_(t.qty) + '개';
+    }).join('<br>');
+    return '<div class="it"><label><input type="checkbox" value="' + i + '"> <b>' + short(ev.name) + ' ' + rsvFmtNum_(ev.qty) + '개</b>' +
+      ' · ' + esc(ev.who) + ' / ' + esc(ev.purpose) + (ev.useDate ? ' · 사용 ' + esc(ev.useDate) : '') + ' <span class="g">(' + ev.row + '행)</span></label>' +
+      '<div class="d">' + why + (ev.shortage > 0 ? ' — 예약 유지하면 [재고관리] 예약차감재고 <b class="red">−' + rsvFmtNum_(ev.shortage) + '</b>' : '') + '</div>' +
+      (taken ? '<div class="d g">먼저 배정된 건: ' + taken + '</div>' : '') + '</div>';
+  }).join('');
+  var payload = JSON.stringify(list.map(function (ev) { return { row: ev.row, sig: ev.sig }; }));
+  var html =
+    '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:14px;color:#222}' +
+    '.it{border:1px solid #e0e0e0;border-radius:6px;padding:8px 10px;margin:6px 0}.d{margin:4px 0 0 22px;line-height:1.5}' +
+    '.g{color:#777}.red{color:#c00}.btns{position:sticky;bottom:0;background:#fff;padding:10px 0 2px}' +
+    'button{border:0;border-radius:4px;padding:9px 14px;font-size:13px;cursor:pointer;margin-right:6px}' +
+    '#k{background:#674ea7;color:#fff}#h{background:#e8eaed}#msg{margin-top:8px}</style>' +
+    '<div>우선순위가 더 높은 건(사용 예정일이 더 빠르거나 긴급)이 재고를 먼저 가져가서 아래 <b>' + list.length + '건</b>이 ' +
+    '<b>예약 → 홀딩</b>으로 바뀌었어요.<br>그래도 예약으로 잡을 건은 체크하고 <b>예약 유지</b>를 누르세요. ' +
+    '<span class="g">(우선순위에 📌강제예약 표시 · 맨 앞 순위로 배정 · 다른 건이 대신 홀딩될 수 있음)</span></div>' +
+    items +
+    '<div class="btns"><button id="k" onclick="keep()">✔ 체크한 건 예약 유지</button>' +
+    '<button id="h" onclick="google.script.host.close()">모두 홀딩으로 둘게요</button><div id="msg"></div></div>' +
+    '<script>var P=' + payload.replace(/</g, '\\u003c') + ';' +
+    'function keep(){var s=[].slice.call(document.querySelectorAll("input:checked")).map(function(c){return P[+c.value]});' +
+    'var m=document.getElementById("msg");if(!s.length){m.textContent="체크한 건이 없어요";return;}' +
+    'document.getElementById("k").disabled=true;m.textContent="반영 중…";' +
+    'google.script.run.withSuccessHandler(function(r){m.textContent=r;setTimeout(function(){google.script.host.close()},1500);})' +
+    '.withFailureHandler(function(e){document.getElementById("k").disabled=false;m.textContent="⚠ 실패: "+e.message;}).rsvKeepReserved(s);}' +
+    '</script>';
+  try {
+    ui.showModalDialog(HtmlService.createHtmlOutput(html).setWidth(620).setHeight(Math.min(160 + list.length * 95, 620)),
+      '⚠ 예약 → 홀딩 변경 ' + list.length + '건');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 알림창에서 "예약 유지" 선택: 재고 분류 → 예약, 우선순위 → 강제예약 후 재계산 */
+function rsvKeepReserved(items) {
+  rsvAssertAllowed_();
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
+  var lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  var done = [];
+  try {
+    var rows = rsvReadResRows_(sh);
+    var stamp = rsvFmtDateTime_(new Date());
+    (items || []).forEach(function (ev) {
+      var row = rsvLocateDemoted_(ev, rows);
+      if (!row) return;
+      var r = rows.filter(function (x) { return x.row === row; })[0];
+      sh.getRange(row, RSV_COL.status).setValue(RSV_CONFIG.STATUS_RES);
+      sh.getRange(row, RSV_COL.priority).setValue(RSV_CONFIG.FORCE_LABEL);
+      var logCell = sh.getRange(row, RSV_COL.log), log = String(logCell.getValue() || '');
+      logCell.setValue((log ? log + '\n' : '') + stamp + ' 재고 부족 알림에서 예약 유지 선택 → ' + RSV_CONFIG.FORCE_LABEL +
+        (r.priority ? ' (기존 우선순위: ' + r.priority + ')' : ''));
+      done.push(row);
+    });
+  } finally {
+    lock.releaseLock();
+  }
+  if (!done.length) return '이미 바뀐 건이라 반영할 게 없어요';
+  // 강제예약 때문에 다른 건이 홀딩되면 이어서 알림창이 다시 뜬다
+  rsvRunAllocation({ sort: false, interactive: true });
+  return '✅ ' + done.length + '건 예약 유지 (' + done.join(', ') + '행)';
 }
 
 /** 메뉴: 출고일 정렬 (출고 묶음 단위) */
@@ -647,7 +803,7 @@ function rsvSortByCompany() { rsvSetSortMode_('company'); }
 function rsvSetSortMode_(mode) {
   rsvAssertAllowed_();
   PropertiesService.getScriptProperties().setProperty('RSV_SORT_MODE', mode);
-  rsvRunAllocation({ sort: true });
+  rsvRunAllocation({ sort: true, interactive: true });
   rsvToast_(mode === 'company' ? '업체별 정렬로 바꿨습니다 (업체 → 출고일 → 차수)' : '출고일 정렬로 바꿨습니다 (출고 묶음 단위)');
 }
 
@@ -913,12 +1069,37 @@ function rsvAllocate(rows, inventory, now, cfg) {
     var stock = inv.stock;
     var inbound = inv.inbound.slice().sort(function (a, b) { return a.date - b.date; });
     var left = stock, blocked = false, ahead = 0; // ahead: 앞 순위 수요 합계 (예약+홀딩)
+    var reserved = []; // 앞 순위로 예약된 건 (예약→홀딩 알림에 "어느 건이 먼저 가져갔는지" 표시)
+    var imminentTag = function (dday) {
+      return dday !== null && dday >= 0 && dday <= cfg.IMMINENT_DAYS ? ' · 🚚 D-' + dday + ' 출고 임박' : '';
+    };
+    var reserve = function (x, forced) {
+      reserved.push({ row: x.r.row, who: x.r.company || x.r.channel, purpose: x.r.purpose, qty: rsvToNum_(x.r.qty),
+        useDate: x.useDate ? rsvFmtMD_(x.useDate) : '', forced: forced, urgent: /긴급|0순위/.test(x.r.priority) });
+    };
 
     list.forEach(function (x, idx) {
       var q = rsvToNum_(x.r.qty), res = results[x.i];
       res.order = idx + 1;
       res.freeNow = left;
       var dday = x.useDate ? Math.round((x.useDate - today) / DAY) : null;
+
+      // 강제예약: 재고가 모자라도 예약 유지 (사용자가 직접 선택). 맨 앞 순위라 뒤 건들이 홀딩된다
+      if (rsvIsForced_(x.r, cfg)) {
+        var over = Math.min(q, q - Math.max(left, 0));
+        left -= q;
+        res.avail = today;
+        if (x.kind !== 'res') {
+          res.newStatus = cfg.STATUS_RES;
+          res.converted = x.kind === 'hold';
+          res.logAppend = stamp + ' ' + cfg.FORCE_LABEL + ' → 예약재고 (재고 부족해도 유지)';
+        }
+        res.verdict = '📌 강제 예약' + (over > 0 ? ' · 현재고보다 ' + rsvFmtNum_(over) + '개 초과 ([재고관리] 예약차감재고 마이너스)' : '') +
+          imminentTag(dday) + (x.late > 0 ? ' · ⚠ 사용예정일 ' + x.late + '일 경과 — 출고했으면 출고 완료로' : '');
+        reserve(x, true);
+        ahead += q;
+        return;
+      }
 
       if (!blocked && left >= q) {
         left -= q;
@@ -929,9 +1110,9 @@ function rsvAllocate(rows, inventory, now, cfg) {
           res.logAppend = stamp + (x.kind === 'hold' ? ' 홀딩→예약 자동 전환' : ' 신규 → 예약재고 자동 판정') +
             ' (가용 ' + rsvFmtNum_(left + q) + ' ≥ ' + rsvFmtNum_(q) + ')';
         }
-        res.verdict = (x.kind === 'hold' ? '🔄 홀딩→예약 전환' : '✅ 예약') +
-          (dday !== null && dday >= 0 && dday <= cfg.IMMINENT_DAYS ? ' · 🚚 D-' + dday + ' 출고 임박' : '') +
+        res.verdict = (x.kind === 'hold' ? '🔄 홀딩→예약 전환' : '✅ 예약') + imminentTag(dday) +
           (x.late > 0 ? ' · ⚠ 사용예정일 ' + x.late + '일 경과 — 출고했으면 출고 완료로' : '');
+        reserve(x, false);
         ahead += q;
         return;
       }
@@ -941,6 +1122,12 @@ function rsvAllocate(rows, inventory, now, cfg) {
       if (x.kind !== 'hold') {
         res.newStatus = cfg.STATUS_HOLD;
         res.demoted = x.kind === 'res';
+        if (res.demoted) {
+          res.stock = stock;
+          res.left = Math.max(left, 0);
+          res.shortage = Math.max(0, q - Math.max(left, 0)); // 0 이면 재고는 있지만 앞 순위 홀딩 건 대기
+          res.takenBy = reserved.slice(-3);
+        }
         res.logAppend = stamp + (x.kind === 'res' ? ' 예약→홀딩 (재고 부족 · 사용 예정일이 더 빠른 건 우선)' : ' 신규 → 홀딩재고 자동 판정') +
           ' (지금 가용 ' + rsvFmtNum_(Math.max(left, 0)) + ' < ' + rsvFmtNum_(q) + ')';
       }
@@ -990,9 +1177,13 @@ function rsvPriorityKey_(r, volume, today, cfg) {
     useDate: useDate ? useDate.getTime() : Infinity,
     volume: -(volume[rsvCompanyKey_(r)] || 0),
   };
-  var key = cfg.PRIORITY_ORDER.map(function (k) { return parts[k]; });
+  var key = [rsvIsForced_(r, cfg) ? 0 : 1].concat(cfg.PRIORITY_ORDER.map(function (k) { return parts[k]; }));
   key.push(r.row);
   return key;
+}
+
+function rsvIsForced_(r, cfg) {
+  return !!cfg.FORCE_LABEL && String(r.priority || '').replace(/\s/g, '').indexOf(cfg.FORCE_LABEL) >= 0;
 }
 
 function rsvCmpKey_(a, b) {
