@@ -1548,7 +1548,7 @@ function rsvSendOverdueAlerts_(now) {
   var base = ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=';
   var mention = (RSV_CONFIG.OVERDUE_MENTIONS || []).map(function (u) { return '<@' + u + '>'; }).join(' ');
   var stamp = rsvFmtYMD_(today).slice(2).replace(/-/g, '');
-  var sent = 0;
+  var tracked = [], details = [], lines = [], qtySum = 0, oyCount = 0;
   groups.forEach(function (g, gi) {
     // 행마다 고유 키가 없으면 붙여서 스레드 답글로 정확히 그 행들만 처리
     var keys = g.rows.map(function (r, k) {
@@ -1559,20 +1559,63 @@ function rsvSendOverdueAlerts_(now) {
       return r.key;
     });
     var total = g.rows.reduce(function (s, r) { return s + rsvToNum_(r.qty); }, 0);
-    var head = ':alarm_clock: *출고 확인 필요* · ' + g.purpose + ' / ' + g.company + ' ' + mention + '\n' +
-      '• 사용 예정일 ' + rsvFmtMD_(g.rows[0].useDate) + ' (+' + g.late + '일) 지났는데 출고 완료 표시가 없어요 · ' + g.rows.length + '종 / ' + rsvFmtNum_(total) + '개\n' +
-      '• 스레드에 *출고완료* (수량이 다른 품목만 *출고완료 새틴 250* 처럼) / 안 나갔으면 *취소* 답글 · +' + RSV_CONFIG.OVERDUE_RELEASE_DAYS + '일이면 재고에서 자동 제외';
-    var detail = g.rows.map(function (r) {
+    qtySum += total;
+    if (g.oy) oyCount++;
+    var no = gi + 1;
+    var title = '*' + no + '.* ' + (g.oy ? ':large_green_circle: ' : '') + '*' + g.purpose + '* / ' + g.company +
+      ' — 사용 예정일 ' + rsvFmtMD_(g.rows[0].useDate) + ' (+' + g.late + '일) · ' + g.rows.length + '종 / ' + rsvFmtNum_(total) + '개';
+    var detail = title + '\n' + g.rows.map(function (r) {
       var sku = inv[r.name] ? inv[r.name].barcode : '';
       var out = rsvLedgerSum_(ledger, sku, new Date(r.useDate.getTime() - RSV_CONFIG.AUTO_COMPLETE_WINDOW_DAYS * 86400000), today);
       return '• ' + r.name + ' — *' + rsvFmtNum_(rsvToNum_(r.qty)) + '개*' + (sku ? '  (수불부 출고 ' + rsvFmtMD_(r.useDate) + '±: ' + rsvFmtNum_(out) + '개, 다른 업체 포함)' : '');
     }).join('\n') + '\n<' + base + 'A' + g.rows[0].row + '|시트에서 보기>';
-    var res;
-    try { res = rsvPostSlackThreaded_(head, detail); } catch (e) { rsvWarnOnce_('출고 경과 알림 실패: ' + e.message); return; }
-    if (res && res.ts) rsvTrackThread_(res.ts, '', { keys: keys, label: g.purpose + ' (' + g.company + ')' });
-    sent++;
+    details.push(detail);
+    lines.push(no + '. ' + (g.oy ? ':large_green_circle: ' : '') + g.purpose + ' / ' + g.company + ' · +' + g.late + '일 · ' + rsvFmtNum_(total) + '개');
+    tracked.push({ n: no, keys: keys, label: no + '. ' + g.purpose + ' (' + g.company + ')' });
   });
-  return sent;
+  // 채널에는 요약 1건, 건별 상세는 스레드에 (번호를 붙여 답글로 처리)
+  var head = ':alarm_clock: *출고 확인 필요 ' + groups.length + '건* (' + rsvFmtMD_(today) + ')' + (mention ? ' ' + mention : '') + '\n' +
+    '• 사용 예정일이 지났는데 출고 완료 표시가 없어요 · ' + (oyCount ? '올리브영 ' + oyCount + '건 · ' : '') +
+    '총 ' + rsvFmtNum_(qtySum) + '개\n' + lines.join('\n') + '\n' +
+    '• 건별 품목은 스레드에 :point_down:\n' +
+    '• 스레드에 *번호 + 출고완료* / 안 나갔으면 *번호 + 취소* 답글 (예: *1 출고완료* · *2,3 출고완료* · *4 취소* · *1 출고완료 새틴 250* · *전체 출고완료*)\n' +
+    '• +' + RSV_CONFIG.OVERDUE_RELEASE_DAYS + '일이 지나면 재고에서 자동 제외';
+  var res;
+  try { res = rsvPostSlack_(head); } catch (e) { rsvWarnOnce_('출고 경과 알림 실패: ' + e.message); return 0; }
+  details.forEach(function (d) {
+    try { rsvPostSlack_(d, res && res.ts); } catch (e) { console.error('출고 경과 상세 전송 실패', e); }
+  });
+  if (res && res.ts) rsvTrackThread_(res.ts, '', { groups: tracked, label: '출고 확인 필요 (' + rsvFmtMD_(today) + ')' });
+  return groups.length;
+}
+
+/**
+ * 번호 붙은 답글 해석 (순수 함수). 줄마다 '번호(들) + 출고완료/취소'.
+ *  '1 출고완료' · '2,3번 출고완료' · '1~3 출고완료' · '4 취소' · '전체 출고완료' · '1 출고완료 새틴 250'
+ *  번호가 없으면 묶음이 1개일 때만 그 묶음. 반환: [{nums:[…] | 'all', action:'done'|'cancel', text}]
+ */
+function rsvParseNumberedReply(text, count) {
+  var out = [];
+  String(text || '').split(/\n+/).forEach(function (line) {
+    var t = line.replace(/<@[^>]+>/g, '').trim();
+    if (!t) return;
+    var nums = null, m;
+    if ((m = t.match(/^(전체|모두|all)\s*/i))) { nums = 'all'; t = t.slice(m[0].length); }
+    else if ((m = t.match(/^(\d+(?:\s*(?:[,~\-]|번)\s*\d+)*)\s*번?\s*[.)]?\s*/))) {
+      nums = [];
+      m[1].replace(/번/g, ',').split(/\s*,\s*/).forEach(function (part) {
+        var r = part.split(/\s*[~\-]\s*/).map(Number);
+        if (r.length === 2) { for (var x = r[0]; x <= r[1]; x++) nums.push(x); } else if (r[0]) nums.push(r[0]);
+      });
+      t = t.slice(m[0].length);
+    }
+    var action = /^(발주\s*)?취소/.test(t) ? 'cancel' : /출고\s*완료/.test(t) ? 'done' : null;
+    if (!action) return;
+    if (nums && !nums.length) nums = null; // '26-13차 출고완료' 처럼 번호가 아닌 숫자
+    if (!nums) nums = count === 1 ? [1] : null;
+    out.push({ nums: nums, action: action, text: t });
+  });
+  return out;
 }
 
 /** [이지어드민 수불부_Raw] → { SKU: { 'yyyy-mm-dd': 출고 } }  (SKU = 연동코드 → 공급처옵션 → 바코드) */
@@ -2445,7 +2488,16 @@ function rsvThreads_() {
 }
 
 function rsvSaveThreads_(map) {
-  PropertiesService.getScriptProperties().setProperty('RSV_SLACK_THREADS', JSON.stringify(map));
+  // 스크립트 속성 값은 9KB 까지 — 넘으면 오래된 스레드부터 추적 중단
+  var json = JSON.stringify(map);
+  var ts = Object.keys(map).sort(function (a, b) { return map[a].at - map[b].at; });
+  while (json.length > 8500 && ts.length) {
+    var drop = ts.shift();
+    rsvWarnOnce_('슬랙 스레드 추적 목록이 가득 차서 오래된 스레드(' + (map[drop].label || map[drop].po || drop) + ') 답글 확인을 중단했어요');
+    delete map[drop];
+    json = JSON.stringify(map);
+  }
+  PropertiesService.getScriptProperties().setProperty('RSV_SLACK_THREADS', json);
 }
 
 /** 스레드 기억. opts.key: 행을 찾을 메일키 접두어(기본 'po:<PO>|'), opts.label: 답글에 쓸 이름 */
@@ -2458,6 +2510,7 @@ function rsvTrackThread_(ts, poNo, opts) {
     if (opts && opts.key) map[ts].key = opts.key;
     if (opts && opts.label) map[ts].label = opts.label;
     if (opts && opts.keys) map[ts].keys = opts.keys;
+    if (opts && opts.groups) map[ts].groups = opts.groups;
     rsvSaveThreads_(map);
   } finally {
     lock.releaseLock();
@@ -2501,6 +2554,14 @@ function rsvCheckSlackThreads_() {
 
   for (var k = 0; k < keys.length; k++) {
     var ts = keys[k], entry = map[ts];
+    if (entry.groups) {
+      var gr = rsvCheckNumberedThread_(token, sh, values, ts, entry);
+      doneCount += gr.done;
+      if (gr.close) delete map[ts];
+      changed = changed || gr.changed;
+      if (gr.stop) break;
+      continue;
+    }
     var prefix = entry.key || ('po:' + entry.po + '|');
     var idx = [];
     values.forEach(function (v, i) {
@@ -2526,58 +2587,7 @@ function rsvCheckSlackThreads_() {
     var cancel = !hit && human.filter(function (m) { return /^\s*(발주\s*)?취소/.test(String(m.text || '')); })[0];
     if (!hit && !cancel) continue;
 
-    var stamp = rsvFmtDateTime_(new Date()), msgs = [];
-    var log = function (i, text) {
-      var old = String(values[i][RSV_COL.log - 1] || '');
-      sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.log).setValue((old ? old + '\n' : '') + stamp + ' ' + text);
-    };
-    if (cancel) {
-      open.forEach(function (i) {
-        sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.status).setValue(RSV_CONFIG.STATUS_CANCEL);
-        log(i, '슬랙 스레드 답글("' + String(cancel.text).slice(0, 30) + '")로 ' + RSV_CONFIG.STATUS_CANCEL);
-        values[i][RSV_COL.status - 1] = RSV_CONFIG.STATUS_CANCEL;
-      });
-      msgs.push(open.length + '행 *' + RSV_CONFIG.STATUS_CANCEL + '* (재고 계산 제외)');
-    } else {
-      var reply = rsvParseShipReply(hit.text) || { all: true, items: [] };
-      var norm = function (s) { return String(s || '').replace(/\s/g, '').toLowerCase(); };
-      // '출고완료' = 이 묶음 전부 출고. 뒤에 '품목 수량'을 적으면 그 품목만 실제 수량으로 (나머지는 그대로 전부 출고)
-      var targets = open, used = [];
-      if (!reply.all) {
-        reply.items.forEach(function (it) {
-          var i = open.filter(function (j) { return norm(values[j][RSV_COL.name - 1]).indexOf(norm(it.token)) >= 0 && used.indexOf(j) < 0; })[0];
-          if (i === undefined) { msgs.push('⚠ "' + it.token + '" 품목을 찾지 못함'); return; }
-          used.push(i);
-          var qty = rsvToNum_(values[i][RSV_COL.qty - 1]);
-          if (it.qty > 0 && it.qty < qty) {
-            // 일부 출고: 이 행은 출고 수량으로 완료, 남은 수량은 새 행(예약 대기)으로
-            var copy = values[i].slice();
-            copy[RSV_COL.qty - 1] = qty - it.qty;
-            copy[RSV_COL.status - 1] = '';
-            copy[RSV_COL.shipped - 1] = '';
-            copy[RSV_COL.log - 1] = stamp + ' 일부 출고(' + rsvFmtNum_(it.qty) + '/' + rsvFmtNum_(qty) + ') 후 남은 수량';
-            copy[RSV_COL.mailKey - 1] = String(values[i][RSV_COL.mailKey - 1] || 'od:') + 'r';
-            var at = rsvLastDataRow_(sh) + 1;
-            if (at > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), 50);
-            sh.getRange(at, 1, 1, RSV_COL.priority).setValues([copy.slice(0, RSV_COL.priority)]);
-            sh.getRange(at, RSV_COL.log).setValue(copy[RSV_COL.log - 1]);
-            sh.getRange(at, RSV_COL.mailKey).setValue(copy[RSV_COL.mailKey - 1]);
-            sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.qty).setValue(it.qty);
-            msgs.push(values[i][RSV_COL.name - 1] + ' ' + rsvFmtNum_(it.qty) + '개 출고 완료 · 남은 ' + rsvFmtNum_(qty - it.qty) + '개는 ' + at + '행(예약 대기)');
-          } else if (it.qty > qty) {
-            sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.qty).setValue(it.qty);
-            msgs.push(values[i][RSV_COL.name - 1] + ' ' + rsvFmtNum_(qty) + ' → 실제 ' + rsvFmtNum_(it.qty) + '개로 기록');
-          }
-        });
-      }
-      targets.forEach(function (i) {
-        sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.status).setValue(RSV_CONFIG.STATUS_DONE);
-        log(i, '슬랙 스레드 답글("' + String(hit.text).slice(0, 30) + '")로 출고 완료 처리');
-        values[i][RSV_COL.status - 1] = RSV_CONFIG.STATUS_DONE;
-      });
-      msgs.unshift(targets.length + '행 *출고 완료* (' + targets.map(function (i) { return (RSV_CONFIG.FIRST_ROW + i) + '행'; }).join(', ') + ')');
-      open = targets;
-    }
+    var msgs = rsvApplyThreadReply_(sh, values, open, cancel ? 'cancel' : 'done', String((cancel || hit).text || ''));
     doneCount += open.length;
     try { rsvPostSlack_(':white_check_mark: ' + (entry.label || 'PO ' + entry.po) + ' — ' + msgs.join('\n'), ts); } catch (e) { console.error(e); }
     delete map[ts]; changed = true;
@@ -2595,6 +2605,127 @@ function rsvCheckSlackThreads_() {
     }
   }
   return doneCount;
+}
+
+/** 스레드 답글 반영: action 'cancel' → 발주취소, 'done' → 출고 완료 (text 의 '품목 수량'은 그 품목만 실제 수량). 반환: 결과 문구 목록 */
+function rsvApplyThreadReply_(sh, values, open, action, text) {
+  var stamp = rsvFmtDateTime_(new Date()), msgs = [];
+  var log = function (i, text) {
+    var old = String(values[i][RSV_COL.log - 1] || '');
+    sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.log).setValue((old ? old + '\n' : '') + stamp + ' ' + text);
+  };
+  if (action === 'cancel') {
+    open.forEach(function (i) {
+      sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.status).setValue(RSV_CONFIG.STATUS_CANCEL);
+      log(i, '슬랙 스레드 답글("' + String(text).slice(0, 30) + '")로 ' + RSV_CONFIG.STATUS_CANCEL);
+      values[i][RSV_COL.status - 1] = RSV_CONFIG.STATUS_CANCEL;
+    });
+    msgs.push(open.length + '행 *' + RSV_CONFIG.STATUS_CANCEL + '* (재고 계산 제외)');
+  } else {
+    var reply = rsvParseShipReply(text) || { all: true, items: [] };
+    var norm = function (s) { return String(s || '').replace(/\s/g, '').toLowerCase(); };
+    // '출고완료' = 이 묶음 전부 출고. 뒤에 '품목 수량'을 적으면 그 품목만 실제 수량으로 (나머지는 그대로 전부 출고)
+    var targets = open, used = [];
+    if (!reply.all) {
+      reply.items.forEach(function (it) {
+        var i = open.filter(function (j) { return norm(values[j][RSV_COL.name - 1]).indexOf(norm(it.token)) >= 0 && used.indexOf(j) < 0; })[0];
+        if (i === undefined) { msgs.push('⚠ "' + it.token + '" 품목을 찾지 못함'); return; }
+        used.push(i);
+        var qty = rsvToNum_(values[i][RSV_COL.qty - 1]);
+        if (it.qty > 0 && it.qty < qty) {
+          // 일부 출고: 이 행은 출고 수량으로 완료, 남은 수량은 새 행(예약 대기)으로
+          var copy = values[i].slice();
+          copy[RSV_COL.qty - 1] = qty - it.qty;
+          copy[RSV_COL.status - 1] = '';
+          copy[RSV_COL.shipped - 1] = '';
+          copy[RSV_COL.log - 1] = stamp + ' 일부 출고(' + rsvFmtNum_(it.qty) + '/' + rsvFmtNum_(qty) + ') 후 남은 수량';
+          copy[RSV_COL.mailKey - 1] = String(values[i][RSV_COL.mailKey - 1] || 'od:') + 'r';
+          var at = rsvLastDataRow_(sh) + 1;
+          if (at > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), 50);
+          sh.getRange(at, 1, 1, RSV_COL.priority).setValues([copy.slice(0, RSV_COL.priority)]);
+          sh.getRange(at, RSV_COL.log).setValue(copy[RSV_COL.log - 1]);
+          sh.getRange(at, RSV_COL.mailKey).setValue(copy[RSV_COL.mailKey - 1]);
+          sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.qty).setValue(it.qty);
+          msgs.push(values[i][RSV_COL.name - 1] + ' ' + rsvFmtNum_(it.qty) + '개 출고 완료 · 남은 ' + rsvFmtNum_(qty - it.qty) + '개는 ' + at + '행(예약 대기)');
+        } else if (it.qty > qty) {
+          sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.qty).setValue(it.qty);
+          msgs.push(values[i][RSV_COL.name - 1] + ' ' + rsvFmtNum_(qty) + ' → 실제 ' + rsvFmtNum_(it.qty) + '개로 기록');
+        }
+      });
+    }
+    targets.forEach(function (i) {
+      sh.getRange(RSV_CONFIG.FIRST_ROW + i, RSV_COL.status).setValue(RSV_CONFIG.STATUS_DONE);
+      log(i, '슬랙 스레드 답글("' + String(text).slice(0, 30) + '")로 출고 완료 처리');
+      values[i][RSV_COL.status - 1] = RSV_CONFIG.STATUS_DONE;
+    });
+    msgs.unshift(targets.length + '행 *출고 완료* (' + targets.map(function (i) { return (RSV_CONFIG.FIRST_ROW + i) + '행'; }).join(', ') + ')');
+  }
+  return msgs;
+}
+
+/**
+ * 번호 붙은 묶음 스레드(출고 확인 필요 요약) 확인. 답글마다 해당 번호 묶음만 처리하고,
+ * 처리한 답글은 기억해서 다시 처리하지 않는다. 모든 묶음이 끝나면 close.
+ */
+function rsvCheckNumberedThread_(token, sh, values, ts, entry) {
+  var out = { done: 0, close: false, changed: false, stop: false };
+  var keyIdx = function (keys) {
+    var idx = [];
+    values.forEach(function (v, i) { if (keys.indexOf(String(v[RSV_COL.mailKey - 1])) >= 0) idx.push(i); });
+    return idx;
+  };
+  var isOpen = function (i) {
+    var st = String(values[i][RSV_COL.status - 1]).trim();
+    return st !== RSV_CONFIG.STATUS_DONE && st !== RSV_CONFIG.STATUS_CANCEL;
+  };
+  var openGroups = entry.groups.filter(function (g) { return keyIdx(g.keys).some(isOpen); });
+  if (!openGroups.length || Date.now() - entry.at > RSV_CONFIG.SLACK_THREAD_DAYS * 86400000) {
+    out.close = true; out.changed = true; return out;
+  }
+  var res = UrlFetchApp.fetch('https://slack.com/api/conversations.replies?channel=' + encodeURIComponent(RSV_CONFIG.SLACK_CHANNEL) +
+    '&ts=' + encodeURIComponent(ts) + '&limit=200', { headers: { Authorization: 'Bearer ' + token }, muteHttpExceptions: true });
+  var body = JSON.parse(res.getContentText() || '{}');
+  if (!body.ok) {
+    if (body.error === 'thread_not_found' || body.error === 'message_not_found') { out.close = true; out.changed = true; return out; }
+    rsvWarnOnce_('슬랙 스레드 확인 실패: ' + body.error +
+      (body.error === 'missing_scope' ? ' (슬랙 앱에 channels:history, groups:history 권한 추가 후 재설치 필요)' : ''));
+    out.stop = true;
+    return out;
+  }
+  var seen = entry.seen || [];
+  var human = (body.messages || []).slice(1).filter(function (m) {
+    return !m.bot_id && !(m.subtype && m.subtype !== 'thread_broadcast') && seen.indexOf(m.ts) < 0;
+  });
+  human.forEach(function (m) {
+    var cmds = rsvParseNumberedReply(m.text, entry.groups.length);
+    if (!cmds.length) return;
+    seen.push(m.ts);
+    out.changed = true;
+    var msgs = [];
+    cmds.forEach(function (c) {
+      if (!c.nums) { msgs.push('⚠ 번호를 붙여 주세요 (예: *1 출고완료*, *2 취소*, *전체 출고완료*)'); return; }
+      var list = c.nums === 'all' ? entry.groups : entry.groups.filter(function (g) { return c.nums.indexOf(g.n) >= 0; });
+      if (c.nums !== 'all') {
+        c.nums.forEach(function (n) { if (!entry.groups.some(function (g) { return g.n === n; })) msgs.push('⚠ ' + n + '번은 없어요'); });
+      }
+      list.forEach(function (g) {
+        var open = keyIdx(g.keys).filter(isOpen);
+        if (!open.length) { msgs.push(g.label + ' — 이미 처리됨'); return; }
+        // 여러 번호에 '품목 수량'을 함께 적으면 품목명이 맞는 묶음에만 적용된다
+        var r = rsvApplyThreadReply_(sh, values, open, c.action, c.text);
+        out.done += open.length;
+        msgs.push('*' + g.label + '* — ' + r.join(' · '));
+      });
+    });
+    var icon = msgs.every(function (x) { return x.indexOf('⚠') === 0; }) ? ':warning: ' : ':white_check_mark: ';
+    if (msgs.length) { try { rsvPostSlack_(icon + msgs.join('\n'), ts); } catch (e) { console.error(e); } }
+  });
+  entry.seen = seen;
+  if (!entry.groups.some(function (g) { return keyIdx(g.keys).some(isOpen); })) {
+    out.close = true;
+    try { rsvPostSlack_(':tada: 이 스레드의 ' + entry.groups.length + '건 모두 처리 완료', ts); } catch (e) { console.error(e); }
+  }
+  return out;
 }
 
 /** 같은 경고는 하루 한 번만 [메일수신로그]에 남긴다 */
