@@ -1101,7 +1101,8 @@ function rsvAllocate(rows, inventory, now, cfg) {
         return;
       }
 
-      if (!blocked && left >= q) {
+      // 이미 예약인 건은 재고가 실제로 남아 있으면 앞 순위 홀딩 대기(STRICT_QUEUE) 때문에 내리지 않는다
+      if (left >= q && (!blocked || x.kind === 'res')) {
         left -= q;
         res.avail = today;
         if (x.kind !== 'res') {
