@@ -1067,7 +1067,10 @@ function rsvAllocate(rows, inventory, now, cfg) {
     var list = groups[name].sort(function (a, b) { return rsvCmpKey_(a.key, b.key); });
     var inv = inventory[name];
     var stock = inv.stock;
-    var inbound = inv.inbound.slice().sort(function (a, b) { return a.date - b.date; });
+    // 입고 예정일이 지났는데 아직 입고 안 된 건(입고예정에 남아 있음)은 '오늘 이후 입고'로 보고 지연 표시
+    var inbound = inv.inbound.map(function (b) {
+      return { date: b.date < today ? today : b.date, qty: b.qty, due: b.date, late: b.date < today };
+    }).sort(function (a, b) { return a.date - b.date; });
     var left = stock, blocked = false, ahead = 0; // ahead: 앞 순위 수요 합계 (예약+홀딩)
     var reserved = []; // 앞 순위로 예약된 건 (예약→홀딩 알림에 "어느 건이 먼저 가져갔는지" 표시)
     var imminentTag = function (dday) {
@@ -1130,20 +1133,22 @@ function rsvAllocate(rows, inventory, now, cfg) {
           res.takenBy = reserved.slice(-3);
         }
         res.logAppend = stamp + (x.kind === 'res' ? ' 예약→홀딩 (재고 부족 · 사용 예정일이 더 빠른 건 우선)' : ' 신규 → 홀딩재고 자동 판정') +
-          ' (지금 가용 ' + rsvFmtNum_(Math.max(left, 0)) + ' < ' + rsvFmtNum_(q) + ')';
+          (left >= q ? ' (앞 순위 홀딩 대기 · 지금 가용 ' + rsvFmtNum_(left) + ')' : ' (지금 가용 ' + rsvFmtNum_(Math.max(left, 0)) + ' < ' + rsvFmtNum_(q) + ')');
       }
       // 확보 시점: 현재고 + 입고예정(날짜순) 이 앞 순위 수요 + 이 건을 덮는 첫 날
-      var cum = stock, need = ahead + q, okDate = cum >= need ? today : null, supplyByUse = stock;
+      var cum = stock, need = ahead + q, okDate = cum >= need ? today : null, supplyByUse = stock, okLate = null;
       inbound.forEach(function (b) {
         cum += b.qty;
-        if (!okDate && cum >= need) okDate = b.date;
+        if (!okDate && cum >= need) { okDate = b.date; if (b.late) okLate = b.due; }
         if (!x.useDate || b.date <= x.useDate) supplyByUse += b.qty;
       });
       supplyByUse -= ahead;
       res.supply = supplyByUse;
       res.avail = okDate;
       var why = left >= q ? '앞 순위 홀딩 대기 중' : '지금 가용 ' + rsvFmtNum_(Math.max(left, 0)) + '개';
-      if (supplyByUse >= q) {
+      if (okLate) {
+        res.verdict = (supplyByUse >= q ? '⏳' : '⚠') + ' 홀딩 · ' + why + ' · 입고 지연 (예정 ' + rsvFmtMD_(okLate) + ' 미입고) — 입고되면 출고 가능';
+      } else if (supplyByUse >= q) {
         res.verdict = '⏳ 홀딩 · ' + why + ' · 입고 후 출고 가능 (예상 ' + rsvFmtMD_(okDate) + ')';
       } else if (okDate) {
         res.verdict = '⚠ 홀딩 · 사용예정일까지 ' + rsvFmtNum_(q - supplyByUse) + '개 부족 · 입고 후 ' + rsvFmtMD_(okDate) + ' 가능';
