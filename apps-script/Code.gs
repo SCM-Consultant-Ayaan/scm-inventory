@@ -247,7 +247,7 @@ function rsvOnOpen() {
       .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow')
       .addSeparator()
       .addItem('📑 거래명세서 지금 발급 (사용 예정일 D-2 · 날짜/수량 바뀐 건)', 'rsvIssueInvoicesNow')
-      .addItem('📑 선택한 행의 PO 거래명세서 다시 발급', 'rsvReissueSelectedInvoice'))
+      .addItem('📑 선택한 셀의 묶음 거래명세서 발급', 'rsvIssueSelectedInvoices'))
     .addSubMenu(ui.createMenu('🚚 출고 확인')
       .addItem('슬랙 답글 지금 확인 (출고완료 · 취소 · 변경 승인)', 'rsvCheckSlackNow')
       .addItem('출고일 지난 건 알림 지금 보내기', 'rsvSendOverdueNow')
@@ -870,22 +870,74 @@ function rsvIssueInvoicesNow() {
     (r.errors.length ? ' · ⚠ ' + r.errors.join(' / ') : ''));
 }
 
-/** 메뉴: 선택한 행의 PO 거래명세서를 지금 내용으로 바로 다시 발급 (D-2 전이어도) */
-function rsvReissueSelectedInvoice() {
+/**
+ * 메뉴: 선택한 셀(여러 범위 가능)의 행이 속한 묶음(PO × 사용 예정일)을 지금 발급 — 날짜와 상관없이.
+ * 거래명세서 기능 전에 등록된 PO 도 메일의 발주서 첨부를 다시 읽어 단가·SHIP TO 를 가져온다.
+ */
+function rsvIssueSelectedInvoices() {
   rsvAssertAllowed_();
   var ss = SpreadsheetApp.getActive(), sh = ss.getActiveSheet();
-  if (sh.getName() !== RSV_CONFIG.RES_SHEET) { rsvToast_('[' + RSV_CONFIG.RES_SHEET + ']에서 PO 행을 선택하세요'); return; }
-  var row = ss.getActiveRange().getRow();
-  var key = String(sh.getRange(row, RSV_COL.mailKey).getValue() || '');
-  var m = key.match(/^po:(.+?)\|/);
-  if (!m) { rsvToast_('메일로 등록된 PO 행이 아닙니다 (V열 메일키 없음)'); return; }
-  var r = rsvSyncInvoices_({ only: m[1], force: true });
-  rsvToast_(r.issued ? '거래명세서 다시 발급: ' + r.names.join(', ') : '발급 못 함' + (r.errors.length ? ' · ⚠ ' + r.errors.join(' / ') : ''));
+  if (sh.getName() !== RSV_CONFIG.RES_SHEET) { rsvToast_('[' + RSV_CONFIG.RES_SHEET + ']에서 발급할 행(셀)을 선택하세요'); return; }
+  var targets = {}, rowsByPo = {}, skipped = 0;
+  ss.getActiveRangeList().getRanges().forEach(function (rg) {
+    var top = Math.max(rg.getRow(), RSV_CONFIG.FIRST_ROW), n = rg.getLastRow() - top + 1;
+    if (n <= 0) return;
+    sh.getRange(top, 1, n, RSV_LAST_COL).getValues().forEach(function (v) {
+      var key = String(v[RSV_COL.mailKey - 1] || ''), m = key.match(/^po:(.+?)\|/);
+      if (!m || !String(v[RSV_COL.name - 1]).trim()) { if (String(v[RSV_COL.name - 1]).trim()) skipped++; return; }
+      var gk = rsvInvoiceGroupKey({ useDate: v[RSV_COL.useDate - 1], level: (key.match(/r+$/) || [''])[0].length });
+      targets[m[1]] = targets[m[1]] || [];
+      if (targets[m[1]].indexOf(gk) < 0) targets[m[1]].push(gk);
+      rowsByPo[m[1]] = rowsByPo[m[1]] || { created: v[RSV_COL.created - 1], company: String(v[RSV_COL.company - 1] || '') };
+    });
+  });
+  var pos = Object.keys(targets);
+  if (!pos.length) { rsvToast_('메일로 등록된 PO 행이 아닙니다 (V열 메일키 po: 없음)'); return; }
+  // 기억된 단가가 없는 PO 는 메일에서 발주서를 다시 찾는다
+  var known = {}, log = rsvInvoiceSheet_();
+  if (log.getLastRow() > 1) log.getRange(2, 1, log.getLastRow() - 1, 1).getValues().forEach(function (v) { known[String(v[0])] = true; });
+  var errors = [];
+  pos.forEach(function (po) {
+    if (known[po]) return;
+    try { if (!rsvInvoiceRecoverPo_(po, rowsByPo[po].created, rowsByPo[po].company)) errors.push(po + ': 메일에서 발주서를 못 찾음'); }
+    catch (e) { errors.push(po + ': ' + e.message); }
+  });
+  var r = rsvSyncInvoices_({ targets: targets });
+  errors = errors.concat(r.errors);
+  var msg = (r.issued ? '거래명세서 ' + r.issued + '건 발급: ' + r.names.join(', ') : '발급된 거래명세서 없음') +
+    (skipped ? ' · 수기 행 ' + skipped + '개 제외(PO 없음)' : '') + (errors.length ? ' · ⚠ ' + errors.join(' / ') : '');
+  try { SpreadsheetApp.getUi().alert('📑 거래명세서 발급', msg.replace(/ · /g, '\n'), SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { rsvToast_(msg); }
+}
+
+/** 기억된 정보가 없는 PO: 등록일 앞뒤 메일에서 발주서 첨부를 찾아 단가·SHIP TO 를 기억. 찾으면 true */
+function rsvInvoiceRecoverPo_(poNo, created, company) {
+  var d = rsvToDate_(created, null) || new Date();
+  var after = new Date(d.getTime() - 3 * 86400000), before = new Date(d.getTime() + 3 * 86400000);
+  var q = RSV_CONFIG.MAIL_QUERY + ' after:' + Math.floor(after.getTime() / 1000) + ' before:' + Math.floor(before.getTime() / 1000);
+  var products = rsvReadProducts_(SpreadsheetApp.getActive());
+  var threads = GmailApp.search(q, 0, 30);
+  for (var t = 0; t < threads.length; t++) {
+    var msgs = threads[t].getMessages();
+    for (var m = msgs.length - 1; m >= 0; m--) {
+      var atts = msgs[m].getAttachments();
+      for (var a = 0; a < atts.length; a++) {
+        var fname = String(atts[a].getName()).normalize('NFC');
+        if (!RSV_CONFIG.ATTACHMENT_NAME_PATTERN.test(fname) || !/\.(xlsx|xls|xlsm)$/i.test(fname)) continue;
+        var grids = rsvAttachmentToGrids_(atts[a]);
+        var po = rsvPickPurchaseOrder(grids);
+        if (!po || po.poNo !== poNo) continue;
+        rsvTranslateLines(po, rsvPoCatalog(grids));
+        rsvInvoiceRemember_(po, company, products);
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /**
  * 기억한 PO 마다 [예약 재고 관리]의 현재 행(수량·FOC·출고예정일)으로 거래명세서 내용을 만들고,
- * 처음이거나 품목·수량·단가가 바뀌었으면(변경요청 승인 등) 발급. opts.only: PO No. 하나만, opts.force: 바뀌지 않아도 발급
+ * 처음이거나 바뀌었으면 발급. opts.targets: {PO No.: [묶음 키]} 이면 그 묶음만 지금 발급 (셀 선택), opts.force: 바뀌지 않아도 발급
  */
 function rsvSyncInvoices_(opts) {
   opts = opts || {};
@@ -902,7 +954,7 @@ function rsvSyncInvoices_(opts) {
   var now = new Date(), buyers = null;
   recs.forEach(function (rec, ri) {
     var poNo = String(rec[RSV_INV.po - 1]);
-    if (!poNo || (opts.only && poNo !== opts.only)) return;
+    if (!poNo || (opts.targets && !opts.targets[poNo])) return;
     var prices = {};
     try { prices = JSON.parse(rec[RSV_INV.prices - 1] || '{}'); } catch (e) { prices = {}; }
     var issued = rsvInvoiceIssued_(rec[RSV_INV.fileId - 1]);
@@ -914,9 +966,10 @@ function rsvSyncInvoices_(opts) {
       if (st === RSV_CONFIG.STATUS_CANCEL || !String(v[RSV_COL.name - 1]).trim()) return;
       rows.push({ row: RSV_CONFIG.FIRST_ROW + i, name: String(v[RSV_COL.name - 1]).trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
         foc: /\|foc/.test(key), shipDate: v[RSV_COL.shipDate - 1], useDate: v[RSV_COL.useDate - 1],
-        company: String(v[RSV_COL.company - 1] || '').trim(), level: (key.match(/r+$/) || [''])[0].length });
+        company: String(v[RSV_COL.company - 1] || '').trim(), purpose: String(v[RSV_COL.purpose - 1] || '').trim(),
+        level: (key.match(/r+$/) || [''])[0].length });
     });
-    var plan = rsvInvoicePlan(rows, issued, prices, now, RSV_CONFIG, !!opts.force);
+    var plan = rsvInvoicePlan(rows, issued, prices, now, RSV_CONFIG, !!opts.force, opts.targets ? opts.targets[poNo] : null);
     if (!plan.make.length && !plan.drop.length) return;
     var keep = issued.filter(function (x) { return plan.drop.indexOf(x) < 0; });
     // 사용 예정일이 바뀌어 없어진 묶음의 파일은 지운다 (같은 날짜로 다시 만들어질 파일은 아래에서 내용만 바꿈)
@@ -933,7 +986,8 @@ function rsvSyncInvoices_(opts) {
         var company = g.rows[0].company || String(rec[RSV_INV.company - 1] || '');
         var buyer = rsvFindBuyer(buyers, company, String(rec[RSV_INV.vendor - 1] || ''), RSV_CONFIG.INVOICE_COMPANY_ALIASES);
         if (!buyer) throw new Error('[' + RSV_CONFIG.INVOICE_BUYER_SHEET + ']에 업체 없음 (' + company + ')');
-        var poLabel = poNo + (g.seq ? '-' + g.seq : '');
+        // 발주서 PO No. 칸이 수식 오류(#N/A 등)면 용도(차수)로 대신 표기
+        var poLabel = (/^#/.test(poNo) ? (g.rows[0].purpose || poNo) : poNo) + (g.seq ? '-' + g.seq : '');
         var fname = (rsvFmtYMD_(inv.date).slice(2).replace(/-/g, '') + '_거래명세서_' + poLabel + '_' + (company || buyer.name) +
           (g.old && g.old.items !== inv.sig ? '_수정' : '')).replace(/[\\/:*?"<>|]/g, '-');
         var blob = rsvBuildInvoiceBlob_(inv, buyer, String(rec[RSV_INV.shipTo - 1] || ''), poLabel + (g.seq ? ' (' + g.seq + '차 출고분)' : ''), fname);
@@ -984,10 +1038,12 @@ function rsvInvoiceIssued_(cell) {
 /**
  * 거래명세서 발급 계획 (순수 함수). PO 행을 사용 예정일(C)별로 묶고,
  *  사용 예정일 INVOICE_DAYS_BEFORE 일 전(D-2)부터 발급. 이미 발급한 묶음은 발급일(출고예정일)·품목·수량·단가가 바뀌면 다시.
+ *  사용 예정일이 이미 지난 묶음은 자동으로 건드리지 않음 (onlyKeys 로 직접 고른 묶음만).
  *  사용 예정일이 바뀌어 없어진 묶음의 파일은 drop. force: D-2 전이어도, 바뀐 게 없어도 다시
+ *  onlyKeys: 이 묶음 키들만 지금 발급 (셀 선택 발급 — 날짜와 상관없이, drop 없음)
  * 반환: { make: [{key, rows, inv, sig, old}], drop: [발급 기록] }
  */
-function rsvInvoicePlan(rows, issued, prices, now, cfg, force) {
+function rsvInvoicePlan(rows, issued, prices, now, cfg, force, onlyKeys) {
   var today = rsvStartOfDay_(now), DAY = 86400000;
   var groups = {}, order = [];
   rows.forEach(function (r) {
@@ -1017,15 +1073,20 @@ function rsvInvoicePlan(rows, issued, prices, now, cfg, force) {
   }
   order.forEach(function (k) {
     var g = groups[k];
-    var due = g.date ? (g.date - today) / DAY <= cfg.INVOICE_DAYS_BEFORE : false;
-    if (!due && !force) return;
+    if (onlyKeys) {
+      if (onlyKeys.indexOf(k) < 0) return;
+    } else {
+      var left = g.date ? (g.date - today) / DAY : null;
+      var due = left !== null && left >= 0 && left <= cfg.INVOICE_DAYS_BEFORE;
+      if (!due && !force) return;
+    }
     var inv = rsvInvoiceContent(g.rows, prices, now, cfg.INVOICE_DATE_PICK);
     var sig = rsvFmtYMD_(inv.date) + '#' + (g.seq || 0) + '#' + inv.sig;
     var old = byKey[k] || null;
-    if (old && old.sig === sig && !force) return;
+    if (old && old.sig === sig && !force && !onlyKeys) return;
     make.push({ key: k, rows: g.rows, inv: inv, sig: sig, old: old, seq: g.seq || 0 });
   });
-  issued.forEach(function (x) { if (!groups[x.key] || (x.key === 'none')) drop.push(x); });
+  if (!onlyKeys) issued.forEach(function (x) { if (!groups[x.key] || (x.key === 'none')) drop.push(x); });
   return { make: make, drop: drop.filter(function (x) { return !make.some(function (m) { return m.old === x; }); }) };
 }
 
