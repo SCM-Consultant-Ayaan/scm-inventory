@@ -124,7 +124,8 @@ var RSV_CONFIG = {
   INVOICE_TEMPLATE_XLSX_ID: '1WMHRUVfmQwZP8mU5ocbXeJYA6kix2CK0',   // 양식 원본 (261019_뷰릿지코퍼레이션_BG(CN)_261016_11_거래명세서.xlsx)
   INVOICE_BUYER_SHEET: 'B2B 거래업체정보',
   INVOICE_LOG_SHEET: '거래명세서_발급',                           // 숨김 시트: PO 별 단가·SHIP TO·발급 기록
-  INVOICE_DATE_PICK: 'last',                                       // 발급일 = 출고예정일 (PO 안에 여러 날이면 'last' 가장 늦은 날 / 'first')
+  INVOICE_DATE_PICK: 'last',
+  INVOICE_DAYS_BEFORE: 2,                                          // 사용 예정일(C) D-2 부터 발급 (사용 예정일별로 따로)                                       // 발급일 = 출고예정일 (PO 안에 여러 날이면 'last' 가장 늦은 날 / 'first')
   // 업체명(F) → [B2B 거래업체정보] 상호 일부 (이름이 달라 자동으로 안 맞는 업체만)
   INVOICE_COMPANY_ALIASES: { '예스스타일': '예스아시아', '그리니스트': '그리스트', '올리브영': '홍천' },
   // 과세(부가세 10%) 업체 — 상호 일부. 그 외는 영세율. [B2B 거래업체정보]에 '과세구분' 열(과세/영세율)을 만들면 그 값이 우선
@@ -245,7 +246,7 @@ function rsvOnOpen() {
       .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
       .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow')
       .addSeparator()
-      .addItem('📑 거래명세서 지금 발급 (새 PO · 수량 바뀐 PO)', 'rsvIssueInvoicesNow')
+      .addItem('📑 거래명세서 지금 발급 (사용 예정일 D-2 · 날짜/수량 바뀐 건)', 'rsvIssueInvoicesNow')
       .addItem('📑 선택한 행의 PO 거래명세서 다시 발급', 'rsvReissueSelectedInvoice'))
     .addSubMenu(ui.createMenu('🚚 출고 확인')
       .addItem('슬랙 답글 지금 확인 (출고완료 · 취소 · 변경 승인)', 'rsvCheckSlackNow')
@@ -861,7 +862,7 @@ function rsvInvoiceSheet_() {
   return sh;
 }
 
-/** 메뉴: 거래명세서 지금 발급 (새 PO · 수량이 바뀐 PO 만) */
+/** 메뉴: 거래명세서 지금 발급 (사용 예정일 D-2 가 된 묶음 · 날짜/수량이 바뀐 묶음) */
 function rsvIssueInvoicesNow() {
   rsvAssertAllowed_();
   var r = rsvSyncInvoices_({});
@@ -869,7 +870,7 @@ function rsvIssueInvoicesNow() {
     (r.errors.length ? ' · ⚠ ' + r.errors.join(' / ') : ''));
 }
 
-/** 메뉴: 선택한 행의 PO 거래명세서를 지금 내용(출고예정일 포함)으로 다시 발급 */
+/** 메뉴: 선택한 행의 PO 거래명세서를 지금 내용으로 바로 다시 발급 (D-2 전이어도) */
 function rsvReissueSelectedInvoice() {
   rsvAssertAllowed_();
   var ss = SpreadsheetApp.getActive(), sh = ss.getActiveSheet();
@@ -898,56 +899,130 @@ function rsvSyncInvoices_(opts) {
   if (last < RSV_CONFIG.FIRST_ROW) return out;
   var values = res.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
   var recs = log.getRange(2, 1, log.getLastRow() - 1, 10).getValues();
-  var buyers = null;
+  var now = new Date(), buyers = null;
   recs.forEach(function (rec, ri) {
     var poNo = String(rec[RSV_INV.po - 1]);
     if (!poNo || (opts.only && poNo !== opts.only)) return;
     var prices = {};
     try { prices = JSON.parse(rec[RSV_INV.prices - 1] || '{}'); } catch (e) { prices = {}; }
+    var issued = rsvInvoiceIssued_(rec[RSV_INV.fileId - 1]);
     var rows = [];
     values.forEach(function (v, i) {
-      if (String(v[RSV_COL.mailKey - 1]).indexOf('po:' + poNo + '|') !== 0) return;
+      var key = String(v[RSV_COL.mailKey - 1]);
+      if (key.indexOf('po:' + poNo + '|') !== 0) return;
       var st = String(v[RSV_COL.status - 1]).trim();
       if (st === RSV_CONFIG.STATUS_CANCEL || !String(v[RSV_COL.name - 1]).trim()) return;
-      rows.push({ row: RSV_CONFIG.FIRST_ROW + i, v: v });
+      rows.push({ row: RSV_CONFIG.FIRST_ROW + i, name: String(v[RSV_COL.name - 1]).trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
+        foc: /\|foc/.test(key), shipDate: v[RSV_COL.shipDate - 1], useDate: v[RSV_COL.useDate - 1],
+        company: String(v[RSV_COL.company - 1] || '').trim(), display: '' });
     });
-    if (!rows.length) return;
-    var inv = rsvInvoiceContent(rows.map(function (x) {
-      var v = x.v, key = String(v[RSV_COL.mailKey - 1]);
-      return { name: String(v[RSV_COL.name - 1]).trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]), foc: /\|foc/.test(key),
-        shipDate: v[RSV_COL.shipDate - 1], useDate: v[RSV_COL.useDate - 1] };
-    }), prices, new Date(), RSV_CONFIG.INVOICE_DATE_PICK);
-    var hadFile = !!rec[RSV_INV.fileId - 1];
-    if (hadFile && rec[RSV_INV.sig - 1] === inv.sig && !opts.force) return;
-    if (inv.missingPrice.length && !opts.force) {
-      out.errors.push(poNo + ' 단가 없음: ' + inv.missingPrice.join(', '));
-      rsvWarnOnce_('거래명세서 보류 ' + poNo + ' — 단가를 모르는 품목: ' + inv.missingPrice.join(', ') + ' (메뉴 "다시 발급"이면 단가 0으로 발급)');
-      return;
-    }
-    try {
-      buyers = buyers || rsvReadBuyers_(ss);
-      var company = String(values[rows[0].row - RSV_CONFIG.FIRST_ROW][RSV_COL.company - 1] || rec[RSV_INV.company - 1] || '').trim();
-      var buyer = rsvFindBuyer(buyers, company, String(rec[RSV_INV.vendor - 1] || ''), RSV_CONFIG.INVOICE_COMPANY_ALIASES);
-      if (!buyer) throw new Error('[' + RSV_CONFIG.INVOICE_BUYER_SHEET + ']에 업체 없음 (' + company + ')');
-      var fname = rsvFmtYMD_(inv.date).slice(2).replace(/-/g, '') + '_거래명세서_' + poNo + '_' + (company || buyer.name) + (hadFile ? '_수정' : '');
-      fname = fname.replace(/[\\/:*?"<>|]/g, '-');
-      var file = rsvBuildInvoiceFile_(inv, buyer, String(rec[RSV_INV.shipTo - 1] || ''), poNo, fname, rsvInvoiceFolder_(buyer, company));
-      if (hadFile) { try { DriveApp.getFileById(rec[RSV_INV.fileId - 1]).setTrashed(true); } catch (e) { /* 이미 지운 파일 */ } }
-      var r = ri + 2;
-      log.getRange(r, RSV_INV.fileId, 1, 5).setValues([[file.getId(), file.getName(), inv.sig, rsvFmtDateTime_(new Date()), file.getUrl()]]);
-      // 업체명(F)에 링크
-      rows.forEach(function (x) {
-        var c = res.getRange(x.row, RSV_COL.company), text = String(c.getDisplayValue() || company);
-        if (text) c.setRichTextValue(SpreadsheetApp.newRichTextValue().setText(text).setLinkUrl(file.getUrl()).build());
-      });
-      out.issued++;
-      out.names.push(file.getName());
-    } catch (err) {
-      out.errors.push(poNo + ': ' + err.message);
-      rsvWarnOnce_('거래명세서 발급 실패 ' + poNo + ': ' + err.message);
-    }
+    var plan = rsvInvoicePlan(rows, issued, prices, now, RSV_CONFIG, !!opts.force);
+    if (!plan.make.length && !plan.drop.length) return;
+    var keep = issued.filter(function (x) { return plan.drop.indexOf(x) < 0; });
+    // 사용 예정일이 바뀌어 없어진 묶음의 파일은 지운다 (같은 날짜로 다시 만들어질 파일은 아래에서 내용만 바꿈)
+    plan.drop.forEach(function (x) { try { DriveApp.getFileById(x.fileId).setTrashed(true); } catch (e) { /* 이미 없음 */ } });
+    plan.make.forEach(function (g) {
+      var inv = g.inv;
+      if (inv.missingPrice.length && !opts.force) {
+        out.errors.push(poNo + ' 단가 없음: ' + inv.missingPrice.join(', '));
+        rsvWarnOnce_('거래명세서 보류 ' + poNo + ' — 단가를 모르는 품목: ' + inv.missingPrice.join(', ') + ' (메뉴 "다시 발급"이면 단가 0으로 발급)');
+        return;
+      }
+      try {
+        buyers = buyers || rsvReadBuyers_(ss);
+        var company = g.rows[0].company || String(rec[RSV_INV.company - 1] || '');
+        var buyer = rsvFindBuyer(buyers, company, String(rec[RSV_INV.vendor - 1] || ''), RSV_CONFIG.INVOICE_COMPANY_ALIASES);
+        if (!buyer) throw new Error('[' + RSV_CONFIG.INVOICE_BUYER_SHEET + ']에 업체 없음 (' + company + ')');
+        var fname = (rsvFmtYMD_(inv.date).slice(2).replace(/-/g, '') + '_거래명세서_' + poNo + '_' + (company || buyer.name) +
+          (g.old && g.old.items !== inv.sig ? '_수정' : '')).replace(/[\\/:*?"<>|]/g, '-');
+        var blob = rsvBuildInvoiceBlob_(inv, buyer, String(rec[RSV_INV.shipTo - 1] || ''), poNo, fname);
+        var file = null;
+        if (g.old) {
+          // 같은 사용 예정일 묶음: 파일은 그대로 두고 내용·이름만 바꿈 (업체명 링크 유지)
+          try { file = rsvReplaceDriveFile_(g.old.fileId, blob); } catch (e) { file = null; }
+          keep = keep.filter(function (x) { return x !== g.old; });
+        }
+        if (!file) {
+          if (g.old) { try { DriveApp.getFileById(g.old.fileId).setTrashed(true); } catch (e) { /* 무시 */ } }
+          file = rsvInvoiceFolder_(buyer, company).createFile(blob);
+        }
+        keep.push({ key: g.key, fileId: file.getId(), url: file.getUrl(), name: file.getName(), sig: g.sig, items: inv.sig });
+        out.issued++;
+        out.names.push(file.getName());
+      } catch (err) {
+        out.errors.push(poNo + ': ' + err.message);
+        rsvWarnOnce_('거래명세서 발급 실패 ' + poNo + ': ' + err.message);
+      }
+    });
+    // 업체명(F) 링크: 발급된 묶음의 행은 그 파일로, 날짜가 바뀌어 아직 발급 전인 행은 링크 해제
+    var urlByKey = {};
+    keep.forEach(function (x) { urlByKey[x.key] = x.url; });
+    rows.forEach(function (x) {
+      var key = x.useDate instanceof Date ? rsvFmtYMD_(rsvStartOfDay_(x.useDate)) : 'none';
+      var c = res.getRange(x.row, RSV_COL.company), text = String(c.getDisplayValue() || x.company);
+      if (!text) return;
+      var b = SpreadsheetApp.newRichTextValue().setText(text);
+      if (urlByKey[key]) b.setLinkUrl(urlByKey[key]);
+      c.setRichTextValue(b.build());
+    });
+    log.getRange(ri + 2, RSV_INV.fileId).setValue(JSON.stringify(keep));
+    log.getRange(ri + 2, RSV_INV.fileName, 1, 4).setValues([[keep.map(function (x) { return x.name; }).join('\n'), '',
+      rsvFmtDateTime_(now), keep.map(function (x) { return x.url; }).join('\n')]]);
   });
   return out;
+}
+
+/** [거래명세서_발급] F열 → 발급 기록 [{key, fileId, url, name, sig, items}] (예전 버전의 파일 ID 한 개도 읽음) */
+function rsvInvoiceIssued_(cell) {
+  var s = String(cell || '').trim();
+  if (!s) return [];
+  if (s.charAt(0) === '[') { try { return JSON.parse(s); } catch (e) { return []; } }
+  return [{ key: 'legacy', fileId: s, sig: '', items: '' }];
+}
+
+/**
+ * 거래명세서 발급 계획 (순수 함수). PO 행을 사용 예정일(C)별로 묶고,
+ *  사용 예정일 INVOICE_DAYS_BEFORE 일 전(D-2)부터 발급. 이미 발급한 묶음은 발급일(출고예정일)·품목·수량·단가가 바뀌면 다시.
+ *  사용 예정일이 바뀌어 없어진 묶음의 파일은 drop. force: D-2 전이어도, 바뀐 게 없어도 다시
+ * 반환: { make: [{key, rows, inv, sig, old}], drop: [발급 기록] }
+ */
+function rsvInvoicePlan(rows, issued, prices, now, cfg, force) {
+  var today = rsvStartOfDay_(now), DAY = 86400000;
+  var groups = {}, order = [];
+  rows.forEach(function (r) {
+    var d = r.useDate instanceof Date ? rsvStartOfDay_(r.useDate) : null;
+    var key = d ? rsvFmtYMD_(d) : 'none';
+    if (!groups[key]) { groups[key] = { key: key, date: d, rows: [] }; order.push(key); }
+    groups[key].rows.push(r);
+  });
+  var make = [], drop = [];
+  var byKey = {};
+  issued.forEach(function (x) { byKey[x.key] = x; });
+  order.forEach(function (k) {
+    var g = groups[k];
+    var due = g.date ? (g.date - today) / DAY <= cfg.INVOICE_DAYS_BEFORE : false;
+    if (!due && !force) return;
+    var inv = rsvInvoiceContent(g.rows, prices, now, cfg.INVOICE_DATE_PICK);
+    var sig = rsvFmtYMD_(inv.date) + '#' + inv.sig;
+    var old = byKey[k] || null;
+    if (old && old.sig === sig && !force) return;
+    make.push({ key: k, rows: g.rows, inv: inv, sig: sig, old: old });
+  });
+  issued.forEach(function (x) { if (!groups[x.key] || (x.key === 'none')) drop.push(x); });
+  return { make: make, drop: drop.filter(function (x) { return !make.some(function (m) { return m.old === x; }); }) };
+}
+
+/** Drive 파일 내용을 blob 으로 바꾸고 이름도 바꿈 (링크 유지). 반환: File */
+function rsvReplaceDriveFile_(fileId, blob) {
+  var res = UrlFetchApp.fetch('https://www.googleapis.com/upload/drive/v3/files/' + fileId + '?uploadType=media&supportsAllDrives=true', {
+    method: 'patch', contentType: blob.getContentType() || 'application/octet-stream', payload: blob.getBytes(),
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() >= 300) throw new Error('파일 덮어쓰기 실패 (' + res.getResponseCode() + ')');
+  var f = DriveApp.getFileById(fileId);
+  if (f.isTrashed()) f.setTrashed(false);
+  f.setName(blob.getName());
+  return f;
 }
 
 /**
@@ -1048,8 +1123,8 @@ function rsvInvoiceFolder_(buyer, company) {
   return root.createFolder(buyer.name);
 }
 
-/** 템플릿(구글 시트 사본)을 채워 xlsx 로 폴더에 저장. 임시 시트는 지운다 */
-function rsvBuildInvoiceFile_(inv, buyer, shipTo, poNo, fname, folder) {
+/** 템플릿(구글 시트 사본)을 채워 xlsx blob 으로. 임시 시트는 지운다 */
+function rsvBuildInvoiceBlob_(inv, buyer, shipTo, poNo, fname) {
   var tplId = rsvInvoiceTemplateId_();
   var tmp = DriveApp.getFileById(tplId).makeCopy('[임시] ' + fname);
   try {
@@ -1115,7 +1190,7 @@ function rsvBuildInvoiceFile_(inv, buyer, shipTo, poNo, fname, folder) {
       headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
     });
     if (res.getResponseCode() !== 200) throw new Error('엑셀 변환 실패 (' + res.getResponseCode() + ')');
-    return folder.createFile(res.getBlob().setName(fname + '.xlsx'));
+    return res.getBlob().setName(fname + '.xlsx');
   } finally {
     try { tmp.setTrashed(true); } catch (e) { /* 임시 파일 정리 실패는 무시 */ }
   }
