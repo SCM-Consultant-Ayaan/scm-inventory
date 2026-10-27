@@ -118,6 +118,26 @@ var RSV_CONFIG = {
       ],
     },
   ],
+  // ---- 거래명세서 자동 발급 (메일 PO 등록 시) ----
+  INVOICE_ENABLED: true,
+  INVOICE_ROOT_FOLDER_ID: '1gYWMNxOv2M4vZqhy8z2-BEIHTFiPAYQn',     // [00. B2B 발주] — 아래 업체 폴더에 저장
+  INVOICE_TEMPLATE_XLSX_ID: '1WMHRUVfmQwZP8mU5ocbXeJYA6kix2CK0',   // 양식 원본 (261019_뷰릿지코퍼레이션_BG(CN)_261016_11_거래명세서.xlsx)
+  INVOICE_BUYER_SHEET: 'B2B 거래업체정보',
+  INVOICE_LOG_SHEET: '거래명세서_발급',                           // 숨김 시트: PO 별 단가·SHIP TO·발급 기록
+  INVOICE_DATE_PICK: 'last',                                       // 발급일 = 출고예정일 (PO 안에 여러 날이면 'last' 가장 늦은 날 / 'first')
+  // 업체명(F) → [B2B 거래업체정보] 상호 일부 (이름이 달라 자동으로 안 맞는 업체만)
+  INVOICE_COMPANY_ALIASES: { '예스스타일': '예스아시아', '그리니스트': '그리스트', '올리브영': '홍천' },
+  // 과세(부가세 10%) 업체 — 상호 일부. 그 외는 영세율. [B2B 거래업체정보]에 '과세구분' 열(과세/영세율)을 만들면 그 값이 우선
+  INVOICE_TAXED: ['예스아시아'],
+  INVOICE_MEMO_ZERO: ['※ 본 거래는 유상 정산 기준에 따라 진행되며, 대금 입금 후 발송됩니다.',
+    '※ 공급 단가는 별도 협의한 Price List 상 가격이며 간접 수출로 인한 영세율 거래입니다.'],
+  INVOICE_MEMO_TAXED: ['※ 본 거래는 과세 거래이며, 공급가는 부가세 별도 기준입니다.'],
+  INVOICE_LAYOUT: {
+    brn: 'Q10', name: 'Q11', ceo: 'T11', addr: 'Q12', biz: 'Q13', item: 'T13', person: 'Q14', tel: 'T14', date: 'A6',
+    amountText: 'L18', taxHeader: 'U20', firstLine: 21, lastLine: 37, totalRow: 38,
+    merges: [['A', 'B'], ['C', 'K'], ['L', 'O'], ['P', 'Q'], ['S', 'T']],
+  },
+
   // 발주서 업체명 → 업체명(F) 드롭다운 값. 회사명 정리(㈜·코퍼레이션 등 제거) 후 드롭다운과 비슷하면 자동으로 맞춤.
   // 영문명처럼 자동으로 안 맞는 업체만 여기에 추가 (왼쪽: 발주서에 적힌 이름의 일부, 오른쪽: 드롭다운 값)
   COMPANY_ALIASES: {
@@ -223,7 +243,10 @@ function rsvOnOpen() {
     .addSubMenu(ui.createMenu('✉️ 메일 발주')
       .addItem('메일 발주서 지금 가져오기', 'rsvRunMailImport')
       .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
-      .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow'))
+      .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow')
+      .addSeparator()
+      .addItem('📑 거래명세서 지금 발급 (새 PO · 수량 바뀐 PO)', 'rsvIssueInvoicesNow')
+      .addItem('📑 선택한 행의 PO 거래명세서 다시 발급', 'rsvReissueSelectedInvoice'))
     .addSubMenu(ui.createMenu('🚚 출고 확인')
       .addItem('슬랙 답글 지금 확인 (출고완료 · 취소 · 변경 승인)', 'rsvCheckSlackNow')
       .addItem('출고일 지난 건 알림 지금 보내기', 'rsvSendOverdueNow')
@@ -300,6 +323,7 @@ function rsvRunScheduled() {
   var lastEdit = Number(PropertiesService.getScriptProperties().getProperty('RSV_LAST_EDIT') || 0);
   var idle = Date.now() - lastEdit >= RSV_CONFIG.SORT_IDLE_MINUTES * 60000;
   rsvNotifySlack_(res.pos, rsvRunAllocation({ sort: idle }).conversions);
+  try { rsvSyncInvoices_({}); } catch (err) { console.error('거래명세서 발급 오류', err); }
   if (idle && RSV_CONFIG.SLACK_NOTIFY_MANUAL) {
     try { rsvNotifyManual_(); } catch (err) { console.error('수기 등록 알림 오류', err); }
   }
@@ -746,11 +770,13 @@ function rsvShowDemoteDialog_(events) {
     '<div>우선순위가 더 높은 건(사용 예정일이 더 빠르거나 긴급)이 재고를 먼저 가져가서 아래 <b>' + list.length + '건</b>이 ' +
     '<b>예약 → 홀딩</b>으로 바뀌었어요.<br>그래도 예약으로 잡을 건은 체크하고 <b>예약 유지</b>를 누르세요. ' +
     '<span class="g">(우선순위에 📌강제예약 표시 · 맨 앞 순위로 배정 · 다른 건이 대신 홀딩될 수 있음)</span></div>' +
+    '<label style="display:block;margin:8px 0 2px"><input type="checkbox" id="all" onclick="var c=this.checked;' +
+    '[].forEach.call(document.querySelectorAll(\'.it input\'),function(x){x.checked=c})"> <b>전체 선택</b></label>' +
     items +
     '<div class="btns"><button id="k" onclick="keep()">✔ 체크한 건 예약 유지</button>' +
     '<button id="h" onclick="google.script.host.close()">모두 홀딩으로 둘게요</button><div id="msg"></div></div>' +
     '<script>var P=' + payload.replace(/</g, '\\u003c') + ';' +
-    'function keep(){var s=[].slice.call(document.querySelectorAll("input:checked")).map(function(c){return P[+c.value]});' +
+    'function keep(){var s=[].slice.call(document.querySelectorAll(".it input:checked")).map(function(c){return P[+c.value]});' +
     'var m=document.getElementById("msg");if(!s.length){m.textContent="체크한 건이 없어요";return;}' +
     'document.getElementById("k").disabled=true;m.textContent="반영 중…";' +
     'google.script.run.withSuccessHandler(function(r){m.textContent=r;setTimeout(function(){google.script.host.close()},1500);})' +
@@ -793,6 +819,344 @@ function rsvKeepReserved(items) {
   // 강제예약 때문에 다른 건이 홀딩되면 이어서 알림창이 다시 뜬다
   rsvRunAllocation({ sort: false, interactive: true });
   return '✅ ' + done.length + '건 예약 유지 (' + done.join(', ') + '행)';
+}
+
+// =====================================================================
+// 거래명세서 자동 발급 (메일 PO 등록 → 업체 폴더에 xlsx · 업체명(F)에 링크)
+// =====================================================================
+
+/** 메일 PO 등록·변경 때 발주서 정보(단가·SHIP TO)를 [거래명세서_발급]에 기억 */
+function rsvInvoiceRemember_(po, company, products) {
+  var sh = rsvInvoiceSheet_();
+  var prices = {};
+  po.lines.forEach(function (ln) {
+    var prod = rsvResolveProduct(ln, products);
+    prices[prod.name || ln.name] = ln.price || 0;
+  });
+  var vals = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues() : [];
+  var at = 0;
+  vals.forEach(function (v, i) { if (String(v[0]) === po.poNo) at = i + 2; });
+  if (at) {
+    var old = {};
+    try { old = JSON.parse(sh.getRange(at, RSV_INV.prices).getValue() || '{}'); } catch (e) { old = {}; }
+    Object.keys(prices).forEach(function (k) { old[k] = prices[k]; });
+    sh.getRange(at, RSV_INV.prices).setValue(JSON.stringify(old));
+    if (po.shipTo) sh.getRange(at, RSV_INV.shipTo).setValue(po.shipTo);
+    return;
+  }
+  sh.appendRow([po.poNo, company || po.company, po.company, po.shipTo || '', JSON.stringify(prices), '', '', '', '', '']);
+}
+
+var RSV_INV = { po: 1, company: 2, vendor: 3, shipTo: 4, prices: 5, fileId: 6, fileName: 7, sig: 8, issuedAt: 9, url: 10 };
+
+function rsvInvoiceSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(RSV_CONFIG.INVOICE_LOG_SHEET);
+  if (sh) return sh;
+  sh = ss.insertSheet(RSV_CONFIG.INVOICE_LOG_SHEET);
+  sh.getRange(1, 1, 1, 10).setValues([['PO No.', '업체명', '발주서 업체명', 'SHIP TO', '단가(JSON)', '파일 ID', '파일명', '내용 서명', '발급 일시', '링크']])
+    .setFontWeight('bold').setBackground('#d9d9d9');
+  sh.setFrozenRows(1);
+  sh.hideSheet();
+  return sh;
+}
+
+/** 메뉴: 거래명세서 지금 발급 (새 PO · 수량이 바뀐 PO 만) */
+function rsvIssueInvoicesNow() {
+  rsvAssertAllowed_();
+  var r = rsvSyncInvoices_({});
+  rsvToast_(r.issued ? '거래명세서 ' + r.issued + '건 발급 (' + r.names.join(', ') + ')' : '새로 발급할 거래명세서가 없습니다' +
+    (r.errors.length ? ' · ⚠ ' + r.errors.join(' / ') : ''));
+}
+
+/** 메뉴: 선택한 행의 PO 거래명세서를 지금 내용(출고예정일 포함)으로 다시 발급 */
+function rsvReissueSelectedInvoice() {
+  rsvAssertAllowed_();
+  var ss = SpreadsheetApp.getActive(), sh = ss.getActiveSheet();
+  if (sh.getName() !== RSV_CONFIG.RES_SHEET) { rsvToast_('[' + RSV_CONFIG.RES_SHEET + ']에서 PO 행을 선택하세요'); return; }
+  var row = ss.getActiveRange().getRow();
+  var key = String(sh.getRange(row, RSV_COL.mailKey).getValue() || '');
+  var m = key.match(/^po:(.+?)\|/);
+  if (!m) { rsvToast_('메일로 등록된 PO 행이 아닙니다 (V열 메일키 없음)'); return; }
+  var r = rsvSyncInvoices_({ only: m[1], force: true });
+  rsvToast_(r.issued ? '거래명세서 다시 발급: ' + r.names.join(', ') : '발급 못 함' + (r.errors.length ? ' · ⚠ ' + r.errors.join(' / ') : ''));
+}
+
+/**
+ * 기억한 PO 마다 [예약 재고 관리]의 현재 행(수량·FOC·출고예정일)으로 거래명세서 내용을 만들고,
+ * 처음이거나 품목·수량·단가가 바뀌었으면(변경요청 승인 등) 발급. opts.only: PO No. 하나만, opts.force: 바뀌지 않아도 발급
+ */
+function rsvSyncInvoices_(opts) {
+  opts = opts || {};
+  var out = { issued: 0, names: [], errors: [] };
+  if (!RSV_CONFIG.INVOICE_ENABLED) return out;
+  var ss = SpreadsheetApp.getActive();
+  var log = ss.getSheetByName(RSV_CONFIG.INVOICE_LOG_SHEET);
+  if (!log || log.getLastRow() < 2) return out;
+  var res = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(res);
+  if (last < RSV_CONFIG.FIRST_ROW) return out;
+  var values = res.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
+  var recs = log.getRange(2, 1, log.getLastRow() - 1, 10).getValues();
+  var buyers = null;
+  recs.forEach(function (rec, ri) {
+    var poNo = String(rec[RSV_INV.po - 1]);
+    if (!poNo || (opts.only && poNo !== opts.only)) return;
+    var prices = {};
+    try { prices = JSON.parse(rec[RSV_INV.prices - 1] || '{}'); } catch (e) { prices = {}; }
+    var rows = [];
+    values.forEach(function (v, i) {
+      if (String(v[RSV_COL.mailKey - 1]).indexOf('po:' + poNo + '|') !== 0) return;
+      var st = String(v[RSV_COL.status - 1]).trim();
+      if (st === RSV_CONFIG.STATUS_CANCEL || !String(v[RSV_COL.name - 1]).trim()) return;
+      rows.push({ row: RSV_CONFIG.FIRST_ROW + i, v: v });
+    });
+    if (!rows.length) return;
+    var inv = rsvInvoiceContent(rows.map(function (x) {
+      var v = x.v, key = String(v[RSV_COL.mailKey - 1]);
+      return { name: String(v[RSV_COL.name - 1]).trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]), foc: /\|foc/.test(key),
+        shipDate: v[RSV_COL.shipDate - 1], useDate: v[RSV_COL.useDate - 1] };
+    }), prices, new Date(), RSV_CONFIG.INVOICE_DATE_PICK);
+    var hadFile = !!rec[RSV_INV.fileId - 1];
+    if (hadFile && rec[RSV_INV.sig - 1] === inv.sig && !opts.force) return;
+    if (inv.missingPrice.length && !opts.force) {
+      out.errors.push(poNo + ' 단가 없음: ' + inv.missingPrice.join(', '));
+      rsvWarnOnce_('거래명세서 보류 ' + poNo + ' — 단가를 모르는 품목: ' + inv.missingPrice.join(', ') + ' (메뉴 "다시 발급"이면 단가 0으로 발급)');
+      return;
+    }
+    try {
+      buyers = buyers || rsvReadBuyers_(ss);
+      var company = String(values[rows[0].row - RSV_CONFIG.FIRST_ROW][RSV_COL.company - 1] || rec[RSV_INV.company - 1] || '').trim();
+      var buyer = rsvFindBuyer(buyers, company, String(rec[RSV_INV.vendor - 1] || ''), RSV_CONFIG.INVOICE_COMPANY_ALIASES);
+      if (!buyer) throw new Error('[' + RSV_CONFIG.INVOICE_BUYER_SHEET + ']에 업체 없음 (' + company + ')');
+      var fname = rsvFmtYMD_(inv.date).slice(2).replace(/-/g, '') + '_거래명세서_' + poNo + '_' + (company || buyer.name) + (hadFile ? '_수정' : '');
+      fname = fname.replace(/[\\/:*?"<>|]/g, '-');
+      var file = rsvBuildInvoiceFile_(inv, buyer, String(rec[RSV_INV.shipTo - 1] || ''), poNo, fname, rsvInvoiceFolder_(buyer, company));
+      if (hadFile) { try { DriveApp.getFileById(rec[RSV_INV.fileId - 1]).setTrashed(true); } catch (e) { /* 이미 지운 파일 */ } }
+      var r = ri + 2;
+      log.getRange(r, RSV_INV.fileId, 1, 5).setValues([[file.getId(), file.getName(), inv.sig, rsvFmtDateTime_(new Date()), file.getUrl()]]);
+      // 업체명(F)에 링크
+      rows.forEach(function (x) {
+        var c = res.getRange(x.row, RSV_COL.company), text = String(c.getDisplayValue() || company);
+        if (text) c.setRichTextValue(SpreadsheetApp.newRichTextValue().setText(text).setLinkUrl(file.getUrl()).build());
+      });
+      out.issued++;
+      out.names.push(file.getName());
+    } catch (err) {
+      out.errors.push(poNo + ': ' + err.message);
+      rsvWarnOnce_('거래명세서 발급 실패 ' + poNo + ': ' + err.message);
+    }
+  });
+  return out;
+}
+
+/**
+ * 거래명세서 내용 (순수 함수). rows: [{name, qty, foc, shipDate, useDate}], prices: {상품명: 단가}
+ *  같은 상품·단가는 합침 (일부 출고로 나뉜 행). FOC 는 단가 0. 발급일 = 출고예정일 (datePick 'last': 가장 늦은 날 / 'first')
+ */
+function rsvInvoiceContent(rows, prices, now, datePick) {
+  var lines = [], byKey = {}, missing = [], dates = [];
+  rows.forEach(function (r) {
+    if (!(r.qty > 0)) return;
+    var price = r.foc ? 0 : prices[r.name];
+    if (price == null) { if (missing.indexOf(r.name) < 0) missing.push(r.name); price = 0; }
+    var k = r.name + '|' + price + '|' + (r.foc ? 'f' : '');
+    if (!byKey[k]) { byKey[k] = { name: r.name, qty: 0, price: price, foc: r.foc }; lines.push(byKey[k]); }
+    byKey[k].qty += r.qty;
+    var d = r.shipDate instanceof Date ? r.shipDate : r.useDate instanceof Date ? r.useDate : null;
+    if (d) dates.push(d.getTime());
+  });
+  lines.sort(function (a, b) { return (a.foc ? 1 : 0) - (b.foc ? 1 : 0); });
+  var date = dates.length ? new Date(datePick === 'first' ? Math.min.apply(null, dates) : Math.max.apply(null, dates)) : rsvStartOfDay_(now);
+  var sig = lines.map(function (l) { return l.name + ':' + l.qty + ':' + l.price + (l.foc ? ':f' : ''); }).sort().join(';');
+  return { lines: lines, date: date, sig: sig, missingPrice: missing };
+}
+
+/** 품목명 → 명세서 표기 {name, spec} (순수 함수). '로지킴 PDRN 틴티드 립 앰플 10ml_01 새틴' → 'PDRN 틴티드 립 앰플 01 새틴' / '10ml' */
+function rsvInvoiceItemName(name) {
+  var s = String(name || '').replace(/^\s*로지킴\s*/, '').trim();
+  var m = s.match(/\s(\d+(?:\.\d+)?\s?(?:ml|mL|ML|g))(?:[_\s]+|$)/);
+  if (!m) return { name: s, spec: '' };
+  var rest = (s.slice(0, m.index) + ' ' + s.slice(m.index + m[0].length)).replace(/\s+/g, ' ').trim();
+  return { name: rest, spec: m[1].replace(/\s/g, '') };
+}
+
+/** 금액 → 한글 (NUMBERSTRING(n,1) 과 같은 표기). 1234500 → '일백이십삼만사천오백' (순수 함수) */
+function rsvKoreanAmount(n) {
+  n = Math.floor(Math.abs(Number(n) || 0));
+  if (!n) return '영';
+  var digit = ['', '일', '이', '삼', '사', '오', '육', '칠', '팔', '구'], small = ['', '십', '백', '천'], big = ['', '만', '억', '조'];
+  var out = '', g = 0;
+  while (n > 0) {
+    var part = n % 10000, s = '';
+    for (var i = 0; i < 4 && part > 0; i++) {
+      var d = part % 10;
+      if (d) s = digit[d] + small[i] + s;
+      part = Math.floor(part / 10);
+    }
+    if (s) out = s + big[g] + out;
+    n = Math.floor(n / 10000);
+    g++;
+  }
+  return out;
+}
+
+/** [B2B 거래업체정보] → [{name, brn, ceo, addr, biz, item, person, tel, taxed, norm}] (헤더 이름으로 열을 찾음) */
+function rsvReadBuyers_(ss) {
+  var sh = ss.getSheetByName(RSV_CONFIG.INVOICE_BUYER_SHEET);
+  if (!sh || sh.getLastRow() < 2) throw new Error('[' + RSV_CONFIG.INVOICE_BUYER_SHEET + '] 시트가 없거나 비어 있음');
+  var v = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  var head = v[0].map(function (x) { return String(x).replace(/\s/g, ''); });
+  var c = function (k) { for (var i = 0; i < head.length; i++) if (head[i].indexOf(k) === 0) return i; return -1; };
+  var cn = c('상호'), cb = c('사업자'), cc = c('대표'), ca = c('주소'), cz = c('업태'), cp = c('담당자'), ct = c('과세');
+  var clean = function (s) { s = String(s || '').trim(); return /^\(.*없음.*\)$/.test(s) ? '' : s; };
+  return v.slice(1).filter(function (r) { return String(r[cn] || '').trim(); }).map(function (r) {
+    var biz = String(cz >= 0 ? r[cz] : '').split('/');
+    var who = String(cp >= 0 ? r[cp] : '').split(/\s*·\s*/).map(clean).filter(String);
+    var name = String(r[cn]).trim();
+    return {
+      name: name.replace(/\s*\(.*\)\s*$/, ''), brn: clean(cb >= 0 ? r[cb] : ''), ceo: clean(cc >= 0 ? r[cc] : ''), addr: clean(ca >= 0 ? r[ca] : ''),
+      biz: clean(biz[0]), item: clean(biz.slice(1).join('/')), person: who[0] || '', tel: who.slice(1).join(' · '),
+      taxed: ct >= 0 ? /과세|10/.test(String(r[ct])) && !/영세/.test(String(r[ct])) : null,
+      norm: rsvCompanyNorm(name),
+    };
+  });
+}
+
+/** 업체명(F) / 발주서 업체명 → 거래업체 (순수 함수). aliases: {시트 업체명: 상호 일부} */
+function rsvFindBuyer(buyers, company, vendor, aliases) {
+  var keys = [];
+  Object.keys(aliases || {}).forEach(function (k) { if (company && company.indexOf(k) >= 0) keys.push(rsvCompanyNorm(aliases[k])); });
+  [company, vendor].forEach(function (s) { var n = rsvCompanyNorm(s); if (n) keys.push(n); });
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i];
+    var hit = buyers.filter(function (b) { return b.norm.indexOf(k) >= 0 || k.indexOf(b.norm) >= 0; })[0];
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** 업체 폴더 (00. B2B 발주 아래). 상호 또는 업체명과 비슷한 폴더가 없으면 상호로 새로 만든다 */
+function rsvInvoiceFolder_(buyer, company) {
+  var root = DriveApp.getFolderById(RSV_CONFIG.INVOICE_ROOT_FOLDER_ID);
+  var want = [rsvCompanyNorm(buyer.name), rsvCompanyNorm(company)].filter(String);
+  var it = root.getFolders();
+  while (it.hasNext()) {
+    var f = it.next(), n = rsvCompanyNorm(String(f.getName()).replace(/주시회사/g, '주식회사'));
+    if (n && want.some(function (w) { return n.indexOf(w) >= 0 || w.indexOf(n) >= 0; })) return f;
+  }
+  return root.createFolder(buyer.name);
+}
+
+/** 템플릿(구글 시트 사본)을 채워 xlsx 로 폴더에 저장. 임시 시트는 지운다 */
+function rsvBuildInvoiceFile_(inv, buyer, shipTo, poNo, fname, folder) {
+  var tplId = rsvInvoiceTemplateId_();
+  var tmp = DriveApp.getFileById(tplId).makeCopy('[임시] ' + fname);
+  try {
+    var ss = SpreadsheetApp.openById(tmp.getId());
+    var sh = ss.getSheets()[0];
+    var L = RSV_CONFIG.INVOICE_LAYOUT;
+    var taxed = buyer.taxed != null ? buyer.taxed : RSV_CONFIG.INVOICE_TAXED.some(function (k) { return buyer.name.indexOf(k) >= 0; });
+    // 공급받는자
+    sh.getRange(L.brn).setValue(buyer.brn);
+    sh.getRange(L.name).setValue(buyer.name);
+    sh.getRange(L.ceo).setValue(buyer.ceo);
+    sh.getRange(L.addr).setValue(buyer.addr);
+    sh.getRange(L.biz).setValue(buyer.biz);
+    sh.getRange(L.item).setValue(buyer.item);
+    sh.getRange(L.person).setValue(buyer.person);
+    sh.getRange(L.tel).setValue(buyer.tel);
+    sh.getRange(L.date).setValue(inv.date).setNumberFormat('yyyy년 m월 d일');
+    // 품목 줄: 모자라면 합계 줄 위에 늘린다
+    var first = L.firstLine, cap = L.lastLine - L.firstLine + 1, n = inv.lines.length;
+    var extra = Math.max(0, n - cap);
+    if (extra) {
+      sh.insertRowsAfter(L.lastLine, extra);
+      var src = sh.getRange(L.lastLine, 1, 1, 21);
+      for (var e = 1; e <= extra; e++) {
+        var rr = L.lastLine + e;
+        src.copyTo(sh.getRange(rr, 1, 1, 21), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+        L.merges.forEach(function (m) {
+          var g = sh.getRange(m[0] + rr + ':' + m[1] + rr);
+          try { g.breakApart(); } catch (x) { /* 무시 */ }
+          g.merge();
+        });
+        sh.setRowHeight(rr, sh.getRowHeight(L.lastLine));
+      }
+    }
+    var lastLine = L.lastLine + extra, totalRow = L.totalRow + extra;
+    sh.getRange(first, 1, lastLine - first + 1, 21).clearContent();
+    var supply = 0, tax = 0;
+    inv.lines.forEach(function (l, i) {
+      var r = first + i, nm = rsvInvoiceItemName(l.name);
+      sh.getRange('A' + r).setValue(i + 1);
+      sh.getRange('C' + r).setValue(nm.name + (l.foc ? ' (FOC)' : ''));
+      sh.getRange('L' + r).setValue(nm.spec);
+      sh.getRange('P' + r).setValue(l.qty);
+      sh.getRange('R' + r).setValue(l.price);
+      sh.getRange('S' + r).setFormula('=P' + r + '*R' + r);
+      sh.getRange('U' + r).setFormula(taxed ? '=ROUND(S' + r + '*0.1,0)' : '=0');
+      supply += l.qty * l.price;
+      tax += taxed ? Math.round(l.qty * l.price * 0.1) : 0;
+    });
+    sh.getRange('P' + totalRow).setFormula('=SUM(P' + first + ':Q' + lastLine + ')');
+    sh.getRange('S' + totalRow).setFormula('=SUM(S' + first + ':T' + lastLine + ')');
+    sh.getRange('U' + totalRow).setFormula('=SUM(U' + first + ':U' + lastLine + ')');
+    sh.getRange('U' + (totalRow + 1)).setFormula('=SUM(S' + totalRow + ':U' + totalRow + ')');
+    var total = supply + tax;
+    sh.getRange(L.amountText).setValue('일금 ' + rsvKoreanAmount(total) + '원정 (' + rsvFmtNum_(total) + '원)');
+    sh.getRange(L.taxHeader).setValue(taxed ? '세 액' : '세 액(영세율 거래)');
+    var memo = (taxed ? RSV_CONFIG.INVOICE_MEMO_TAXED : RSV_CONFIG.INVOICE_MEMO_ZERO).slice();
+    memo.push('※ 배송지: ' + (shipTo || '(발주서 SHIP TO 없음)'));
+    memo.push('※ PO No. ' + poNo);
+    sh.getRange('I' + (totalRow + 2)).setValue(memo.join('\n'));
+    SpreadsheetApp.flush();
+    var res = UrlFetchApp.fetch('https://docs.google.com/spreadsheets/d/' + tmp.getId() + '/export?format=xlsx', {
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) throw new Error('엑셀 변환 실패 (' + res.getResponseCode() + ')');
+    return folder.createFile(res.getBlob().setName(fname + '.xlsx'));
+  } finally {
+    try { tmp.setTrashed(true); } catch (e) { /* 임시 파일 정리 실패는 무시 */ }
+  }
+}
+
+/** 거래명세서 템플릿 xlsx → 구글 시트 사본 (처음 한 번 만들고 ID 기억) */
+function rsvInvoiceTemplateId_() {
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty('RSV_INVOICE_TPL');
+  if (id) {
+    try { if (!DriveApp.getFileById(id).isTrashed()) return id; } catch (e) { /* 다시 만듦 */ }
+  }
+  var res = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + RSV_CONFIG.INVOICE_TEMPLATE_XLSX_ID + '/copy?fields=id&supportsAllDrives=true', {
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify({ name: '[자동발급 템플릿] 거래명세서 (지우지 마세요)', mimeType: MimeType.GOOGLE_SHEETS,
+      parents: [RSV_CONFIG.INVOICE_ROOT_FOLDER_ID] }),
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() >= 300) throw new Error('거래명세서 템플릿 변환 실패 (' + res.getResponseCode() + ')');
+  id = JSON.parse(res.getContentText()).id;
+  props.setProperty('RSV_INVOICE_TPL', id);
+  return id;
+}
+
+/** SHIP TO 블록 → '주소 회사명 (담당자 / 연락처)' (순수 함수). grid: 발주서 시트 값 */
+function rsvParseShipTo(grid) {
+  var start = -1;
+  for (var r = 0; r < Math.min(grid.length, 30) && start < 0; r++) {
+    if (grid[r].some(function (v) { return /ship\s*to/i.test(String(v)); })) start = r;
+  }
+  if (start < 0) return '';
+  var f = {};
+  for (var i = start + 1; i < Math.min(grid.length, start + 8); i++) {
+    var text = grid[i].map(String).filter(function (s) { return s.trim(); }).join(' ').trim();
+    if (!text) { if (Object.keys(f).length) break; continue; }
+    var m = text.match(/^(회사명|담당자|주소|연락처)\s*[:：]\s*(.*)$/);
+    if (!m) break;
+    f[m[1]] = m[2].replace(/\s+/g, ' ').trim();
+  }
+  var who = [f['담당자'], f['연락처']].filter(Boolean).join(' / ');
+  return [f['주소'], f['회사명']].filter(Boolean).join(' · ') + (who ? ' (' + who + ')' : '');
 }
 
 /** 메뉴: 출고일 정렬 (출고 묶음 단위) */
@@ -1266,6 +1630,7 @@ function rsvImportMail_() {
             var diff = rsvDiffPo(existing, lines, RSV_CONFIG);
             if (!diff.length) { rsvWriteLog_(msg, fname, '변경 없음: 이미 등록된 발주와 수량 동일 · PO ' + po.poNo + ' · ' + po.purpose); return; }
             var req = rsvCreateChangeRequest_(po, diff, msg, fname, existing);
+            try { rsvInvoiceRemember_(po, existing[0].company, products); } catch (e) { /* 단가 기억 실패는 무시 */ }
             if (req.dup) { rsvWriteLog_(msg, fname, '건너뜀: 같은 내용의 변경요청 ' + req.id + ' 승인 대기 중'); return; }
             changes++;
             rsvWriteLog_(msg, fname, '변경요청 ' + req.id + ' · ' + diff.length + '건 · PO ' + po.poNo + ' · ' + po.purpose + ' → 승인 대기');
@@ -1308,6 +1673,7 @@ function rsvImportMail_() {
           sh.getRange(at, 1, newRows.length, RSV_COL.priority).setValues(newRows.map(function (r) { return r.slice(0, RSV_COL.priority); }));
           sh.getRange(at, RSV_COL.mailKey, newRows.length, 1).setValues(newRows.map(function (r) { return [r[RSV_COL.mailKey - 1]]; }));
           added += newRows.length;
+          try { rsvInvoiceRemember_(po, company, products); } catch (e) { rsvWriteLog_(msg, fname, '⚠ 거래명세서 정보 저장 실패: ' + e.message); }
           pos.push({ poNo: po.poNo, company: company || po.company, purpose: po.purpose, fname: fname,
             from: msg.getFrom(), firstRow: at, count: newRows.length });
           var unmatched = po.lines.filter(function (ln) { return !rsvResolveProduct(ln, products).name; }).length;
@@ -2990,6 +3356,7 @@ function rsvParsePurchaseOrder(grid) {
   var out = {
     poNo: poNo, poDate: poDate, round: round, company: company, country: country, lines: [], amount: 0,
     purpose: [country ? country + ' 수출' : '수출', yy && round ? yy + '-' + Number(round) + '차' : ''].filter(String).join(' '),
+    shipTo: rsvParseShipTo(grid),
   };
   if (hdr < 0) return out;
 
