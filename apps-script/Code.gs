@@ -914,7 +914,7 @@ function rsvSyncInvoices_(opts) {
       if (st === RSV_CONFIG.STATUS_CANCEL || !String(v[RSV_COL.name - 1]).trim()) return;
       rows.push({ row: RSV_CONFIG.FIRST_ROW + i, name: String(v[RSV_COL.name - 1]).trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
         foc: /\|foc/.test(key), shipDate: v[RSV_COL.shipDate - 1], useDate: v[RSV_COL.useDate - 1],
-        company: String(v[RSV_COL.company - 1] || '').trim(), display: '' });
+        company: String(v[RSV_COL.company - 1] || '').trim(), level: (key.match(/r+$/) || [''])[0].length });
     });
     var plan = rsvInvoicePlan(rows, issued, prices, now, RSV_CONFIG, !!opts.force);
     if (!plan.make.length && !plan.drop.length) return;
@@ -933,9 +933,10 @@ function rsvSyncInvoices_(opts) {
         var company = g.rows[0].company || String(rec[RSV_INV.company - 1] || '');
         var buyer = rsvFindBuyer(buyers, company, String(rec[RSV_INV.vendor - 1] || ''), RSV_CONFIG.INVOICE_COMPANY_ALIASES);
         if (!buyer) throw new Error('[' + RSV_CONFIG.INVOICE_BUYER_SHEET + ']에 업체 없음 (' + company + ')');
-        var fname = (rsvFmtYMD_(inv.date).slice(2).replace(/-/g, '') + '_거래명세서_' + poNo + '_' + (company || buyer.name) +
+        var poLabel = poNo + (g.seq ? '-' + g.seq : '');
+        var fname = (rsvFmtYMD_(inv.date).slice(2).replace(/-/g, '') + '_거래명세서_' + poLabel + '_' + (company || buyer.name) +
           (g.old && g.old.items !== inv.sig ? '_수정' : '')).replace(/[\\/:*?"<>|]/g, '-');
-        var blob = rsvBuildInvoiceBlob_(inv, buyer, String(rec[RSV_INV.shipTo - 1] || ''), poNo, fname);
+        var blob = rsvBuildInvoiceBlob_(inv, buyer, String(rec[RSV_INV.shipTo - 1] || ''), poLabel + (g.seq ? ' (' + g.seq + '차 출고분)' : ''), fname);
         var file = null;
         if (g.old) {
           // 같은 사용 예정일 묶음: 파일은 그대로 두고 내용·이름만 바꿈 (업체명 링크 유지)
@@ -946,7 +947,7 @@ function rsvSyncInvoices_(opts) {
           if (g.old) { try { DriveApp.getFileById(g.old.fileId).setTrashed(true); } catch (e) { /* 무시 */ } }
           file = rsvInvoiceFolder_(buyer, company).createFile(blob);
         }
-        keep.push({ key: g.key, fileId: file.getId(), url: file.getUrl(), name: file.getName(), sig: g.sig, items: inv.sig });
+        keep.push({ key: g.key, fileId: file.getId(), url: file.getUrl(), name: file.getName(), sig: g.sig, items: inv.sig, seq: g.seq });
         out.issued++;
         out.names.push(file.getName());
       } catch (err) {
@@ -958,7 +959,7 @@ function rsvSyncInvoices_(opts) {
     var urlByKey = {};
     keep.forEach(function (x) { urlByKey[x.key] = x.url; });
     rows.forEach(function (x) {
-      var key = x.useDate instanceof Date ? rsvFmtYMD_(rsvStartOfDay_(x.useDate)) : 'none';
+      var key = rsvInvoiceGroupKey(x);
       var c = res.getRange(x.row, RSV_COL.company), text = String(c.getDisplayValue() || x.company);
       if (!text) return;
       var b = SpreadsheetApp.newRichTextValue().setText(text);
@@ -990,26 +991,48 @@ function rsvInvoicePlan(rows, issued, prices, now, cfg, force) {
   var today = rsvStartOfDay_(now), DAY = 86400000;
   var groups = {}, order = [];
   rows.forEach(function (r) {
-    var d = r.useDate instanceof Date ? rsvStartOfDay_(r.useDate) : null;
-    var key = d ? rsvFmtYMD_(d) : 'none';
-    if (!groups[key]) { groups[key] = { key: key, date: d, rows: [] }; order.push(key); }
+    var key = rsvInvoiceGroupKey(r);
+    if (!groups[key]) { groups[key] = { key: key, date: r.useDate instanceof Date ? rsvStartOfDay_(r.useDate) : null, level: r.level || 0, rows: [] }; order.push(key); }
     groups[key].rows.push(r);
   });
   var make = [], drop = [];
   var byKey = {};
   issued.forEach(function (x) { byKey[x.key] = x; });
+  // 출고 차례 번호: 한 PO 가 여러 번 나가면(사용 예정일이 다르거나 일부 출고 후 잔여) -1, -2, -3 … (한 번에 다 나가면 번호 없음)
+  //  이미 발급한 묶음은 번호 유지, 새 묶음은 날짜 순으로 비어 있는 가장 작은 번호
+  order.sort(function (a, b) {
+    var ga = groups[a], gb = groups[b];
+    return (ga.date ? ga.date.getTime() : 9e15) - (gb.date ? gb.date.getTime() : 9e15) || ga.level - gb.level;
+  });
+  var multi = order.length > 1 || issued.some(function (x) { return x.seq > 0; });
+  var used = {};
+  if (multi) {
+    order.forEach(function (k) { var o = byKey[k]; if (o && o.seq > 0) { groups[k].seq = o.seq; used[o.seq] = true; } });
+    order.forEach(function (k) {
+      if (groups[k].seq) return;
+      var n = 1;
+      while (used[n]) n++;
+      groups[k].seq = n; used[n] = true;
+    });
+  }
   order.forEach(function (k) {
     var g = groups[k];
     var due = g.date ? (g.date - today) / DAY <= cfg.INVOICE_DAYS_BEFORE : false;
     if (!due && !force) return;
     var inv = rsvInvoiceContent(g.rows, prices, now, cfg.INVOICE_DATE_PICK);
-    var sig = rsvFmtYMD_(inv.date) + '#' + inv.sig;
+    var sig = rsvFmtYMD_(inv.date) + '#' + (g.seq || 0) + '#' + inv.sig;
     var old = byKey[k] || null;
     if (old && old.sig === sig && !force) return;
-    make.push({ key: k, rows: g.rows, inv: inv, sig: sig, old: old });
+    make.push({ key: k, rows: g.rows, inv: inv, sig: sig, old: old, seq: g.seq || 0 });
   });
   issued.forEach(function (x) { if (!groups[x.key] || (x.key === 'none')) drop.push(x); });
   return { make: make, drop: drop.filter(function (x) { return !make.some(function (m) { return m.old === x; }); }) };
+}
+
+/** 거래명세서 묶음 키 (순수 함수): 사용 예정일 + 일부 출고 잔여 단계(메일키 끝 r 개수) */
+function rsvInvoiceGroupKey(r) {
+  var d = r.useDate instanceof Date ? rsvStartOfDay_(r.useDate) : null;
+  return (d ? rsvFmtYMD_(d) : 'none') + (r.level ? '#r' + r.level : '');
 }
 
 /** Drive 파일 내용을 blob 으로 바꾸고 이름도 바꿈 (링크 유지). 반환: File */
