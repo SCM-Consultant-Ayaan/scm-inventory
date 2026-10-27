@@ -884,11 +884,15 @@ function rsvIssueSelectedInvoices() {
     if (n <= 0) return;
     sh.getRange(top, 1, n, RSV_LAST_COL).getValues().forEach(function (v) {
       var key = String(v[RSV_COL.mailKey - 1] || ''), m = key.match(/^po:(.+?)\|/);
-      if (!m || !String(v[RSV_COL.name - 1]).trim()) { if (String(v[RSV_COL.name - 1]).trim()) skipped++; return; }
-      var gk = rsvInvoiceGroupKey({ useDate: v[RSV_COL.useDate - 1], level: (key.match(/r+$/) || [''])[0].length });
-      targets[m[1]] = targets[m[1]] || [];
-      if (targets[m[1]].indexOf(gk) < 0) targets[m[1]].push(gk);
-      rowsByPo[m[1]] = rowsByPo[m[1]] || { created: v[RSV_COL.created - 1], company: String(v[RSV_COL.company - 1] || '') };
+      if (!String(v[RSV_COL.name - 1]).trim()) return;
+      // 메일 PO 행은 PO No., 수기 행은 업체 + 용도(G) 로 묶음
+      var id = m ? m[1] : rsvManualInvoiceId(v);
+      if (!id) { skipped++; return; }
+      var gk = rsvInvoiceGroupKey({ useDate: v[RSV_COL.useDate - 1], level: m ? (key.match(/r+$/) || [''])[0].length : 0 });
+      targets[id] = targets[id] || [];
+      if (targets[id].indexOf(gk) < 0) targets[id].push(gk);
+      rowsByPo[id] = rowsByPo[id] || { created: v[RSV_COL.created - 1], company: String(v[RSV_COL.company - 1] || ''),
+        purpose: String(v[RSV_COL.purpose - 1] || '') };
     });
   });
   var pos = Object.keys(targets);
@@ -898,15 +902,90 @@ function rsvIssueSelectedInvoices() {
   if (log.getLastRow() > 1) log.getRange(2, 1, log.getLastRow() - 1, 1).getValues().forEach(function (v) { known[String(v[0])] = true; });
   var errors = [];
   pos.forEach(function (po) {
-    if (known[po]) return;
-    try { if (!rsvInvoiceRecoverPo_(po, rowsByPo[po].created, rowsByPo[po].company)) errors.push(po + ': 메일에서 발주서를 못 찾음'); }
-    catch (e) { errors.push(po + ': ' + e.message); }
+    try {
+      if (po.indexOf('mn:') === 0) { rsvInvoiceRememberManual_(po, rowsByPo[po], !!known[po]); return; }
+      if (known[po]) return;
+      if (!rsvInvoiceRecoverPo_(po, rowsByPo[po].created, rowsByPo[po].company)) errors.push(po + ': 메일에서 발주서를 못 찾음');
+    } catch (e) { errors.push((po.indexOf('mn:') === 0 ? rowsByPo[po].purpose : po) + ': ' + e.message); }
   });
   var r = rsvSyncInvoices_({ targets: targets });
   errors = errors.concat(r.errors);
   var msg = (r.issued ? '거래명세서 ' + r.issued + '건 발급: ' + r.names.join(', ') : '발급된 거래명세서 없음') +
-    (skipped ? ' · 수기 행 ' + skipped + '개 제외(PO 없음)' : '') + (errors.length ? ' · ⚠ ' + errors.join(' / ') : '');
+    (skipped ? ' · 업체명·용도가 비어 있는 행 ' + skipped + '개 제외' : '') + (errors.length ? ' · ⚠ ' + errors.join(' / ') : '');
   try { SpreadsheetApp.getUi().alert('📑 거래명세서 발급', msg.replace(/ · /g, '\n'), SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { rsvToast_(msg); }
+}
+
+/** 수기 행(메일 PO 아님)의 거래명세서 묶음 ID: 'mn:업체|용도' (순수 함수). 업체·용도가 없으면 '' */
+function rsvManualInvoiceId(v) {
+  if (/^po:/.test(String(v[RSV_COL.mailKey - 1] || ''))) return '';
+  var c = String(v[RSV_COL.company - 1] || '').trim(), p = String(v[RSV_COL.purpose - 1] || '').trim();
+  return c && p ? 'mn:' + c + '|' + p : '';
+}
+
+/**
+ * 수기 묶음: 같은 업체가 메일로 보낸 최근 발주서의 같은 상품 단가와 SHIP TO 를 가져와 [거래명세서_발급]에 기억.
+ * 기억된 발주서로 모자라면 시트에 있는 그 업체의 최근 메일 PO 를 메일에서 다시 읽어 채운다 (최대 3건).
+ */
+function rsvInvoiceRememberManual_(id, info, exists) {
+  var ss = SpreadsheetApp.getActive(), res = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
+  var vals = res.getRange(RSV_CONFIG.FIRST_ROW, 1, rsvLastDataRow_(res) - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
+  var names = [];
+  vals.forEach(function (v) {
+    if (rsvManualInvoiceId(v) !== id) return;
+    if (/FOC/i.test(String(v[RSV_COL.memo - 1]) + String(v[RSV_COL.purpose - 1]))) return; // FOC 는 0원
+    var n = String(v[RSV_COL.name - 1]).trim();
+    if (n && names.indexOf(n) < 0) names.push(n);
+  });
+  var cn = rsvCompanyNorm(info.company);
+  var same = function (c) { var n = rsvCompanyNorm(c); return n && cn && (n.indexOf(cn) >= 0 || cn.indexOf(n) >= 0); };
+  var lookup = function () {
+    var log = rsvInvoiceSheet_();
+    var recs = log.getLastRow() > 1 ? log.getRange(2, 1, log.getLastRow() - 1, 5).getValues() : [];
+    return rsvLatestPrices(recs.filter(function (r) { return String(r[0]).indexOf('mn:') !== 0 && same(r[1]); }), names);
+  };
+  var found = lookup();
+  if (found.missing.length) {
+    // 그 업체의 메일 PO (최근 등록 순) 중 아직 기억 안 된 것을 메일에서 다시 읽음
+    var seen = {}, cands = [];
+    vals.forEach(function (v) {
+      var m = String(v[RSV_COL.mailKey - 1] || '').match(/^po:(.+?)\|/);
+      if (!m || seen[m[1]] || !same(v[RSV_COL.company - 1])) return;
+      seen[m[1]] = true;
+      cands.push({ po: m[1], created: v[RSV_COL.created - 1] });
+    });
+    cands.sort(function (a, b) { return (rsvToDate_(b.created, null) || 0) - (rsvToDate_(a.created, null) || 0); });
+    var log = rsvInvoiceSheet_(), known = {};
+    if (log.getLastRow() > 1) log.getRange(2, 1, log.getLastRow() - 1, 1).getValues().forEach(function (v) { known[String(v[0])] = true; });
+    cands.filter(function (c) { return !known[c.po]; }).slice(0, 3).forEach(function (c) {
+      if (!lookup().missing.length) return;
+      try { rsvInvoiceRecoverPo_(c.po, c.created, info.company); } catch (e) { /* 다음 후보 */ }
+    });
+    found = lookup();
+  }
+  var sh = rsvInvoiceSheet_();
+  var at = 0;
+  if (exists) sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().forEach(function (v, i) { if (String(v[0]) === id) at = i + 2; });
+  if (at) {
+    sh.getRange(at, RSV_INV.shipTo, 1, 2).setValues([[found.shipTo, JSON.stringify(found.prices)]]);
+  } else {
+    sh.appendRow([id, info.company, info.company, found.shipTo, JSON.stringify(found.prices), '', '', '', '', '']);
+  }
+  if (found.missing.length) throw new Error(info.company + ' 메일 발주서에서 단가를 못 찾은 품목: ' + found.missing.join(', '));
+}
+
+/**
+ * 최근 발주서 단가 (순수 함수). recs: [거래명세서_발급] 행 [PO, 업체, 발주서 업체명, SHIP TO, 단가 JSON] (아래일수록 최근)
+ * 반환: { prices: {상품명: 단가}, shipTo, missing: [단가 못 찾은 상품명] }
+ */
+function rsvLatestPrices(recs, names) {
+  var prices = {}, shipTo = '';
+  for (var i = recs.length - 1; i >= 0; i--) {
+    var p = {};
+    try { p = JSON.parse(recs[i][4] || '{}'); } catch (e) { p = {}; }
+    names.forEach(function (n) { if (prices[n] == null && p[n] != null && p[n] > 0) prices[n] = p[n]; });
+    if (!shipTo && recs[i][3]) shipTo = String(recs[i][3]);
+  }
+  return { prices: prices, shipTo: shipTo, missing: names.filter(function (n) { return prices[n] == null; }) };
 }
 
 /** 기억된 정보가 없는 PO: 등록일 앞뒤 메일에서 발주서 첨부를 찾아 단가·SHIP TO 를 기억. 찾으면 true */
@@ -958,16 +1037,17 @@ function rsvSyncInvoices_(opts) {
     var prices = {};
     try { prices = JSON.parse(rec[RSV_INV.prices - 1] || '{}'); } catch (e) { prices = {}; }
     var issued = rsvInvoiceIssued_(rec[RSV_INV.fileId - 1]);
-    var rows = [];
+    var rows = [], manual = poNo.indexOf('mn:') === 0;
     values.forEach(function (v, i) {
       var key = String(v[RSV_COL.mailKey - 1]);
-      if (key.indexOf('po:' + poNo + '|') !== 0) return;
+      if (manual ? rsvManualInvoiceId(v) !== poNo : key.indexOf('po:' + poNo + '|') !== 0) return;
       var st = String(v[RSV_COL.status - 1]).trim();
       if (st === RSV_CONFIG.STATUS_CANCEL || !String(v[RSV_COL.name - 1]).trim()) return;
       rows.push({ row: RSV_CONFIG.FIRST_ROW + i, name: String(v[RSV_COL.name - 1]).trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
-        foc: /\|foc/.test(key), shipDate: v[RSV_COL.shipDate - 1], useDate: v[RSV_COL.useDate - 1],
+        foc: /\|foc/.test(key) || (manual && /FOC/i.test(String(v[RSV_COL.memo - 1]) + String(v[RSV_COL.purpose - 1]))),
+        shipDate: v[RSV_COL.shipDate - 1], useDate: v[RSV_COL.useDate - 1],
         company: String(v[RSV_COL.company - 1] || '').trim(), purpose: String(v[RSV_COL.purpose - 1] || '').trim(),
-        level: (key.match(/r+$/) || [''])[0].length });
+        level: manual ? 0 : (key.match(/r+$/) || [''])[0].length });
     });
     var plan = rsvInvoicePlan(rows, issued, prices, now, RSV_CONFIG, !!opts.force, opts.targets ? opts.targets[poNo] : null);
     if (!plan.make.length && !plan.drop.length) return;
@@ -987,7 +1067,8 @@ function rsvSyncInvoices_(opts) {
         var buyer = rsvFindBuyer(buyers, company, String(rec[RSV_INV.vendor - 1] || ''), RSV_CONFIG.INVOICE_COMPANY_ALIASES);
         if (!buyer) throw new Error('[' + RSV_CONFIG.INVOICE_BUYER_SHEET + ']에 업체 없음 (' + company + ')');
         // 발주서 PO No. 칸이 수식 오류(#N/A 등)면 용도(차수)로 대신 표기
-        var poLabel = (/^#/.test(poNo) ? (g.rows[0].purpose || poNo) : poNo) + (g.seq ? '-' + g.seq : '');
+        //  수기 건은 용도(G)를 PO No. 로
+        var poLabel = (/^#|^mn:/.test(poNo) ? (g.rows[0].purpose || poNo) : poNo) + (g.seq ? '-' + g.seq : '');
         var fname = (rsvFmtYMD_(inv.date).slice(2).replace(/-/g, '') + '_거래명세서_' + poLabel + '_' + (company || buyer.name) +
           (g.old && g.old.items !== inv.sig ? '_수정' : '')).replace(/[\\/:*?"<>|]/g, '-');
         var blob = rsvBuildInvoiceBlob_(inv, buyer, String(rec[RSV_INV.shipTo - 1] || ''), poLabel + (g.seq ? ' (' + g.seq + '차 출고분)' : ''), fname);
