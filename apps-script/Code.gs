@@ -1268,6 +1268,88 @@ function rsvKoreanAmount(n) {
   return out;
 }
 
+/**
+ * 발주서 상단(업체명·사업자등록번호·담당자·이메일·연락처)으로 [B2B 거래업체정보] 갱신.
+ *  사업자번호 → 상호 순으로 업체를 찾고, 담당자·연락처·이메일이 바뀌었으면 고치고 '자동 갱신 기록' 열에 이전 값을 남긴다.
+ *  없는 업체면 새 줄로 추가 (대표자·주소·업태는 발주서에 없어서 비워 두고 노란색 표시). 반환: 결과 문구 ('' = 변경 없음)
+ */
+function rsvB2BUpsert_(po, company, msg) {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(RSV_CONFIG.INVOICE_BUYER_SHEET);
+  if (!sh || !po || !po.company) return '';
+  var lastCol = sh.getLastColumn();
+  var head = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(function (x) { return String(x).replace(/\s/g, ''); });
+  var col = function (k) { for (var i = 0; i < head.length; i++) if (head[i].indexOf(k) === 0) return i + 1; return 0; };
+  var addCol = function (title) { lastCol++; sh.getRange(1, lastCol).setValue(title).setFontWeight('bold'); head.push(title.replace(/\s/g, '')); return lastCol; };
+  var cName = col('상호'), cBrn = col('사업자'), cWho = col('담당자');
+  if (!cName) return '';
+  var cMail = col('이메일') || addCol('이메일');
+  var cLog = col('자동갱신') || addCol('자동 갱신 기록');
+
+  var mine = /@followmecorp\.com/i;
+  var fromAddr = (String(msg && msg.getFrom ? msg.getFrom() : '').match(/<([^>]+)>/) || [])[1] || String(msg && msg.getFrom ? msg.getFrom() : '').trim();
+  var info = rsvB2BInfoFromPo(po, mine.test(fromAddr) ? '' : fromAddr);
+  var stamp = rsvFmtDateTime_(new Date()), src = 'PO ' + po.poNo;
+
+  var n = sh.getLastRow() - 1;
+  var rows = n > 0 ? sh.getRange(2, 1, n, lastCol).getValues() : [];
+  var hit = rsvB2BFindRow(rows.map(function (r) { return { name: r[cName - 1], brn: cBrn ? r[cBrn - 1] : '' }; }),
+    info, company, RSV_CONFIG.INVOICE_COMPANY_ALIASES);
+  if (hit < 0) {
+    var row = new Array(lastCol);
+    for (var k = 0; k < lastCol; k++) row[k] = '';
+    row[cName - 1] = info.name;
+    if (cBrn) row[cBrn - 1] = info.brn;
+    if (cWho) row[cWho - 1] = [info.person, info.tel].filter(String).join(' · ');
+    row[cMail - 1] = info.email;
+    row[cLog - 1] = stamp + ' 신규 자동 추가 (' + src + ') — 대표자·주소·업태/종목 확인 필요';
+    var at = sh.getLastRow() + 1;
+    sh.getRange(at, 1, 1, lastCol).setValues([row]);
+    sh.getRange(at, 1, 1, lastCol).setBackground('#fff2cc');
+    return '거래업체 신규 추가: ' + info.name;
+  }
+  var r = rows[hit], at2 = hit + 2, changes = [];
+  var set = function (c, val, label) {
+    if (!c || !val) return;
+    var old = String(r[c - 1] || '').trim();
+    if (old === val) return;
+    sh.getRange(at2, c).setValue(val);
+    changes.push(label + " '" + (old || '빈칸') + "' → '" + val + "'");
+  };
+  if (cBrn && !String(r[cBrn - 1] || '').trim()) set(cBrn, info.brn, '사업자번호');
+  if (cWho && (info.person || info.tel)) {
+    var cur = String(r[cWho - 1] || '').split(/\s*·\s*/).map(function (s) { return s.trim(); });
+    var person = info.person || cur[0] || '', tel = info.tel || cur.slice(1).filter(function (s) { return s.indexOf('@') < 0; }).join(' · ');
+    var extra = cur.slice(1).filter(function (s) { return s.indexOf('@') >= 0; }); // 연락처 칸에 적어 둔 메일은 유지
+    set(cWho, [person, tel].concat(extra).filter(String).join(' · '), '담당자·연락처');
+  }
+  set(cMail, info.email, '이메일');
+  if (!changes.length) return '';
+  var log = String(r[cLog - 1] || '');
+  sh.getRange(at2, cLog).setValue((log ? log + '\n' : '') + stamp + ' ' + src + ': ' + changes.join(', '));
+  return '거래업체 정보 갱신: ' + r[cName - 1] + ' (' + changes.length + '건)';
+}
+
+/** 발주서 → 거래업체 정보 (순수 함수). 이메일이 없으면 보낸 사람 주소 */
+function rsvB2BInfoFromPo(po, fromAddr) {
+  var clean = function (s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); };
+  var email = clean(po.email);
+  if (!/@/.test(email)) email = clean(fromAddr);
+  return { name: clean(po.company), brn: clean(po.brn), person: clean(po.contact), tel: clean(po.tel), email: /@/.test(email) ? email : '' };
+}
+
+/** 업체 줄 찾기 (순수 함수): 사업자번호(숫자만 비교) → 상호·업체명(F)·별칭. 없으면 -1 */
+function rsvB2BFindRow(rows, info, company, aliases) {
+  var digits = function (s) { return String(s || '').replace(/\D/g, ''); };
+  var b = digits(info.brn);
+  if (b.length >= 10) {
+    for (var i = 0; i < rows.length; i++) if (digits(rows[i].brn) === b) return i;
+  }
+  var buyers = rows.map(function (r) { return { name: String(r.name || ''), norm: rsvCompanyNorm(r.name) }; });
+  var found = rsvFindBuyer(buyers.filter(function (x) { return x.norm; }), company || '', info.name, aliases);
+  return found ? buyers.indexOf(found) : -1;
+}
+
 /** [B2B 거래업체정보] → [{name, brn, ceo, addr, biz, item, person, tel, taxed, norm}] (헤더 이름으로 열을 찾음) */
 function rsvReadBuyers_(ss) {
   var sh = ss.getSheetByName(RSV_CONFIG.INVOICE_BUYER_SHEET);
@@ -1275,7 +1357,7 @@ function rsvReadBuyers_(ss) {
   var v = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
   var head = v[0].map(function (x) { return String(x).replace(/\s/g, ''); });
   var c = function (k) { for (var i = 0; i < head.length; i++) if (head[i].indexOf(k) === 0) return i; return -1; };
-  var cn = c('상호'), cb = c('사업자'), cc = c('대표'), ca = c('주소'), cz = c('업태'), cp = c('담당자'), ct = c('과세');
+  var cn = c('상호'), cb = c('사업자'), cc = c('대표'), ca = c('주소'), cz = c('업태'), cp = c('담당자'), ct = c('과세'), cl = c('자동갱신');
   var clean = function (s) { s = String(s || '').trim(); return /^\(.*없음.*\)$/.test(s) ? '' : s; };
   return v.slice(1).filter(function (r) { return String(r[cn] || '').trim(); }).map(function (r) {
     var biz = String(cz >= 0 ? r[cz] : '').split('/');
@@ -1286,7 +1368,7 @@ function rsvReadBuyers_(ss) {
       biz: clean(biz[0]), item: clean(biz.slice(1).join('/')), person: who[0] || '', tel: who.slice(1).join(' · '),
       taxed: ct >= 0 ? /과세|10/.test(String(r[ct])) && !/영세/.test(String(r[ct])) : null,
       norm: rsvCompanyNorm(name),
-      emails: (r.join(' ').match(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g) || []),
+      emails: (r.filter(function (x, i) { return i !== cl; }).join(' ').match(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g) || []),
     };
   });
 }
@@ -2125,6 +2207,7 @@ function rsvImportMail_() {
             if (!diff.length) { rsvWriteLog_(msg, fname, '변경 없음: 이미 등록된 발주와 수량 동일 · PO ' + po.poNo + ' · ' + po.purpose); return; }
             var req = rsvCreateChangeRequest_(po, diff, msg, fname, existing);
             try { rsvInvoiceRemember_(po, existing[0].company, products, msg.getId()); } catch (e) { /* 단가 기억 실패는 무시 */ }
+            try { var b2b2 = rsvB2BUpsert_(po, existing[0].company, msg); if (b2b2) rsvWriteLog_(msg, fname, b2b2); } catch (e) { /* 무시 */ }
             if (req.dup) { rsvWriteLog_(msg, fname, '건너뜀: 같은 내용의 변경요청 ' + req.id + ' 승인 대기 중'); return; }
             changes++;
             rsvWriteLog_(msg, fname, '변경요청 ' + req.id + ' · ' + diff.length + '건 · PO ' + po.poNo + ' · ' + po.purpose + ' → 승인 대기');
@@ -2168,6 +2251,7 @@ function rsvImportMail_() {
           sh.getRange(at, RSV_COL.mailKey, newRows.length, 1).setValues(newRows.map(function (r) { return [r[RSV_COL.mailKey - 1]]; }));
           added += newRows.length;
           try { rsvInvoiceRemember_(po, company, products, msg.getId()); } catch (e) { rsvWriteLog_(msg, fname, '⚠ 거래명세서 정보 저장 실패: ' + e.message); }
+          try { var b2b = rsvB2BUpsert_(po, company, msg); if (b2b) rsvWriteLog_(msg, fname, b2b); } catch (e) { rsvWriteLog_(msg, fname, '⚠ 거래업체 정보 갱신 실패: ' + e.message); }
           pos.push({ poNo: po.poNo, company: company || po.company, purpose: po.purpose, fname: fname,
             from: msg.getFrom(), firstRow: at, count: newRows.length });
           var unmatched = po.lines.filter(function (ln) { return !rsvResolveProduct(ln, products).name; }).length;
@@ -3851,6 +3935,10 @@ function rsvParsePurchaseOrder(grid) {
     poNo: poNo, poDate: poDate, round: round, company: company, country: country, lines: [], amount: 0,
     purpose: [country ? country + ' 수출' : '수출', yy && round ? yy + '-' + Number(round) + '차' : ''].filter(String).join(' '),
     shipTo: rsvParseShipTo(grid),
+    brn: String(label('사업자등록번호') || label('사업자번호') || '').trim(),
+    contact: String(label('담당자') || '').trim(),
+    email: String(label('이메일') || label('e-mail') || '').trim(),
+    tel: String(label('연락처') || '').trim(),
   };
   if (hdr < 0) return out;
 
