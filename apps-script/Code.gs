@@ -1721,10 +1721,13 @@ function rsvShowInvoiceMailDialog_(t, queue) {
       to = r.to; cc = r.cc;
     } catch (e) { thread = null; }
   }
-  if (!thread) {
-    var buyer = rsvFindBuyer(rsvReadBuyers_(ss), info.company, String(f.rec[RSV_INV.vendor - 1] || ''), RSV_CONFIG.INVOICE_COMPANY_ALIASES);
-    to = buyer && buyer.emails.length ? buyer.emails.join(', ') : '';
-  }
+  var buyer = null;
+  try { buyer = rsvFindBuyer(rsvReadBuyers_(ss), info.company, String(f.rec[RSV_INV.vendor - 1] || ''), RSV_CONFIG.INVOICE_COMPANY_ALIASES); } catch (e) { buyer = null; }
+  var newTo = buyer && buyer.emails.length ? buyer.emails.join(', ') : '';
+  if (!thread) to = newTo;
+  // 답장할 메일 찾기 기본 검색어: 거래처 메일 주소 → 없으면 업체명
+  var query = (buyer && buyer.emails.length ? 'from:(' + buyer.emails.join(' OR ') + ')' : '"' + info.company + '"') + ' newer_than:120d';
+  var cur = thread ? { id: msgId, label: '📌 발주 메일 · ' + origSubject, to: to, cc: cc, subject: rsvReplySubject(origSubject) } : null;
   var label = String(f.entry.name || file.getName()).replace(/\.xlsx$/, '');
   var parts = label.split('_거래명세서_');
   var poLabel = (parts[1] || label).replace(/_[^_]*$/, '');
@@ -1734,7 +1737,7 @@ function rsvShowInvoiceMailDialog_(t, queue) {
   var body = RSV_CONFIG.INVOICE_MAIL_BODY.replace('{po}', poLabel).replace('{company}', info.company)
     .replace('{date}', (parts[0] || '').replace(/^(\d\d)(\d\d)(\d\d)$/, '20$1-$2-$3')).replace('{count}', rows.length).replace('{qty}', rsvFmtNum_(qty));
   var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); };
-  var payload = JSON.stringify({ t: t, fileId: file.getId(), msgId: thread ? msgId : '', queue: queue }).replace(/</g, '\\u003c');
+  var payload = JSON.stringify({ t: t, fileId: file.getId(), cur: cur, newTo: newTo, queue: queue }).replace(/</g, '\\u003c');
   var html =
     '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:14px;color:#222}label{display:block;margin:8px 0 3px;font-weight:bold}' +
     'input[type=text],textarea{width:100%;box-sizing:border-box;padding:6px;font-size:13px;border:1px solid #ccc;border-radius:4px}' +
@@ -1746,7 +1749,12 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     '보내는 계정: <b>' + esc(me || '(트리거 설치한 계정)') + '</b>' +
     (sentBefore ? '<br><span class="warn">⚠ 이미 ' + esc(rsvFmtDateTime_(new Date(sentBefore))) + '에 보낸 거래명세서예요. 다시 보내면 한 번 더 발송됩니다.</span>' : '') +
     (queue.length ? '<br><span class="g">이어서 ' + queue.length + '건 더 확인합니다</span>' : '') + '</div>' +
-    (thread ? '<label><input type="checkbox" id="th" checked onchange="tog()"> 발주 메일 스레드에 전체 답장 <span class="g">(' + esc(origSubject) + ')</span></label>' : '') +
+    '<label>답장할 메일 <span class="g" style="font-weight:normal">(고르면 그 메일에 전체 답장 · 제목은 Re: 원래 제목)</span></label>' +
+    '<select id="mm" onchange="pick()" style="width:100%;padding:6px;font-size:13px"><option value="">✉️ 답장 안 함 — 새 메일로 보내기</option>' +
+    (cur ? '<option value="' + esc(cur.id) + '" selected>' + esc(cur.label) + '</option>' : '') + '</select>' +
+    '<div style="display:flex;gap:6px;margin-top:5px"><input type="text" id="q" value="' + esc(query) + '">' +
+    '<button type="button" onclick="srch()" style="white-space:nowrap;background:#e8eaed">🔍 메일 찾기</button></div>' +
+    '<div class="g" style="font-size:12px;margin-top:2px">Gmail 검색어 그대로 쓸 수 있어요 (예: <code>from:abc@x.com</code> <code>subject:PO</code> <code>"26-6차"</code>) <span id="qm"></span></div>' +
     '<label>받는 사람</label><input type="text" id="to" value="' + esc(to) + '">' +
     '<label>참조 (CC)</label><input type="text" id="cc" value="' + esc(cc) + '">' +
     '<label>제목</label><input type="text" id="su" value="' + esc(subject) + '">' +
@@ -1754,14 +1762,20 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     '<div style="margin-top:12px"><button id="s" onclick="go()">📧 보내기</button><button id="c" onclick="skip()">' + (queue.length ? '이 건 건너뛰기' : '취소') + '</button>' +
     '<span id="m" style="margin-left:6px"></span></div>' +
     '<script>var P=' + payload + ';' +
-    'var SU=document.getElementById("su").value,RE=' + JSON.stringify(rsvReplySubject(origSubject)).replace(/</g, '\\u003c') + ';' +
-    'function tog(){var on=document.getElementById("th")&&document.getElementById("th").checked;["to","cc","su"].forEach(function(i){document.getElementById(i).disabled=on;});' +
-    'document.getElementById("su").value=on?RE:SU;}tog();' +
-    'function go(){var m=document.getElementById("m");var th=document.getElementById("th");' +
-    'var d={t:P.t,fileId:P.fileId,msgId:(th&&th.checked)?P.msgId:"",to:document.getElementById("to").value,cc:document.getElementById("cc").value,' +
+    'var SU=document.getElementById("su").value,C={};if(P.cur)C[P.cur.id]=P.cur;' +
+    'function $(i){return document.getElementById(i);}' +
+    'function pick(){var c=C[$("mm").value];["to","cc","su"].forEach(function(i){$(i).disabled=!!c;});' +
+    'if(c){$("to").value=c.to;$("cc").value=c.cc;$("su").value=c.subject;}else{$("to").value=P.newTo;$("cc").value="";$("su").value=SU;}}pick();' +
+    'function srch(){var qm=$("qm");qm.textContent="찾는 중…";google.script.run.withSuccessHandler(function(list){' +
+    'var sel=$("mm"),keep=sel.value;for(var i=sel.options.length-1;i>0;i--){if(!P.cur||sel.options[i].value!==P.cur.id)sel.remove(i);}' +
+    'list.forEach(function(c){if(P.cur&&c.id===P.cur.id)return;C[c.id]=c;var o=document.createElement("option");o.value=c.id;o.textContent=c.label;sel.appendChild(o);});' +
+    'sel.value=C[keep]?keep:sel.value;qm.textContent=list.length+"개 찾음";})' +
+    '.withFailureHandler(function(e){qm.textContent="⚠ "+e.message;}).rsvInvoiceMailCandidates($("q").value);}srch();' +
+    'function go(){var m=document.getElementById("m");' +
+    'var d={t:P.t,fileId:P.fileId,msgId:$("mm").value,to:document.getElementById("to").value,cc:document.getElementById("cc").value,' +
     'subject:document.getElementById("su").value,body:document.getElementById("bo").value,queue:P.queue};' +
     'if(!d.msgId&&!d.to.trim()){m.textContent="받는 사람을 입력하세요";return;}' +
-    'if(!confirm("이 내용으로 보낼까요?\\n받는 사람: "+(d.msgId?"발주 메일 스레드 전체 답장":d.to)+"\\n제목: "+d.subject))return;' +
+    'if(!confirm("이 내용으로 보낼까요?\\n"+(d.msgId?"선택한 메일에 전체 답장\\n받는 사람: "+d.to:"받는 사람: "+d.to)+"\\n제목: "+d.subject))return;' +
     'document.getElementById("s").disabled=true;m.textContent="보내는 중…";' +
     'google.script.run.withSuccessHandler(function(r){m.textContent=r;if(!P.queue.length)setTimeout(function(){google.script.host.close()},1500);})' +
     '.withFailureHandler(function(e){document.getElementById("s").disabled=false;m.textContent="⚠ 실패: "+e.message;}).rsvSendInvoiceMail(d);}' +
@@ -1812,6 +1826,15 @@ function rsvSendInvoiceMail(d) {
   } else {
     if (String(d.cc || '').trim()) opts.cc = d.cc;
     GmailApp.sendEmail(d.to, d.subject, d.body, opts);
+  }
+  // 고른 답장 메일을 기억 (다음에 같은 PO 를 보낼 때 기본값)
+  if (d.msgId) {
+    try {
+      var lg = rsvInvoiceSheet_();
+      lg.getRange(2, 1, lg.getLastRow() - 1, 1).getValues().forEach(function (v, i) {
+        if (String(v[0]) === d.t.id) lg.getRange(i + 2, RSV_INV.msgId).setValue(d.msgId);
+      });
+    } catch (e) { /* 무시 */ }
   }
   var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
   var last = rsvLastDataRow_(sh);
@@ -1883,6 +1906,20 @@ function rsvInvoiceCancelGroup_(t) {
   return removed;
 }
 
+/** 확인 창 '메일 찾기': Gmail 검색 → 답장 후보 (스레드의 마지막 메일) */
+function rsvInvoiceMailCandidates(q) {
+  rsvAssertAllowed_();
+  var me = '';
+  try { me = Session.getEffectiveUser().getEmail(); } catch (e) { /* 무시 */ }
+  return GmailApp.search(String(q || '').trim() || 'newer_than:30d', 0, 15).map(function (th) {
+    var msgs = th.getMessages(), m = msgs[msgs.length - 1];
+    var r = rsvReplyAllRecipients(m.getFrom(), m.getTo(), m.getCc(), me);
+    var who = String(m.getFrom()).replace(/\s*<.*>$/, '').replace(/"/g, '');
+    return { id: m.getId(), to: r.to, cc: r.cc, subject: rsvReplySubject(th.getFirstMessageSubject()),
+      label: Utilities.formatDate(m.getDate(), Session.getScriptTimeZone(), 'M/d') + ' · ' + th.getFirstMessageSubject() + ' · ' + who + ' (' + msgs.length + '통)' };
+  });
+}
+
 /** 답장 제목 (순수 함수): 이미 Re:/RE:/회신: 이면 그대로, 아니면 'Re: ' 붙임 */
 function rsvReplySubject(subject) {
   var s = String(subject || '').trim();
@@ -1894,9 +1931,12 @@ function rsvReplyAllRecipients(from, to, cc, me) {
   var addr = function (s) { var m = String(s).match(/<([^>]+)>/); return (m ? m[1] : String(s)).trim().toLowerCase(); };
   var list = function (s) { return String(s || '').split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(function (x) { return x.trim(); }).filter(String); };
   var f = addr(from), mine = String(me || '').toLowerCase(), seen = {};
-  seen[f] = true;
+  var uniq = function (arr) { return arr.filter(function (x) { var a = addr(x); if (!a || seen[a]) return false; seen[a] = true; return true; }); };
   if (mine) seen[mine] = true;
-  var rest = list(to).concat(list(cc)).filter(function (x) { var a = addr(x); if (!a || seen[a]) return false; seen[a] = true; return true; });
+  // 마지막 메일을 내가 보냈으면 그 메일의 받는 사람에게 다시
+  if (mine && f === mine) { var t2 = uniq(list(to)); return { to: t2.join(', '), cc: uniq(list(cc)).join(', ') }; }
+  seen[f] = true;
+  var rest = uniq(list(to).concat(list(cc)));
   return { to: from, cc: rest.join(', ') };
 }
 
