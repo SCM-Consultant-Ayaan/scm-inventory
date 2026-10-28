@@ -933,7 +933,7 @@ function rsvIssueSelectedInvoices() {
   var errors = [];
   pos.forEach(function (po) {
     try {
-      if (po.indexOf('mn:') === 0) { rsvInvoiceRememberManual_(po, rowsByPo[po], !!known[po]); return; }
+      if (po.indexOf('mn:') === 0) { rsvInvoiceRememberManual_(po, rowsByPo[po], !!known[po], targets[po]); return; }
       if (known[po]) return;
       if (!rsvInvoiceRecoverPo_(po, rowsByPo[po].created, rowsByPo[po].company)) errors.push(po + ': 메일에서 발주서를 못 찾음');
     } catch (e) { errors.push((po.indexOf('mn:') === 0 ? rowsByPo[po].purpose : po) + ': ' + e.message); }
@@ -962,22 +962,29 @@ function rsvManualInvoiceId(v) {
  * 수기 묶음: 같은 업체가 메일로 보낸 최근 발주서의 같은 상품 단가와 SHIP TO 를 가져와 [거래명세서_발급]에 기억.
  * 기억된 발주서로 모자라면 시트에 있는 그 업체의 최근 메일 PO 를 메일에서 다시 읽어 채운다 (최대 3건).
  */
-function rsvInvoiceRememberManual_(id, info, exists) {
+function rsvInvoiceRememberManual_(id, info, exists, keys) {
   var ss = SpreadsheetApp.getActive(), res = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
   var vals = res.getRange(RSV_CONFIG.FIRST_ROW, 1, rsvLastDataRow_(res) - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
-  var names = [];
-  vals.forEach(function (v) {
-    if (rsvManualInvoiceId(v) !== id) return;
-    if (/FOC/i.test(String(v[RSV_COL.memo - 1]) + String(v[RSV_COL.purpose - 1]))) return; // FOC 는 0원
+  // 이번에 발급할 묶음(사용 예정일)의 상품만 단가를 찾는다 (예전에 출고된 행까지 찾으면 메일을 많이 뒤져 느려짐)
+  var names = [], tg = rsvInvoiceTargets(vals);
+  vals.forEach(function (v, i) {
+    var t = tg[i];
+    if (!t || t.excluded || t.id !== id || t.foc) return; // FOC 는 0원
+    if (keys && keys.indexOf(t.key) < 0) return;
     var n = String(v[RSV_COL.name - 1]).trim();
     if (n && names.indexOf(n) < 0) names.push(n);
   });
+  // 업체별 고정 단가가 있는 상품은 찾을 필요 없음
+  var fixed = rsvApplyPriceList({}, names.map(function (n) { return { name: n }; }), info.company, RSV_CONFIG.INVOICE_PRICE_LIST);
   var cn = rsvCompanyNorm(info.company);
   var same = function (c) { var n = rsvCompanyNorm(c); return n && cn && (n.indexOf(cn) >= 0 || cn.indexOf(n) >= 0); };
   var lookup = function () {
     var log = rsvInvoiceSheet_();
     var recs = log.getLastRow() > 1 ? log.getRange(2, 1, log.getLastRow() - 1, 5).getValues() : [];
-    return rsvLatestPrices(recs.filter(function (r) { return String(r[0]).indexOf('mn:') !== 0 && same(r[1]); }), names);
+    var f = rsvLatestPrices(recs.filter(function (r) { return String(r[0]).indexOf('mn:') !== 0 && same(r[1]); }), names);
+    Object.keys(fixed).forEach(function (n) { f.prices[n] = fixed[n]; });
+    f.missing = f.missing.filter(function (n) { return fixed[n] == null; });
+    return f;
   };
   var found = lookup();
   if (found.missing.length) {
@@ -992,7 +999,7 @@ function rsvInvoiceRememberManual_(id, info, exists) {
     cands.sort(function (a, b) { return (rsvToDate_(b.created, null) || 0) - (rsvToDate_(a.created, null) || 0); });
     var log = rsvInvoiceSheet_(), known = {};
     if (log.getLastRow() > 1) log.getRange(2, 1, log.getLastRow() - 1, 1).getValues().forEach(function (v) { known[String(v[0])] = true; });
-    cands.filter(function (c) { return !known[c.po]; }).slice(0, 3).forEach(function (c) {
+    cands.filter(function (c) { return !known[c.po]; }).slice(0, 2).forEach(function (c) {
       if (!lookup().missing.length) return;
       try { rsvInvoiceRecoverPo_(c.po, c.created, info.company); } catch (e) { /* 다음 후보 */ }
     });
@@ -1002,7 +1009,10 @@ function rsvInvoiceRememberManual_(id, info, exists) {
   var at = 0;
   if (exists) sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().forEach(function (v, i) { if (String(v[0]) === id) at = i + 2; });
   if (at) {
-    sh.getRange(at, RSV_INV.shipTo, 1, 2).setValues([[found.shipTo, JSON.stringify(found.prices)]]);
+    var merged = {};
+    try { merged = JSON.parse(sh.getRange(at, RSV_INV.prices).getValue() || '{}'); } catch (e) { merged = {}; }
+    Object.keys(found.prices).forEach(function (n) { merged[n] = found.prices[n]; });
+    sh.getRange(at, RSV_INV.shipTo, 1, 2).setValues([[found.shipTo || sh.getRange(at, RSV_INV.shipTo).getValue(), JSON.stringify(merged)]]);
   } else {
     sh.appendRow([id, info.company, info.company, found.shipTo, JSON.stringify(found.prices), '', '', '', '', '', '']);
   }
@@ -1030,8 +1040,9 @@ function rsvInvoiceRecoverPo_(poNo, created, company) {
   var after = new Date(d.getTime() - 3 * 86400000), before = new Date(d.getTime() + 3 * 86400000);
   var q = RSV_CONFIG.MAIL_QUERY + ' after:' + Math.floor(after.getTime() / 1000) + ' before:' + Math.floor(before.getTime() / 1000);
   var products = rsvReadProducts_(SpreadsheetApp.getActive());
-  var threads = GmailApp.search(q, 0, 30);
+  var threads = GmailApp.search(q, 0, 15), started = Date.now();
   for (var t = 0; t < threads.length; t++) {
+    if (Date.now() - started > 40000) break; // 너무 오래 걸리면 포기 (창이 멈춘 것처럼 보이지 않게)
     var msgs = threads[t].getMessages();
     for (var m = msgs.length - 1; m >= 0; m--) {
       var atts = msgs[m].getAttachments();
@@ -1597,7 +1608,13 @@ function rsvStartInvoiceMail_(rowNums) {
       '<div style="font-family:Arial,\'Malgun Gothic\',sans-serif;font-size:14px;padding:24px;text-align:center">⏳ 거래명세서 확인 중…<br>' +
       '<span style="color:#777;font-size:12px">처음 발급하거나 내용이 바뀌었으면 10~20초 걸려요</span></div>').setWidth(360).setHeight(130), '📧 거래명세서 메일');
   } catch (e) { /* 화면 없음 */ }
-  rsvShowInvoiceMailDialog_(queue[0], queue.slice(1));
+  try {
+    rsvShowInvoiceMailDialog_(queue[0], queue.slice(1));
+  } catch (err) {
+    // 오류가 나도 '확인 중' 창에 멈춰 있지 않게 알림창으로 바꾸고 체크 해제
+    rowNums.forEach(function (row) { try { rsvUncheckUnsent_(sh, row); } catch (x) { /* 무시 */ } });
+    try { SpreadsheetApp.getUi().alert('📧 거래명세서 메일', '⚠ 준비 중 오류: ' + err.message, SpreadsheetApp.getUi().ButtonSet.OK); } catch (x) { /* 무시 */ }
+  }
 }
 
 /**
@@ -1662,7 +1679,7 @@ function rsvInvoiceForMail_(t, rowsInfo) {
   if (!f || !f.entry || !f.entry.fileId) {
     // 아직 발급 전: 셀 선택 발급과 같은 방법으로 지금 발급
     if (!f) {
-      if (t.id.indexOf('mn:') === 0) rsvInvoiceRememberManual_(t.id, rowsInfo, false);
+      if (t.id.indexOf('mn:') === 0) rsvInvoiceRememberManual_(t.id, rowsInfo, false, [t.key]);
       else if (!rsvInvoiceRecoverPo_(t.id, rowsInfo.created, rowsInfo.company)) throw new Error('메일에서 발주서를 못 찾아 거래명세서를 만들 수 없음');
     }
     var targets = {};
