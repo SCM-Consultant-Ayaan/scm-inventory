@@ -327,6 +327,8 @@ function rsvOnEditTrigger(e) {
     // W 거래명세서 메일 체크 → 확인 창
     if (e.range.getColumn() <= RSV_COL.mailSend && e.range.getLastColumn() >= RSV_COL.mailSend) {
       if (e.range.getNumRows() === 1 && String(e.value).toUpperCase() === 'TRUE') rsvStartInvoiceMail_([e.range.getRow()]);
+      // 체크를 직접 해제 (아직 안 보낸 건) → 거래명세서 파일 삭제 + 업체명 링크 해제
+      else if (e.range.getNumRows() === 1 && String(e.value).toUpperCase() === 'FALSE') rsvInvoiceUncheckRow_(e.range.getRow());
       return;
     }
     if (e.range.getColumn() > RSV_COL.priority) return;
@@ -1199,6 +1201,7 @@ function rsvInvoicePlan(rows, issued, prices, now, cfg, force, onlyKeys) {
     var inv = rsvInvoiceContent(g.rows, prices, now, cfg.INVOICE_DATE_PICK);
     var sig = rsvFmtYMD_(inv.date) + '#' + (g.seq || 0) + '#' + inv.sig;
     var old = byKey[k] || null;
+    if (old && old.cancelled && !onlyKeys) return; // 메일 발송 취소로 지운 묶음은 자동으로 다시 만들지 않음
     if (old && old.sig === sig && !force) return;
     make.push({ key: k, rows: g.rows, inv: inv, sig: sig, old: old, seq: g.seq || 0 });
   });
@@ -1656,7 +1659,7 @@ function rsvInvoiceForMail_(t, rowsInfo) {
     return null;
   };
   var f = find();
-  if (!f || !f.entry) {
+  if (!f || !f.entry || !f.entry.fileId) {
     // 아직 발급 전: 셀 선택 발급과 같은 방법으로 지금 발급
     if (!f) {
       if (t.id.indexOf('mn:') === 0) rsvInvoiceRememberManual_(t.id, rowsInfo, false);
@@ -1664,7 +1667,7 @@ function rsvInvoiceForMail_(t, rowsInfo) {
     }
     var targets = {};
     targets[t.id] = [t.key];
-    var r = rsvSyncInvoices_({ targets: targets });
+    var r = rsvSyncInvoices_({ targets: targets, regen: true });
     if (r.errors.length) throw new Error(r.errors.join(' / '));
     f = find();
   } else {
@@ -1674,7 +1677,7 @@ function rsvInvoiceForMail_(t, rowsInfo) {
     rsvSyncInvoices_({ targets: tg }); // 내용이 바뀐 경우만 새로 만듦
     f = find();
   }
-  if (!f || !f.entry) throw new Error('거래명세서 파일을 만들지 못함');
+  if (!f || !f.entry || !f.entry.fileId) throw new Error('거래명세서 파일을 만들지 못함');
   return f;
 }
 
@@ -1727,7 +1730,7 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     'textarea{height:150px}.box{background:#f1f3f4;border-radius:6px;padding:8px 10px;line-height:1.6}.warn{color:#b45f06;font-weight:bold}' +
     'button{border:0;border-radius:4px;padding:9px 16px;font-size:13px;cursor:pointer;margin-right:6px}#s{background:#1a73e8;color:#fff}#c{background:#e8eaed}' +
     '.g{color:#777}</style>' +
-    '<div class="box">📎 <a href="' + esc(file.getUrl()) + '" target="_blank">' + esc(file.getName()) + '</a><br>' +
+    '<div class="box">📎 <b>' + esc(file.getName().replace(/\.xlsx$/i, '.pdf')) + '</b> <span class="g">(PDF로 바꿔 첨부 · 원본 <a href="' + esc(file.getUrl()) + '" target="_blank">xlsx</a>)</span><br>' +
     esc(info.company) + ' · ' + esc(info.purpose) + ' · ' + rows.length + '행 / ' + rsvFmtNum_(qty) + '개 <span class="g">(' + rows.join(', ') + '행)</span><br>' +
     '보내는 계정: <b>' + esc(me || '(트리거 설치한 계정)') + '</b>' +
     (sentBefore ? '<br><span class="warn">⚠ 이미 ' + esc(rsvFmtDateTime_(new Date(sentBefore))) + '에 보낸 거래명세서예요. 다시 보내면 한 번 더 발송됩니다.</span>' : '') +
@@ -1763,7 +1766,20 @@ function rsvInvoiceMailCancel(t, queue) {
   var last = rsvLastDataRow_(sh);
   var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_EXTRA_LAST_COL).getValues();
   rsvInvoiceGroupRows_(values, t).forEach(function (r) { rsvUncheckUnsent_(sh, r); });
+  try { rsvInvoiceCancelGroup_(t); } catch (e) { console.error('거래명세서 취소 정리 오류', e); }
   if (queue && queue.length) rsvShowInvoiceMailDialog_(queue[0], queue.slice(1));
+}
+
+/** W 체크를 직접 해제한 행: 그 묶음 거래명세서 정리 */
+function rsvInvoiceUncheckRow_(row) {
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(sh);
+  if (row < RSV_CONFIG.FIRST_ROW || row > last) return;
+  var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_EXTRA_LAST_COL).getValues();
+  var t = rsvInvoiceTargets(values)[row - RSV_CONFIG.FIRST_ROW];
+  if (!t || t.excluded) return;
+  var removed = rsvInvoiceCancelGroup_({ id: t.id, key: t.key });
+  if (removed) rsvToast_('발송 취소 → 거래명세서 삭제: ' + removed);
 }
 
 /** 아직 보낸 날짜(Y)가 없는 행의 W 체크 해제 */
@@ -1775,7 +1791,7 @@ function rsvUncheckUnsent_(sh, row) {
 /** 확인 창의 '보내기' → 발송 후 W 체크 · X 제목 · Y 보낸 날짜 */
 function rsvSendInvoiceMail(d) {
   rsvAssertAllowed_();
-  var blob = DriveApp.getFileById(d.fileId).getBlob();
+  var blob = rsvInvoicePdfBlob_(d.fileId);
   var opts = { attachments: [blob], name: RSV_CONFIG.INVOICE_MAIL_FROM_NAME || undefined };
   if (d.msgId) {
     opts.subject = d.subject;
@@ -1792,6 +1808,66 @@ function rsvSendInvoiceMail(d) {
   var msg = '✅ 보냄 (' + rows.length + '행 표시)';
   if (d.queue && d.queue.length) rsvShowInvoiceMailDialog_(d.queue[0], d.queue.slice(1));
   return msg;
+}
+
+/** 거래명세서 xlsx → PDF blob (임시 구글 시트로 바꿔 A4 세로·폭 맞춤으로 내보낸 뒤 임시 파일 삭제) */
+function rsvInvoicePdfBlob_(fileId) {
+  var src = DriveApp.getFileById(fileId);
+  var res = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + fileId + '/copy?fields=id&supportsAllDrives=true', {
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify({ name: '[임시 PDF] ' + src.getName(), mimeType: MimeType.GOOGLE_SHEETS }),
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() >= 300) throw new Error('PDF 변환 실패 (' + res.getResponseCode() + ')');
+  var tmpId = JSON.parse(res.getContentText()).id;
+  try {
+    var gid = SpreadsheetApp.openById(tmpId).getSheets()[0].getSheetId();
+    var url = 'https://docs.google.com/spreadsheets/d/' + tmpId + '/export?format=pdf&gid=' + gid +
+      '&size=A4&portrait=true&fitw=true&gridlines=false&printtitle=false&sheetnames=false&pagenum=UNDEFINED' +
+      '&top_margin=0.5&bottom_margin=0.5&left_margin=0.5&right_margin=0.5&horizontal_alignment=CENTER';
+    var pdf = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+    if (pdf.getResponseCode() !== 200) throw new Error('PDF 내보내기 실패 (' + pdf.getResponseCode() + ')');
+    return pdf.getBlob().setName(src.getName().replace(/\.xlsx$/i, '') + '.pdf');
+  } finally {
+    try { DriveApp.getFileById(tmpId).setTrashed(true); } catch (e) { /* 임시 파일 정리 실패는 무시 */ }
+  }
+}
+
+/**
+ * 메일 발송 취소: 그 묶음 거래명세서 파일을 휴지통으로, 업체명(F) 링크 해제.
+ * 자동 발급(D-2)이 다시 만들지 않도록 '취소됨'으로 기록 (셀 선택 발급·메일 체크로는 다시 만들 수 있음).
+ * 이미 보낸(Y 날짜 있는) 묶음은 건드리지 않는다. 반환: 지운 파일 이름 ('' = 없음)
+ */
+function rsvInvoiceCancelGroup_(t) {
+  var ss = SpreadsheetApp.getActive(), res = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(res);
+  var values = res.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_EXTRA_LAST_COL).getValues();
+  var rows = rsvInvoiceGroupRows_(values, t);
+  if (rows.some(function (r) { return values[r - RSV_CONFIG.FIRST_ROW][RSV_COL.mailSentAt - 1]; })) return '';
+  var log = ss.getSheetByName(RSV_CONFIG.INVOICE_LOG_SHEET);
+  var removed = '';
+  if (log && log.getLastRow() > 1) {
+    var ids = log.getRange(2, 1, log.getLastRow() - 1, 1).getValues();
+    for (var i = 0; i < ids.length; i++) {
+      if (String(ids[i][0]) !== t.id) continue;
+      var cell = log.getRange(i + 2, RSV_INV.fileId);
+      var issued = rsvInvoiceIssued_(cell.getValue());
+      issued = issued.map(function (x) {
+        if (x.key !== t.key || x.cancelled) return x;
+        try { if (x.fileId) { DriveApp.getFileById(x.fileId).setTrashed(true); removed = x.name || x.fileId; } } catch (e) { /* 이미 없음 */ }
+        return { key: x.key, sig: x.sig, items: x.items, seq: x.seq, cancelled: true, fileId: '', url: '', name: '' };
+      });
+      cell.setValue(JSON.stringify(issued));
+      log.getRange(i + 2, RSV_INV.fileName).setValue(issued.map(function (x) { return x.name; }).filter(String).join('\n'));
+      log.getRange(i + 2, RSV_INV.url).setValue(issued.map(function (x) { return x.url; }).filter(String).join('\n'));
+      break;
+    }
+  }
+  rows.forEach(function (r) {
+    var c = res.getRange(r, RSV_COL.company), text = String(c.getDisplayValue() || '');
+    if (text) c.setRichTextValue(SpreadsheetApp.newRichTextValue().setText(text).build());
+  });
+  return removed;
 }
 
 /** 전체 답장 받는 사람 (순수 함수): 받는 사람 = 보낸 사람, 참조 = 원래 받는 사람·참조 (나·보낸 사람 제외) */
