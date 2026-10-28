@@ -182,6 +182,10 @@ var RSV_CONFIG = {
   // 이미 등록된 PO 의 수정 발주서가 오면 바로 바꾸지 않고 변경요청으로 올린다.
   // 담당자 멘션 (예: '<@U01ABCDEF>' 또는 '<!subteam^S0123>'), 비우면 멘션 없이 채널에 알림
   CHANGE_NOTIFY_MENTION: '',
+  // 변경요청 슬랙 알림에 ✅ 승인 / ❌ 반려 버튼 (웹 앱 배포 + 슬랙 앱 Interactivity 설정 필요)
+  CHANGE_BUTTONS: true,
+  // 버튼을 누를 수 있는 슬랙 사용자 ID (비우면 채널의 누구나)
+  CHANGE_APPROVERS: [],
   // 변경요청 스레드에서 승인/반려로 인정하는 답글
   CHANGE_APPROVE_REPLY: /^\s*(승인|ok|오케이)/i,
   CHANGE_REJECT_REPLY: /^\s*(반려|거절)/,
@@ -277,7 +281,8 @@ function rsvOnOpen() {
       .addItem('초기 설정 / 구조 업데이트 (+ 트리거 설치)', 'rsvSetup')
       .addItem('트리거만 다시 설치', 'rsvInstallTriggers')
       .addItem('자동화 중지 (트리거 삭제)', 'rsvRemoveTriggers')
-      .addItem('슬랙 알림 테스트', 'rsvTestSlack'))
+      .addItem('슬랙 알림 테스트', 'rsvTestSlack')
+      .addItem('승인 대기 변경요청 알림에 버튼 붙이기', 'rsvAddChangeButtons'))
     .addToUi();
   try { if (rsvIsAllowed_()) rsvShowPendingDemotions_(); } catch (e) { /* 메뉴만 */ }
 }
@@ -348,6 +353,7 @@ function rsvRunScheduled() {
   }
   try { rsvCheckSlackThreads_(); } catch (err) { console.error('슬랙 스레드 확인 오류', err); }
   try { rsvCheckChangeThreads_(); } catch (err) { console.error('변경요청 스레드 확인 오류', err); }
+  try { rsvProcessSlackDecisions(); } catch (err) { console.error('슬랙 버튼 처리 오류', err); } // 버튼 트리거가 못 돌았을 때 대비
   var lastEdit = Number(PropertiesService.getScriptProperties().getProperty('RSV_LAST_EDIT') || 0);
   var idle = Date.now() - lastEdit >= RSV_CONFIG.SORT_IDLE_MINUTES * 60000;
   rsvNotifySlack_(res.pos, rsvRunAllocation({ sort: idle }).conversions);
@@ -3256,12 +3262,15 @@ function rsvCreateChangeRequest_(po, diff, msg, fname, existing) {
       RSV_CONFIG.CHANGE_NOTIFY_MENTION + '\n' +
       '• PO ' + po.poNo + ' · 변경 ' + diff.length + '건 (' +
       Object.keys(count).map(function (t) { return t + ' ' + count[t]; }).join(' · ') + ')  `' + id + '`\n' +
-      (actionable ? '• 상세는 스레드에 :point_down:  ·  스레드에 *승인* / *반려* 답글' : '• 상세는 스레드에 :point_down:  ·  확인만 필요 (자동 반영 없음)');
+      (actionable ? '• 상세는 스레드에 :point_down:  ·  아래 버튼 또는 스레드에 *승인* / *반려* 답글' : '• 상세는 스레드에 :point_down:  ·  확인만 필요 (자동 반영 없음)');
     var detail = diff.map(function (d) {
         return '• ' + d.name + ' — ' + rsvFmtNum_(d.oldQty) + ' → *' + rsvFmtNum_(d.newQty) + '* (' + d.type + (d.missing ? ', 발주서에서 빠짐' : '') + ')';
       }).join('\n') + '\n' +
       '<' + link + '|변경요청 시트 열기>  ·  메일: ' + mail.replace(/[<>]/g, '');
-    var sent = rsvPostSlackThreaded_(head, detail);
+    // 승인/반려 버튼 (웹 앱 배포 + 슬랙 Interactivity 설정 후 동작. 버튼 없이 답글로도 처리 가능)
+    var sent = rsvPostSlack_(head, null, actionable && RSV_CONFIG.CHANGE_BUTTONS ? rsvChangeBlocks(head, id) : null);
+    if (sent && sent.ts) { try { rsvPostSlack_(detail, sent.ts); } catch (e) { console.error('슬랙 스레드 상세 전송 실패', e); } }
+    else if (!sent) rsvPostSlack_(detail);
     if (sent && sent.ts && actionable) {
       var props = PropertiesService.getScriptProperties();
       var map = JSON.parse(props.getProperty('RSV_CHANGE_THREADS') || '{}');
@@ -3424,6 +3433,166 @@ function rsvCheckChangeThreads_() {
   });
   if (changed) props.setProperty('RSV_CHANGE_THREADS', JSON.stringify(map));
   return handled;
+}
+
+// =====================================================================
+// 슬랙 승인 / 반려 버튼 (변경요청) — 웹 앱(doPost)으로 버튼 클릭을 받는다
+// =====================================================================
+
+/** 변경요청 알림 블록: 본문 + 승인/반려 버튼 (순수 함수) */
+function rsvChangeBlocks(text, id) {
+  return [
+    { type: 'section', text: { type: 'mrkdwn', text: text } },
+    { type: 'actions', block_id: 'rsv_chg', elements: [
+      { type: 'button', action_id: 'rsv_chg_approve', style: 'primary', text: { type: 'plain_text', text: '✅ 승인' }, value: id,
+        confirm: { title: { type: 'plain_text', text: '승인할까요?' }, text: { type: 'mrkdwn', text: '`' + id + '` 변경을 [예약 재고 관리]에 반영합니다.' },
+          confirm: { type: 'plain_text', text: '승인' }, deny: { type: 'plain_text', text: '취소' } } },
+      { type: 'button', action_id: 'rsv_chg_reject', style: 'danger', text: { type: 'plain_text', text: '❌ 반려' }, value: id,
+        confirm: { title: { type: 'plain_text', text: '반려할까요?' }, text: { type: 'mrkdwn', text: '`' + id + '` 변경을 반영하지 않습니다.' },
+          confirm: { type: 'plain_text', text: '반려' }, deny: { type: 'plain_text', text: '취소' } } },
+    ] },
+  ];
+}
+
+/** 버튼을 없애고 상태 줄로 바꾼 블록 (순수 함수) */
+function rsvChangeDoneBlocks(text, status) {
+  return [
+    { type: 'section', text: { type: 'mrkdwn', text: text } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: status }] },
+  ];
+}
+
+/**
+ * 슬랙 버튼 클릭 (Interactivity Request URL = 이 프로젝트의 웹 앱 주소).
+ * 슬랙은 3초 안에 응답을 기다리므로 여기서는 결정만 기록하고 버튼을 '처리 중'으로 바꾼 뒤,
+ * 실제 반영은 몇 초 뒤 트리거(rsvProcessSlackDecisions)에서 한다. (10분 주기에서도 다시 확인)
+ */
+function doPost(e) {
+  var ok = ContentService.createTextOutput('');
+  try {
+    var raw = e && e.parameter && e.parameter.payload;
+    if (!raw) return ok;
+    var p = JSON.parse(raw);
+    var props = PropertiesService.getScriptProperties();
+    var token = props.getProperty('SLACK_VERIFICATION_TOKEN');
+    if (!token || p.token !== token) return ok; // 슬랙에서 온 요청만
+    if (p.type !== 'block_actions' || !p.actions || !p.actions.length) return ok;
+    var a = p.actions[0];
+    if (!/^rsv_chg_(approve|reject)$/.test(a.action_id)) return ok;
+    var id = String(a.value || ''), decision = a.action_id === 'rsv_chg_approve' ? '승인' : '반려';
+    var uid = p.user && p.user.id, who = '슬랙 버튼 <@' + uid + '>';
+    var text = (p.message && p.message.blocks && p.message.blocks[0] && p.message.blocks[0].text && p.message.blocks[0].text.text) ||
+      (p.message && p.message.text) || '';
+    var approvers = RSV_CONFIG.CHANGE_APPROVERS || [];
+    if (approvers.length && approvers.indexOf(uid) < 0) {
+      rsvSlackRespond_(p.response_url, { response_type: 'ephemeral', replace_original: false, text: '⚠ 승인/반려 권한이 없어요 (CHANGE_APPROVERS)' });
+      return ok;
+    }
+    var lock = LockService.getScriptLock();
+    lock.waitLock(10000);
+    try {
+      var map = JSON.parse(props.getProperty('RSV_CHG_BUTTONS') || '{}');
+      if (map[id]) {
+        rsvSlackRespond_(p.response_url, { response_type: 'ephemeral', replace_original: false, text: '이미 ' + map[id].decision + ' 처리 중이에요' });
+        return ok;
+      }
+      map[id] = { decision: decision, who: who, ts: p.message && p.message.ts, channel: p.channel && p.channel.id, text: text, at: Date.now() };
+      props.setProperty('RSV_CHG_BUTTONS', JSON.stringify(map));
+    } finally {
+      lock.releaseLock();
+    }
+    rsvSlackRespond_(p.response_url, { replace_original: true, text: text,
+      blocks: rsvChangeDoneBlocks(text, '⏳ *' + decision + '* 처리 중… · <@' + uid + '>') });
+    // 몇 초 뒤 반영 (이미 예약된 트리거가 있으면 그대로)
+    var has = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'rsvProcessSlackDecisions'; });
+    if (!has) ScriptApp.newTrigger('rsvProcessSlackDecisions').timeBased().after(5 * 1000).create();
+  } catch (err) {
+    console.error('슬랙 버튼 처리 오류', err);
+  }
+  return ok;
+}
+
+function rsvSlackRespond_(url, body) {
+  if (!url) return;
+  try {
+    UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json; charset=utf-8', payload: JSON.stringify(body), muteHttpExceptions: true });
+  } catch (e) { console.error('슬랙 response_url 실패', e); }
+}
+
+/** 버튼으로 기록된 승인/반려를 시트에 반영하고 슬랙 메시지·스레드에 결과 표시 */
+function rsvProcessSlackDecisions() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'rsvProcessSlackDecisions') ScriptApp.deleteTrigger(t);
+  });
+  var props = PropertiesService.getScriptProperties();
+  var map = JSON.parse(props.getProperty('RSV_CHG_BUTTONS') || '{}');
+  var ids = Object.keys(map);
+  if (!ids.length) return;
+  var cs = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.CHANGE_SHEET);
+  var threads = JSON.parse(props.getProperty('RSV_CHANGE_THREADS') || '{}');
+  ids.forEach(function (id) {
+    var x = map[id], results = [];
+    try {
+      var last = cs.getLastRow();
+      var vals = last >= 2 ? cs.getRange(2, 1, last - 1, RSV_CHG.result).getValues() : [];
+      vals.forEach(function (v, i) {
+        if (v[RSV_CHG.id - 1] === id && v[RSV_CHG.status - 1] === '대기') cs.getRange(i + 2, RSV_CHG.status).setValue(x.decision);
+      });
+      rsvProcessChangeDecisions_(id, x.who);
+      results = cs.getRange(2, 1, cs.getLastRow() - 1, RSV_CHG.result).getValues()
+        .filter(function (v) { return v[RSV_CHG.id - 1] === id && v[RSV_CHG.result - 1]; })
+        .map(function (v) { return '• ' + v[RSV_CHG.name - 1] + ' — ' + String(v[RSV_CHG.result - 1]).split(' · ')[0]; });
+    } catch (err) {
+      results = ['⚠ 반영 오류: ' + err.message];
+    }
+    var status = (x.decision === '승인' ? '✅ *승인 · 시트에 반영했습니다*' : '🚫 *반려 · 시트는 그대로입니다*') + ' · ' + x.who.replace('슬랙 버튼 ', '');
+    if (x.ts) {
+      try {
+        rsvSlackApi_('chat.update', { channel: x.channel || RSV_CONFIG.SLACK_CHANNEL, ts: x.ts, text: x.text, blocks: rsvChangeDoneBlocks(x.text, status) });
+        rsvPostSlack_(status + ' (`' + id + '`)\n' + results.join('\n'), x.ts);
+      } catch (e) { console.error(e); }
+      delete threads[x.ts]; // 답글 확인 목록에서도 제거
+    }
+    delete map[id];
+  });
+  props.setProperty('RSV_CHG_BUTTONS', JSON.stringify(map));
+  props.setProperty('RSV_CHANGE_THREADS', JSON.stringify(threads));
+}
+
+/** 슬랙 Web API 호출 (봇 토큰) */
+function rsvSlackApi_(method, payload) {
+  var token = PropertiesService.getScriptProperties().getProperty('SLACK_BOT_TOKEN');
+  if (!token) throw new Error('SLACK_BOT_TOKEN 없음');
+  // 조회(conversations.*)는 JSON 본문을 받지 않아 폼 형식으로
+  var form = /^conversations\./.test(method);
+  var res = UrlFetchApp.fetch('https://slack.com/api/' + method, form ? {
+    method: 'post', headers: { Authorization: 'Bearer ' + token }, payload: payload, muteHttpExceptions: true,
+  } : {
+    method: 'post', contentType: 'application/json; charset=utf-8', headers: { Authorization: 'Bearer ' + token },
+    payload: JSON.stringify(payload), muteHttpExceptions: true,
+  });
+  var body = JSON.parse(res.getContentText() || '{}');
+  if (!body.ok) throw new Error(method + ': ' + (body.error || res.getResponseCode()));
+  return body;
+}
+
+/** 메뉴: 이미 올라간 '승인 대기' 변경요청 알림에 버튼 붙이기 */
+function rsvAddChangeButtons() {
+  rsvAssertAllowed_();
+  var props = PropertiesService.getScriptProperties();
+  var threads = JSON.parse(props.getProperty('RSV_CHANGE_THREADS') || '{}');
+  var n = 0, fail = [];
+  Object.keys(threads).forEach(function (ts) {
+    try {
+      var h = rsvSlackApi_('conversations.history', { channel: RSV_CONFIG.SLACK_CHANNEL, latest: ts, inclusive: true, limit: 1 });
+      var m = (h.messages || [])[0];
+      if (!m || m.ts !== ts) return;
+      var text = String(m.text || '').replace(/스레드에 \*승인\* \/ \*반려\* 답글/, '아래 버튼 또는 스레드에 *승인* / *반려* 답글');
+      rsvSlackApi_('chat.update', { channel: RSV_CONFIG.SLACK_CHANNEL, ts: ts, text: text, blocks: rsvChangeBlocks(text, threads[ts].id) });
+      n++;
+    } catch (e) { fail.push(threads[ts].id + ': ' + e.message); }
+  });
+  rsvToast_('승인 대기 알림 ' + n + '건에 버튼 추가' + (fail.length ? ' · ⚠ ' + fail.join(' / ') : ''));
 }
 
 /** 상품명·수량을 지운 행에 남아 있는 숨김 메일키(V) 정리 (다른 건과 잘못 이어지지 않게) */
@@ -3621,13 +3790,14 @@ function rsvPostSlackThreaded_(head, detail) {
  * 스크립트 속성의 SLACK_BOT_TOKEN(chat.postMessage) 또는 SLACK_WEBHOOK_URL 로 전송.
  * threadTs 를 주면 그 스레드에 답글로 보낸다. 봇 토큰이면 응답(ts 포함)을 반환.
  */
-function rsvPostSlack_(text, threadTs) {
+function rsvPostSlack_(text, threadTs, blocks) {
   var props = PropertiesService.getScriptProperties();
   var token = props.getProperty('SLACK_BOT_TOKEN');
   var hook = props.getProperty('SLACK_WEBHOOK_URL');
   if (token) {
     var payload = { channel: RSV_CONFIG.SLACK_CHANNEL, text: text, unfurl_links: false };
     if (threadTs) payload.thread_ts = threadTs;
+    if (blocks) payload.blocks = blocks;
     var res = UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
       method: 'post',
       contentType: 'application/json; charset=utf-8',
