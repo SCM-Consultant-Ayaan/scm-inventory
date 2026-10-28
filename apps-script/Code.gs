@@ -131,7 +131,16 @@ var RSV_CONFIG = {
   // 거래명세서 발급·메일 대상에서 빼는 업체 (업체명(F)·입고처(E) 일부)
   INVOICE_EXCLUDE: ['올리브영'],
   // 과세(부가세 10%) 업체 — 상호 일부. 그 외는 영세율. [B2B 거래업체정보]에 '과세구분' 열(과세/영세율)을 만들면 그 값이 우선
-  INVOICE_TAXED: ['예스아시아'],
+  INVOICE_TAXED: [],
+  // 업체별 고정 원화 단가 (발주서 단가 대신 사용 — 예: 발주서가 외화인 업체). 업체명(F) 일부 → [{상품명 패턴, 단가}]
+  //  목록에 없는 상품은 발주서 단가를 쓰고, 그것도 외화로 보이면 발급 보류
+  INVOICE_PRICE_LIST: {
+    '예스스타일': [
+      { match: /PDRN 틴티드 립 앰플 10ml/, price: 12000 },
+      { match: /VOL 멜로우 블러싱 세럼 4\.2g/, price: 12500 },
+      { match: /TXA 헬시 글로우 비비에센스 40ml/, price: 18000 },
+    ],
+  },
   INVOICE_MEMO_ZERO: ['※ 본 거래는 유상 정산 기준에 따라 진행되며, 대금 입금 후 발송됩니다.',
     '※ 공급 단가는 별도 협의한 Price List 상 가격이며 간접 수출로 인한 영세율 거래입니다.'],
   INVOICE_MEMO_TAXED: ['※ 본 거래는 과세 거래이며, 공급가는 부가세 별도 기준입니다.'],
@@ -1074,6 +1083,7 @@ function rsvSyncInvoices_(opts) {
         company: String(v[RSV_COL.company - 1] || '').trim(), purpose: String(v[RSV_COL.purpose - 1] || '').trim(),
         level: t.level });
     });
+    prices = rsvApplyPriceList(prices, rows, String(rec[RSV_INV.company - 1] || ''), RSV_CONFIG.INVOICE_PRICE_LIST);
     var plan = rsvInvoicePlan(rows, issued, prices, now, RSV_CONFIG, !!opts.regen, opts.targets ? opts.targets[poNo] : null);
     if (!plan.make.length && !plan.drop.length) return;
     var keep = issued.filter(function (x) { return plan.drop.indexOf(x) < 0; });
@@ -1194,6 +1204,19 @@ function rsvInvoicePlan(rows, issued, prices, now, cfg, force, onlyKeys) {
   });
   if (!onlyKeys) issued.forEach(function (x) { if (!groups[x.key] || (x.key === 'none')) drop.push(x); });
   return { make: make, drop: drop.filter(function (x) { return !make.some(function (m) { return m.old === x; }); }) };
+}
+
+/** 업체별 고정 단가 덮어쓰기 (순수 함수). 반환: 새 단가 사전 */
+function rsvApplyPriceList(prices, rows, company, lists) {
+  var out = {};
+  Object.keys(prices || {}).forEach(function (k) { out[k] = prices[k]; });
+  var key = Object.keys(lists || {}).filter(function (k) { return k && String(company).indexOf(k) >= 0; })[0];
+  if (!key) return out;
+  rows.forEach(function (r) {
+    var hit = lists[key].filter(function (x) { return x.match.test(r.name); })[0];
+    if (hit) out[r.name] = hit.price;
+  });
+  return out;
 }
 
 /** 거래명세서 묶음 키 (순수 함수): 사용 예정일 + 일부 출고 잔여 단계(메일키 끝 r 개수) */
