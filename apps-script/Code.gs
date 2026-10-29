@@ -1296,7 +1296,7 @@ function rsvShowPriceDialog_(miss, next, rest) {
     '<script>var P=' + payload + ';function go(){var pr={},miss=[];P.miss.names.forEach(function(n,i){var v=+document.getElementById("p"+i).value;if(v>0)pr[n]=v;else miss.push(n);});' +
     'var m=document.getElementById("m");if(miss.length){m.textContent=" 단가를 모두 입력하세요 ("+miss.length+"개 남음)";return;}' +
     'document.getElementById("s").disabled=true;m.textContent=" 저장 중…";' +
-    'google.script.run.withSuccessHandler(function(r){m.textContent=" "+r;}).withFailureHandler(function(e){document.getElementById("s").disabled=false;m.textContent=" ⚠ "+e.message;})' +
+    'google.script.run.withSuccessHandler(function(r){m.textContent=" "+r;if(!/다음 PO/.test(r))setTimeout(function(){google.script.host.close()},1200);}).withFailureHandler(function(e){document.getElementById("s").disabled=false;m.textContent=" ⚠ "+e.message;})' +
     '.rsvSavePricesAndContinue({po:P.miss.po,company:P.miss.company,prices:pr,save:document.getElementById("sv").checked,next:P.next,rest:P.rest});}</script>';
   SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(560).setHeight(Math.min(220 + miss.names.length * 34, 600)),
     '💰 단가 입력 — ' + miss.company);
@@ -1346,7 +1346,9 @@ function rsvSavePricesAndContinue(p) {
   if (p.next && p.next.type === 'issue') {
     var r = rsvSyncInvoices_({ targets: p.next.targets, regen: true });
     if (r.missing && r.missing.length) { rsvShowPriceDialog_(r.missing[0], p.next, r.missing.slice(1)); return '다음 PO 단가 입력'; }
-    return r.issued ? '✅ 발급: ' + r.names.join(', ') : '발급된 거래명세서 없음' + (r.errors.length ? ' · ⚠ ' + r.errors.join(' / ') : '');
+    var msg = r.issued ? '✅ 발급: ' + r.names.join(', ') : '발급된 거래명세서 없음' + (r.errors.length ? ' · ⚠ ' + r.errors.join(' / ') : '');
+    rsvToast_(msg); // 창이 닫힌 뒤에도 결과가 보이게
+    return msg;
   }
   return '저장 완료';
 }
