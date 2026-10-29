@@ -765,13 +765,6 @@ function rsvLocateDemoted_(ev, rows) {
   return hit ? hit.row : 0;
 }
 
-function rsvReadResRows_(sh) {
-  var last = rsvLastDataRow_(sh);
-  if (last < RSV_CONFIG.FIRST_ROW) return [];
-  return sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues()
-    .map(function (v, i) { return rsvRowFromValues_(v, RSV_CONFIG.FIRST_ROW + i); });
-}
-
 /** 알림창 표시. 성공하면 true (트리거 실행 등 화면이 없으면 false) */
 function rsvShowDemoteDialog_(events) {
   var ui;
@@ -3168,9 +3161,16 @@ function rsvFindPoRows(rows, po) {
   return rows.filter(function (r) {
     if (!r.name || /\|foc/.test(r.key) || /^FOC/.test(r.memo || '')) return false; // FOC 행은 발주서 비교 대상 아님
     if (r.key.indexOf(key) === 0) return true;
-    if (!hasRound || r.purpose !== String(po.purpose).trim()) return false;
     var rc = rsvCompanyNorm(r.company);
-    return !rc || !pc || rc.indexOf(pc) >= 0 || pc.indexOf(rc) >= 0;
+    var sameCompany = !rc || !pc || rc.indexOf(pc) >= 0 || pc.indexOf(rc) >= 0 ||
+      rsvMatchCompany(po.company, [r.company], RSV_CONFIG.COMPANY_ALIASES) === r.company; // 영문 업체명 별칭
+    // 용도(G)에 PO No. 를 적었거나 비고(N)에 'PO <번호>' 가 있으면 같은 발주 (사람이 용도를 고친 경우)
+    if (!/^NOPO_/.test(po.poNo) && (r.purpose === po.poNo || (r.memo || '').indexOf('PO ' + po.poNo) >= 0)) return true;
+    // PO No. 없이 임시 번호(NOPO_)로 먼저 들어온 같은 차수 발주
+    if (/^po:NOPO_/.test(r.key) && sameCompany && rsvRoundKey_(r.purpose + ' ' + r.memo) != null &&
+      rsvRoundKey_(r.purpose + ' ' + r.memo) === rsvRoundKey_(po.purpose)) return true;
+    if (!hasRound || r.purpose !== String(po.purpose).trim()) return false;
+    return sameCompany;
   });
 }
 
