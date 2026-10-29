@@ -1890,7 +1890,7 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     '보내는 계정: <b>' + esc(me || '(트리거 설치한 계정)') + '</b>' +
     (sentBefore ? '<br><span class="warn">⚠ 이미 ' + esc(rsvFmtDateTime_(new Date(sentBefore))) + '에 보낸 거래명세서예요. 다시 보내면 한 번 더 발송됩니다.</span>' : '') +
     (queue.length ? '<br><span class="g">이어서 ' + queue.length + '건 더 확인합니다</span>' : '') + '</div>' +
-    '<label>답장할 메일 <span class="g" style="font-weight:normal">(고르면 그 메일에 전체 답장 · 제목은 Re: 원래 제목)</span></label>' +
+    '<label>답장할 메일 <span class="g" style="font-weight:normal">(고르면 그 대화에 답장 · 제목은 Re: 원래 제목 · 받는 사람·참조는 아래 칸 그대로)</span></label>' +
     '<select id="mm" onchange="pick()" style="width:100%;padding:6px;font-size:13px"><option value="">✉️ 답장 안 함 — 새 메일로 보내기</option>' +
     (cur ? '<option value="' + esc(cur.id) + '" selected>' + esc(cur.label) + '</option>' : '') + '</select>' +
     '<div style="display:flex;gap:6px;margin-top:5px"><input type="text" id="q" value="' + esc(query) + '">' +
@@ -1905,7 +1905,7 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     '<script>var P=' + payload + ';' +
     'var SU=document.getElementById("su").value,C={};if(P.cur)C[P.cur.id]=P.cur;' +
     'function $(i){return document.getElementById(i);}' +
-    'function pick(){var c=C[$("mm").value];["to","cc","su"].forEach(function(i){$(i).disabled=!!c;});' +
+    'function pick(){var c=C[$("mm").value];$("su").disabled=!!c;' +
     'if(c){$("to").value=c.to;$("cc").value=c.cc;$("su").value=c.subject;}else{$("to").value=P.newTo;$("cc").value="";$("su").value=SU;}}pick();' +
     'function srch(){var qm=$("qm");qm.textContent="찾는 중…";google.script.run.withSuccessHandler(function(list){' +
     'var sel=$("mm"),keep=sel.value;for(var i=sel.options.length-1;i>0;i--){if(!P.cur||sel.options[i].value!==P.cur.id)sel.remove(i);}' +
@@ -1925,6 +1925,56 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     '</script>';
   SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(640).setHeight(620),
     '📧 거래명세서 메일 보내기 — ' + info.company);
+}
+
+/**
+ * 같은 대화(스레드)에 받는 사람·참조를 지정해 답장 (Gmail API). In-Reply-To / References 로 스레드를 잇는다.
+ */
+function rsvGmailReply_(orig, to, cc, subject, body, blob) {
+  if (!String(to || '').trim()) throw new Error('받는 사람이 비어 있음');
+  var b64 = function (str) { return Utilities.base64Encode(Utilities.newBlob(str).getBytes()); };
+  var enc = function (str) { return '=?UTF-8?B?' + b64(str) + '?='; };
+  var wrap = function (s) { return s.replace(/(.{76})/g, '$1\r\n'); };
+  var msgId = orig.getHeader('Message-ID') || orig.getHeader('Message-Id');
+  var refs = (orig.getHeader('References') || '') + (msgId ? ' ' + msgId : '');
+  var bd = 'rsv' + Date.now();
+  var lines = [
+    'To: ' + to,
+    cc && String(cc).trim() ? 'Cc: ' + cc : '',
+    'Subject: ' + enc(subject),
+    msgId ? 'In-Reply-To: ' + msgId : '',
+    refs.trim() ? 'References: ' + refs.trim() : '',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary="' + bd + '"',
+    '',
+    '--' + bd,
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    wrap(b64(body)),
+  ].filter(function (x, i) { return x !== '' || i >= 7; });
+  if (blob) {
+    lines.push('--' + bd,
+      'Content-Type: ' + (blob.getContentType() || 'application/pdf') + '; name="' + enc(blob.getName()) + '"',
+      'Content-Disposition: attachment; filename="' + enc(blob.getName()) + '"',
+      'Content-Transfer-Encoding: base64', '',
+      wrap(Utilities.base64Encode(blob.getBytes())));
+  }
+  lines.push('--' + bd + '--');
+  var raw = Utilities.base64EncodeWebSafe(Utilities.newBlob(lines.join('\r\n')).getBytes());
+  var res = UrlFetchApp.fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify({ raw: raw, threadId: orig.getThread().getId() }),
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() < 300) return;
+  // 프로젝트에서 Gmail API 가 꺼져 있으면 고급 서비스(Gmail)로 시도
+  if (typeof Gmail !== 'undefined' && Gmail.Users && Gmail.Users.Messages) {
+    Gmail.Users.Messages.send({ raw: raw, threadId: orig.getThread().getId() }, 'me');
+    return;
+  }
+  throw new Error('Gmail API ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 200) +
+    ' — Apps Script 편집기 왼쪽 "서비스 +"에서 Gmail API 를 추가하면 해결됩니다');
 }
 
 /** 확인 창의 '취소/건너뛰기' → 그 묶음의 (아직 안 보낸) 체크 해제 후 다음 묶음 */
@@ -1965,8 +2015,9 @@ function rsvSendInvoiceMail(d) {
   if (RSV_CONFIG.INVOICE_MAIL_FROM_NAME) opts.name = RSV_CONFIG.INVOICE_MAIL_FROM_NAME;
   if (d.msgId) {
     // 답장은 원래 제목(Re: …) 그대로 — 제목을 바꾸면 Gmail 이 다른 대화로 나눔
+    // replyAll 은 마지막 메일을 내가 보냈으면 나에게 답장하고 상대를 참조로 넣음 → 확인 창의 받는 사람·참조로 직접 답장
     var orig = step('답장할 메일 찾기', function () { return GmailApp.getMessageById(d.msgId); });
-    step('메일 답장', function () { orig.replyAll(d.body, opts); });
+    step('메일 답장', function () { rsvGmailReply_(orig, d.to, d.cc, d.subject, d.body, blob); });
   } else {
     if (String(d.cc || '').trim()) opts.cc = d.cc;
     step('메일 발송', function () { GmailApp.sendEmail(d.to, d.subject, d.body, opts); });
