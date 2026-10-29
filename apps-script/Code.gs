@@ -120,6 +120,8 @@ var RSV_CONFIG = {
   ],
   // ---- 거래명세서 자동 발급 (메일 PO 등록 시) ----
   INVOICE_ENABLED: true,
+  // 패킹리스트 박스 번호 머리글자 (업체명 일부 → 글자). 없으면 PO No. 첫 영문자 (예: LH(TW) → L-1, L-2 …)
+  PACKING_BOX_PREFIX: { '리호': 'L' },
   INVOICE_ROOT_FOLDER_ID: '1gYWMNxOv2M4vZqhy8z2-BEIHTFiPAYQn',     // [00. B2B 발주] — 아래 업체 폴더에 저장
   INVOICE_TEMPLATE_XLSX_ID: '1WMHRUVfmQwZP8mU5ocbXeJYA6kix2CK0',   // 양식 원본 (261019_뷰릿지코퍼레이션_BG(CN)_261016_11_거래명세서.xlsx)
   INVOICE_BUYER_SHEET: 'B2B 거래업체정보',
@@ -259,7 +261,7 @@ function rsvOnOpen() {
   ui.createMenu('📦 예약재고 자동화')
     // 자주 쓰는 기능
     .addItem('🔄 지금 재계산 + 정렬', 'rsvRunAllocation')
-    .addItem('📄 출고 가능 일정 파일 (업체 선택 → 엑셀)', 'rsvShipScheduleDialog')
+    .addItem('📦 패킹리스트 (업체·출고일 선택 → 엑셀)', 'rsvShipScheduleDialog')
     .addItem('📅 출고 예정 알림 지금 보내기', 'rsvSendShipAlertNow')
     .addSeparator()
     .addSubMenu(ui.createMenu('👀 보기 (정렬)')
@@ -939,6 +941,7 @@ function rsvIssueSelectedInvoices() {
     } catch (e) { errors.push((po.indexOf('mn:') === 0 ? rowsByPo[po].purpose : po) + ': ' + e.message); }
   });
   var r = rsvSyncInvoices_({ targets: targets, regen: true });
+  if (r.missing.length) { rsvShowPriceDialog_(r.missing[0], { type: 'issue', targets: targets }, r.missing.slice(1)); return; }
   errors = errors.concat(r.errors);
   var msg = (r.issued ? '거래명세서 ' + r.issued + '건 발급: ' + r.names.join(', ') : '발급된 거래명세서 없음') +
     (skipped ? ' · 업체명·용도가 비어 있는 행 ' + skipped + '개 제외' : '') + (excluded ? ' · 발급 제외 업체(' + RSV_CONFIG.INVOICE_EXCLUDE.join('·') + ') ' + excluded + '행' : '') + (errors.length ? ' · ⚠ ' + errors.join(' / ') : '');
@@ -1016,7 +1019,7 @@ function rsvInvoiceRememberManual_(id, info, exists, keys) {
   } else {
     sh.appendRow([id, info.company, info.company, found.shipTo, JSON.stringify(found.prices), '', '', '', '', '', '']);
   }
-  if (found.missing.length) throw new Error(info.company + ' 메일 발주서에서 단가를 못 찾은 품목: ' + found.missing.join(', '));
+  // 못 찾은 단가는 발급 단계에서 단가 입력 창으로 받는다
 }
 
 /**
@@ -1067,7 +1070,7 @@ function rsvInvoiceRecoverPo_(poNo, created, company) {
  */
 function rsvSyncInvoices_(opts) {
   opts = opts || {};
-  var out = { issued: 0, names: [], errors: [] };
+  var out = { issued: 0, names: [], errors: [], missing: [] };
   if (!RSV_CONFIG.INVOICE_ENABLED) return out;
   var ss = SpreadsheetApp.getActive();
   var log = ss.getSheetByName(RSV_CONFIG.INVOICE_LOG_SHEET);
@@ -1077,10 +1080,12 @@ function rsvSyncInvoices_(opts) {
   if (last < RSV_CONFIG.FIRST_ROW) return out;
   var values = res.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
   var recs = log.getRange(2, 1, log.getLastRow() - 1, RSV_INV.msgId).getValues();
-  var now = new Date(), buyers = null, targetsAll = rsvInvoiceTargets(values);
+  var now = new Date(), buyers = null, targetsAll = rsvInvoiceTargets(values), seenPo = {}, priceSheet = rsvReadPriceSheet_();
   recs.forEach(function (rec, ri) {
     var poNo = String(rec[RSV_INV.po - 1]);
     if (!poNo || (opts.targets && !opts.targets[poNo])) return;
+    if (seenPo[poNo]) return; // 같은 PO 가 두 줄이면 첫 줄만
+    seenPo[poNo] = true;
     if (rsvInvoiceExcluded(rec[RSV_INV.company - 1], rec[RSV_INV.vendor - 1], RSV_CONFIG)) return;
     var prices = {};
     try { prices = JSON.parse(rec[RSV_INV.prices - 1] || '{}'); } catch (e) { prices = {}; }
@@ -1097,6 +1102,7 @@ function rsvSyncInvoices_(opts) {
         level: t.level });
     });
     prices = rsvApplyPriceList(prices, rows, String(rec[RSV_INV.company - 1] || ''), RSV_CONFIG.INVOICE_PRICE_LIST);
+    prices = rsvFillMissingPrices(prices, rows, (rows[0] && rows[0].company) || String(rec[RSV_INV.company - 1] || ''), priceSheet);
     var plan = rsvInvoicePlan(rows, issued, prices, now, RSV_CONFIG, !!opts.regen, opts.targets ? opts.targets[poNo] : null);
     if (!plan.make.length && !plan.drop.length) return;
     var keep = issued.filter(function (x) { return plan.drop.indexOf(x) < 0; });
@@ -1106,7 +1112,11 @@ function rsvSyncInvoices_(opts) {
       var inv = g.inv;
       if (inv.missingPrice.length) {
         out.errors.push(poNo + ' 단가 없음: ' + inv.missingPrice.join(', '));
-        rsvWarnOnce_('거래명세서 보류 ' + poNo + ' — 단가를 모르는 품목: ' + inv.missingPrice.join(', ') + ' (메뉴 "다시 발급"이면 단가 0으로 발급)');
+        if (!out.missing.some(function (x) { return x.po === poNo; })) {
+          out.missing.push({ po: poNo, company: (g.rows[0] && g.rows[0].company) || String(rec[RSV_INV.company - 1] || ''),
+            names: inv.missingNames, known: inv.missingKnown });
+        }
+        rsvWarnOnce_('거래명세서 보류 ' + poNo + ' — 단가를 모르는 품목: ' + inv.missingPrice.join(', ') + ' (셀 선택 발급·메일 체크 때 단가 입력 창이 뜸)');
         return;
       }
       try {
@@ -1233,6 +1243,114 @@ function rsvApplyPriceList(prices, rows, company, lists) {
   return out;
 }
 
+// =====================================================================
+// 단가 입력 창 (발주서에 단가가 없거나 외화일 때) + [업체별 단가] 시트
+// =====================================================================
+
+var RSV_PRICE_SHEET = '업체별 단가';
+
+/** [업체별 단가] 시트 → {업체명: {상품명: 단가}} */
+function rsvReadPriceSheet_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_PRICE_SHEET);
+  var out = {};
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues().forEach(function (r) {
+    var c = String(r[0] || '').trim(), n = String(r[1] || '').trim(), p = rsvToNum_(r[2]);
+    if (c && n && p > 0) (out[c] = out[c] || {})[n] = p;
+  });
+  return out;
+}
+
+/** 발주서 단가가 없거나 외화로 보이는 상품만 [업체별 단가]로 채움 (순수 함수) */
+function rsvFillMissingPrices(prices, rows, company, sheetMap) {
+  var out = {};
+  Object.keys(prices || {}).forEach(function (k) { out[k] = prices[k]; });
+  var list = (sheetMap || {})[company] || {};
+  rows.forEach(function (r) {
+    var p = out[r.name];
+    if ((p == null || p < 100 || p % 1) && list[r.name] > 0) out[r.name] = list[r.name];
+  });
+  return out;
+}
+
+/**
+ * 단가 입력 창. miss: {po, company, names:[상품명], known:{상품명: 현재값}}
+ * next: {type:'mail', t, queue} 이면 저장 후 메일 확인 창으로, {type:'issue', targets} 이면 저장 후 발급
+ */
+function rsvShowPriceDialog_(miss, next, rest) {
+  var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); };
+  var rowsHtml = miss.names.map(function (n, i) {
+    var k = miss.known[n];
+    return '<tr><td>' + esc(n.replace(/^로지킴\s*/, '')) + (k != null && k !== '' ? ' <span class="g">(발주서: ' + esc(k) + ')</span>' : '') + '</td>' +
+      '<td><input type="number" min="0" step="1" id="p' + i + '" placeholder="원"></td></tr>';
+  }).join('');
+  var payload = JSON.stringify({ miss: miss, next: next, rest: rest || [] }).replace(/</g, '\\u003c');
+  var html =
+    '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:14px;color:#222}table{width:100%;border-collapse:collapse}' +
+    'td{padding:5px 4px;border-bottom:1px solid #eee}input[type=number]{width:110px;padding:5px;font-size:13px}.g{color:#777;font-size:12px}' +
+    'button{border:0;border-radius:4px;padding:9px 16px;font-size:13px;cursor:pointer;margin-right:6px}#s{background:#1a73e8;color:#fff}#c{background:#e8eaed}</style>' +
+    '<div><b>' + esc(miss.company) + ' · ' + esc(miss.po) + '</b> 발주서에 원화 단가가 없어요. 단가(원, 부가세 별도)를 입력하면 거래명세서에 넣어요.</div>' +
+    '<table>' + rowsHtml + '</table>' +
+    '<label style="display:block;margin-top:10px"><input type="checkbox" id="sv" checked> [' + RSV_PRICE_SHEET + '] 시트에도 저장 — 다음에 이 업체 발주서에 단가가 없으면 자동으로 사용</label>' +
+    '<div style="margin-top:12px"><button id="s" onclick="go()">저장하고 계속</button><button id="c" onclick="google.script.host.close()">취소</button><span id="m"></span></div>' +
+    '<script>var P=' + payload + ';function go(){var pr={},miss=[];P.miss.names.forEach(function(n,i){var v=+document.getElementById("p"+i).value;if(v>0)pr[n]=v;else miss.push(n);});' +
+    'var m=document.getElementById("m");if(miss.length){m.textContent=" 단가를 모두 입력하세요 ("+miss.length+"개 남음)";return;}' +
+    'document.getElementById("s").disabled=true;m.textContent=" 저장 중…";' +
+    'google.script.run.withSuccessHandler(function(r){m.textContent=" "+r;}).withFailureHandler(function(e){document.getElementById("s").disabled=false;m.textContent=" ⚠ "+e.message;})' +
+    '.rsvSavePricesAndContinue({po:P.miss.po,company:P.miss.company,prices:pr,save:document.getElementById("sv").checked,next:P.next,rest:P.rest});}</script>';
+  SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(560).setHeight(Math.min(220 + miss.names.length * 34, 600)),
+    '💰 단가 입력 — ' + miss.company);
+}
+
+/** 단가 저장 → (선택) [업체별 단가]에도 저장 → 메일 확인 창 또는 발급으로 이어감 */
+function rsvSavePricesAndContinue(p) {
+  rsvAssertAllowed_();
+  var log = rsvInvoiceSheet_();
+  if (log.getLastRow() > 1) {
+    log.getRange(2, 1, log.getLastRow() - 1, 1).getValues().forEach(function (v, i) {
+      if (String(v[0]) !== p.po) return;
+      var cell = log.getRange(i + 2, RSV_INV.prices), cur = {};
+      try { cur = JSON.parse(cell.getValue() || '{}'); } catch (e) { cur = {}; }
+      Object.keys(p.prices).forEach(function (n) { cur[n] = p.prices[n]; });
+      cell.setValue(JSON.stringify(cur));
+    });
+  }
+  if (p.save) {
+    var ss = SpreadsheetApp.getActive();
+    var sh = ss.getSheetByName(RSV_PRICE_SHEET);
+    if (!sh) {
+      sh = ss.insertSheet(RSV_PRICE_SHEET);
+      sh.getRange(1, 1, 1, 4).setValues([['업체명', '상품명', '단가(원)', '갱신']]).setFontWeight('bold').setBackground('#d9d9d9');
+      sh.setFrozenRows(1);
+      sh.setColumnWidth(2, 340);
+    }
+    var vals = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues() : [];
+    var stamp = rsvFmtDateTime_(new Date()) + ' · ' + p.po;
+    Object.keys(p.prices).forEach(function (n) {
+      var at = 0;
+      vals.forEach(function (v, i) { if (String(v[0]) === p.company && String(v[1]) === n) at = i + 2; });
+      if (at) sh.getRange(at, 3, 1, 2).setValues([[p.prices[n], stamp]]);
+      else { sh.appendRow([p.company, n, p.prices[n], stamp]); vals.push([p.company, n]); }
+    });
+  }
+  // 다음 단계
+  if (p.rest && p.rest.length) { rsvShowPriceDialog_(p.rest[0], p.next, p.rest.slice(1)); return '다음 PO 단가 입력'; }
+  if (p.next && p.next.type === 'mail') {
+    try {
+      SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(
+        '<div style="font-family:Arial,\'Malgun Gothic\',sans-serif;font-size:14px;padding:24px;text-align:center">⏳ 거래명세서 만드는 중…</div>').setWidth(360).setHeight(110), '📧 거래명세서 메일');
+    } catch (e) { /* 무시 */ }
+    rsvShowInvoiceMailDialog_(p.next.t, p.next.queue || []);
+    return '저장 완료';
+  }
+  if (p.next && p.next.type === 'issue') {
+    var r = rsvSyncInvoices_({ targets: p.next.targets, regen: true });
+    if (r.missing && r.missing.length) { rsvShowPriceDialog_(r.missing[0], p.next, r.missing.slice(1)); return '다음 PO 단가 입력'; }
+    return r.issued ? '✅ 발급: ' + r.names.join(', ') : '발급된 거래명세서 없음' + (r.errors.length ? ' · ⚠ ' + r.errors.join(' / ') : '');
+  }
+  return '저장 완료';
+}
+
 /** 거래명세서 묶음 키 (순수 함수): 사용 예정일 + 일부 출고 잔여 단계(메일키 끝 r 개수) */
 function rsvInvoiceGroupKey(r) {
   var d = r.useDate instanceof Date ? rsvStartOfDay_(r.useDate) : null;
@@ -1257,14 +1375,14 @@ function rsvReplaceDriveFile_(fileId, blob) {
  *  같은 상품·단가는 합침 (일부 출고로 나뉜 행). FOC 는 단가 0. 발급일 = 출고예정일 (datePick 'last': 가장 늦은 날 / 'first')
  */
 function rsvInvoiceContent(rows, prices, now, datePick) {
-  var lines = [], byKey = {}, missing = [], dates = [];
+  var lines = [], byKey = {}, missing = [], dates = [], missingNames = [], missingKnown = {};
   rows.forEach(function (r) {
     if (!(r.qty > 0)) return;
     var price = r.foc ? 0 : prices[r.name];
     // 단가가 없거나 원화로 보기 어려운 값(소수·100원 미만 — 외화 PO)이면 발급 보류
     if (price == null || (!r.foc && (price < 100 || price % 1))) {
       var tag = r.name + (price != null ? ' (단가 ' + price + ' — 외화?)' : '');
-      if (missing.indexOf(tag) < 0) missing.push(tag);
+      if (missing.indexOf(tag) < 0) { missing.push(tag); missingNames.push(r.name); missingKnown[r.name] = price; }
       price = price || 0;
     }
     var k = r.name + '|' + price + '|' + (r.foc ? 'f' : '');
@@ -1276,7 +1394,7 @@ function rsvInvoiceContent(rows, prices, now, datePick) {
   lines.sort(function (a, b) { return (a.foc ? 1 : 0) - (b.foc ? 1 : 0); });
   var date = dates.length ? new Date(datePick === 'first' ? Math.min.apply(null, dates) : Math.max.apply(null, dates)) : rsvStartOfDay_(now);
   var sig = lines.map(function (l) { return l.name + ':' + l.qty + ':' + l.price + (l.foc ? ':f' : ''); }).sort().join(';');
-  return { lines: lines, date: date, sig: sig, missingPrice: missing };
+  return { lines: lines, date: date, sig: sig, missingPrice: missing, missingNames: missingNames, missingKnown: missingKnown };
 }
 
 /** 품목명 → 명세서 표기 {name, spec} (순수 함수). '로지킴 PDRN 틴티드 립 앰플 10ml_01 새틴' → 'PDRN 틴티드 립 앰플 01 새틴' / '10ml' */
@@ -1687,6 +1805,7 @@ function rsvInvoiceForMail_(t, rowsInfo) {
     var targets = {};
     targets[t.id] = [t.key];
     var r = rsvSyncInvoices_({ targets: targets, regen: true });
+    if (r.missing.length) { var me = new Error('단가 없음'); me.missing = r.missing; throw me; }
     if (r.errors.length) throw new Error(r.errors.join(' / '));
     f = find();
   } else {
@@ -1710,6 +1829,7 @@ function rsvShowInvoiceMailDialog_(t, queue) {
   var info = { created: v0[RSV_COL.created - 1], company: String(v0[RSV_COL.company - 1] || ''), purpose: String(v0[RSV_COL.purpose - 1] || '') };
   var f;
   try { f = rsvInvoiceForMail_(t, info); } catch (e) {
+    if (e.missing && e.missing.length) { rsvShowPriceDialog_(e.missing[0], { type: 'mail', t: t, queue: queue }, e.missing.slice(1)); return; }
     rows.forEach(function (r) { rsvUncheckUnsent_(sh, r); });
     SpreadsheetApp.getUi().alert('📧 거래명세서 메일', '⚠ ' + info.company + ' / ' + info.purpose + '\n' + e.message, SpreadsheetApp.getUi().ButtonSet.OK);
     if (queue.length) rsvShowInvoiceMailDialog_(queue[0], queue.slice(1));
@@ -4544,39 +4664,255 @@ function rsvFmtNum_(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(
 // 출고 가능 일정 파일 (업체 선택 → 엑셀 다운로드)
 // =====================================================================
 
-/** 메뉴: 업체를 골라 출고 가능 일정 엑셀(.xlsx)을 내려받는다 */
+
+/** [예약 재고 관리]에서 출고 전 행 읽기 */
+// =====================================================================
+// 패킹리스트 (업체 → 출고일 선택 → 엑셀) — 파일명: MMDD_업체명_PO No._패킹리스트
+// =====================================================================
+
+/** 메뉴: 업체와 출고일을 골라 패킹리스트 엑셀을 내려받는다 */
 function rsvShipScheduleDialog() {
   rsvAssertAllowed_();
-  // 재계산은 10분 자동 실행·편집 시 이미 돌고 있으므로 여기서는 시트의 현재 출고 예정일(D)을 그대로 쓴다 (빠르게 열리도록)
   var companies = rsvScheduleCompanies(rsvReadScheduleRows_());
   if (!companies.length) { rsvToast_('출고 전 예약/홀딩 건이 없습니다'); return; }
+  var esc = function (s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); };
   var opts = companies.map(function (c) {
-    var v = String(c.name).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
-    return '<option value="' + v + '">' + v + '  (' + c.count + '건 · ' + rsvFmtNum_(c.qty) + '개)</option>';
+    return '<option value="' + esc(c.name) + '">' + esc(c.name) + '  (' + c.count + '건 · ' + rsvFmtNum_(c.qty) + '개)</option>';
   }).join('');
   var html =
-    '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:16px;color:#222}' +
-    'select{width:100%;padding:8px;font-size:14px;margin:8px 0 14px}' +
-    'button{background:#1a73e8;color:#fff;border:0;border-radius:4px;padding:9px 18px;font-size:14px;cursor:pointer}' +
-    'button:disabled{background:#9bbcf0}#msg{margin-top:14px;line-height:1.6}a{color:#1a73e8}</style>' +
-    '<div>업체를 고르면 출고 전(예약·홀딩) 품목의 <b>출고 가능일 · 제품 · 수량 · 출고 차수</b>를 엑셀로 내려받습니다. (비고 칸은 비워 둠)</div>' +
-    '<select id="c">' + opts + '</select>' +
+    '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:16px;color:#222}label{font-weight:bold;display:block;margin-top:10px}' +
+    'select{width:100%;padding:8px;font-size:14px;margin:6px 0 4px}' +
+    'button{background:#1a73e8;color:#fff;border:0;border-radius:4px;padding:9px 18px;font-size:14px;cursor:pointer;margin-top:12px}' +
+    'button:disabled{background:#9bbcf0}#msg{margin-top:14px;line-height:1.6}a{color:#1a73e8}.g{color:#777;font-size:12px}</style>' +
+    '<div>업체와 출고일을 고르면 그날 나가는 품목의 <b>패킹리스트</b>(수량·박스 수량·소비기한·박스 사이즈·박스 번호·중량)를 엑셀로 내려받습니다.</div>' +
+    '<label>업체</label><select id="c" onchange="dates()">' + opts + '</select>' +
+    '<label>출고일 <span class="g">(출고 예정일 D 기준)</span></label><select id="d"><option>불러오는 중…</option></select>' +
     '<button id="b" onclick="go()">엑셀 만들기</button><div id="msg"></div>' +
     '<script>' +
-    'function go(){var b=document.getElementById("b"),m=document.getElementById("msg");b.disabled=true;m.textContent="만드는 중… (10초 정도)";' +
+    'function $(i){return document.getElementById(i);}' +
+    'function dates(){var s=$("d");s.innerHTML="<option>불러오는 중…</option>";google.script.run.withSuccessHandler(function(list){s.innerHTML="";' +
+    'list.forEach(function(x){var o=document.createElement("option");o.value=x.key;o.textContent=x.label;s.appendChild(o);});})' +
+    '.withFailureHandler(function(e){s.innerHTML="<option>⚠ "+e.message+"</option>";}).rsvPackingDates($("c").value);}dates();' +
+    'function go(){var b=$("b"),m=$("msg");b.disabled=true;m.textContent="만드는 중… (10초 정도)";' +
     'google.script.run.withSuccessHandler(function(r){b.disabled=false;' +
     'var bin=atob(r.b64),arr=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);' +
     'var url=URL.createObjectURL(new Blob([arr],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}));' +
     'var a=document.createElement("a");a.href=url;a.download=r.name;document.body.appendChild(a);a.click();' +
-    'm.innerHTML="✅ <b>"+r.name+"</b> 다운로드<br>"+r.summary+"<br>다운로드가 안 되면 ";' +
+    'm.innerHTML="✅ <b>"+r.name+"</b> 다운로드<br>"+r.summary+"<br>";' +
     'var l=document.createElement("a");l.href=r.driveUrl;l.target="_blank";l.textContent="Drive 에서 열기";m.appendChild(l);})' +
     '.withFailureHandler(function(e){b.disabled=false;m.textContent="⚠ 실패: "+e.message;})' +
-    '.rsvBuildShipSchedule(document.getElementById("c").value);}' +
+    '.rsvBuildPackingList($("c").value,$("d").value);}' +
     '</script>';
-  SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(460).setHeight(300), '출고 가능 일정 파일');
+  SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(480).setHeight(360), '📦 패킹리스트');
 }
 
-/** [예약 재고 관리]에서 출고 전 행 읽기 */
+/** 패킹리스트용 행: 출고 전(예약·홀딩) 행 + 거래명세서 묶음 ID(PO) */
+function rsvPackingRows_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(sh);
+  if (last < RSV_CONFIG.FIRST_ROW) return [];
+  var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
+  var tg = rsvInvoiceTargets(values);
+  return values.map(function (v, i) {
+    var r = {
+      ship: v[RSV_COL.shipDate - 1], name: String(v[RSV_COL.name - 1] || '').trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
+      code: String(v[RSV_COL.code - 1] || '').trim(), purpose: String(v[RSV_COL.purpose - 1] || '').trim(),
+      memo: String(v[RSV_COL.memo - 1] || '').trim(), status: String(v[RSV_COL.status - 1] || '').trim(),
+      shipped: String(v[RSV_COL.shipped - 1] || '').trim(), company: String(v[RSV_COL.company - 1] || '').trim(),
+      channel: String(v[RSV_COL.channel - 1] || '').trim(),
+    };
+    var t = tg[i];
+    r.po = t && !t.excluded ? (/^(mn:|#)/.test(t.id) ? r.purpose : t.id) : r.purpose;
+    r.foc = (t && t.foc) || /^FOC/.test(r.memo);
+    return r;
+  });
+}
+
+/** 출고일 키 (순수 함수): 'yyyy-mm-dd' 또는 'none'(미정) */
+function rsvPackingDateKey(ship) {
+  var d = rsvToDate_(ship, null);
+  return d ? rsvFmtYMD_(d) : 'none';
+}
+
+/** 대화상자: 업체의 출고일 목록 [{key, label}] */
+function rsvPackingDates(company) {
+  rsvAssertAllowed_();
+  var map = {}, list = [];
+  rsvPackingRows_().forEach(function (r) {
+    if (!rsvScheduleOpen_(r) || (r.company || r.channel) !== company) return;
+    var k = rsvPackingDateKey(r.ship);
+    if (!map[k]) { map[k] = { key: k, n: 0, qty: 0, pos: [] }; list.push(map[k]); }
+    map[k].n++; map[k].qty += r.qty;
+    if (r.po && map[k].pos.indexOf(r.po) < 0) map[k].pos.push(r.po);
+  });
+  return list.sort(function (a, b) { return a.key < b.key ? -1 : 1; }).map(function (x) {
+    return { key: x.key, label: (x.key === 'none' ? '출고일 미정' : x.key) + '  ·  ' + x.n + '건 / ' + rsvFmtNum_(x.qty) + '개  ·  ' + x.pos.join(', ') };
+  });
+}
+
+/**
+ * 패킹리스트 내용 (순수 함수).
+ *  rows: 그 업체·출고일 행, master: {SKU/상품명: {perBox, size, weight}}, exp: {SKU/상품명: 'yyyy.mm.dd'}, prefix: 박스 번호 머리글자
+ *  같은 제품·같은 차수는 한 줄. 박스 수량 = 수량 ÷ 아웃박스 입수량 (올림), 박스 번호는 줄 순서대로 이어서.
+ */
+function rsvPackingList(rows, master, exp, prefix) {
+  var lines = [], byKey = {};
+  rows.forEach(function (r) {
+    var k = r.name + '|' + r.purpose + '|' + (r.foc ? 'f' : '');
+    if (!byKey[k]) { byKey[k] = { name: r.name, code: r.code, qty: 0, purpose: r.purpose, foc: r.foc, date: rsvToDate_(r.ship, null) }; lines.push(byKey[k]); }
+    byKey[k].qty += r.qty;
+    if (!byKey[k].code && r.code) byKey[k].code = r.code;
+  });
+  lines.sort(function (a, b) {
+    if (a.foc !== b.foc) return a.foc ? 1 : -1;
+    var x = rsvNaturalKey_(a.name), y = rsvNaturalKey_(b.name);
+    return x < y ? -1 : x > y ? 1 : (a.purpose < b.purpose ? -1 : 1);
+  });
+  var no = 0;
+  lines.forEach(function (l) {
+    var m = master[l.code] || master[l.name] || {};
+    l.perBox = m.perBox || 0; l.size = m.size || ''; l.weight = m.weight || 0;
+    l.exp = exp[l.code] || exp[l.name] || '';
+    l.boxes = l.perBox ? Math.ceil(l.qty / l.perBox) : 0;
+    var rem = l.perBox ? l.qty % l.perBox : 0;
+    l.note = [l.foc ? 'FOC' : '', rem ? '낱개 ' + rem + '개 포함' : '', !l.perBox ? '입수량 정보 없음' : ''].filter(String).join(' · ');
+    if (l.boxes) {
+      var a = no + 1, b = no + l.boxes;
+      l.boxNo = prefix + '-' + a + (b > a ? ' ~ ' + prefix + '-' + b : '');
+      no = b;
+    } else l.boxNo = '';
+    l.total = l.boxes && l.weight ? Math.round(l.boxes * l.weight * 100) / 100 : '';
+  });
+  return lines;
+}
+
+/** [상품 마스터 시트] → {SKU·상품명: {perBox, size, weight}} (헤더 이름으로 열을 찾음) */
+function rsvPackingMaster_(ss) {
+  var sh = ss.getSheetByName('상품 마스터 시트');
+  var out = {};
+  if (!sh || sh.getLastRow() < 3) return out;
+  var v = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  var head = v[1].map(function (x) { return String(x).replace(/\s/g, ''); });
+  var c = function (k, from) { for (var i = from || 0; i < head.length; i++) if (head[i].indexOf(k) === 0) return i; return -1; };
+  var cSku = c('SKU'), cName = c('내부상품명'), cPer = c('아웃박스입수량');
+  var cSize = cPer >= 0 ? c('사이즈', cPer) : -1, cW = cPer >= 0 ? c('아웃박스무게', cPer) : -1;
+  if (cPer < 0) return out;
+  v.slice(2).forEach(function (r) {
+    var per = rsvToNum_(r[cPer]);
+    if (!(per > 0)) return;
+    var size = String(cSize >= 0 ? r[cSize] : '').replace(/mm/i, '').replace(/\s+/g, '');
+    var w = parseFloat(String(cW >= 0 ? r[cW] : '').replace(/[^\d.]/g, '')) || 0;
+    var m = { perBox: per, size: size, weight: w };
+    var sku = String(r[cSku] || '').trim(), nm = String(cName >= 0 ? r[cName] : '').trim();
+    if (sku) out[sku] = m;
+    if (nm) out[nm] = m;
+  });
+  return out;
+}
+
+/** [이지어드민 재고_RD] 유통기한 '7186 ( 2029-08-18 )' → {SKU·상품명: '2029.08.18'} */
+function rsvPackingExp_(ss) {
+  var sh = ss.getSheetByName('이지어드민 재고_RD');
+  var out = {};
+  if (!sh || sh.getLastRow() < 2) return out;
+  var v = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  var head = v[0].map(function (x) { return String(x).replace(/\s/g, ''); });
+  var c = function (k) { return head.indexOf(k); };
+  var cK = c('연동코드'), cO = c('공급처옵션'), cB = c('바코드'), cN = c('상품명'), cE = c('유통기한');
+  if (cE < 0) return out;
+  v.slice(1).forEach(function (r) {
+    var m = String(r[cE] || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return;
+    var d = m[1] + '.' + m[2] + '.' + m[3];
+    [cK, cO, cB].forEach(function (ci) { var k = ci >= 0 ? String(r[ci] || '').trim() : ''; if (k && !out[k]) out[k] = d; });
+    var nm = cN >= 0 ? String(r[cN] || '').trim() : '';
+    if (nm) { if (!out[nm]) out[nm] = d; if (!out['로지킴 ' + nm]) out['로지킴 ' + nm] = d; }
+  });
+  return out;
+}
+
+/** 박스 번호 머리글자: 설정 → PO No. 첫 영문자 → 'B' */
+function rsvPackingPrefix(company, pos, cfg) {
+  var map = cfg.PACKING_BOX_PREFIX || {};
+  var key = Object.keys(map).filter(function (k) { return String(company).indexOf(k) >= 0; })[0];
+  if (key) return map[key];
+  for (var i = 0; i < pos.length; i++) { var m = String(pos[i]).match(/[A-Za-z]/); if (m && !/^NOPO/.test(pos[i])) return m[0].toUpperCase(); }
+  return 'B';
+}
+
+/** 선택한 업체·출고일의 패킹리스트 엑셀 → {name, b64, driveUrl, summary} */
+function rsvBuildPackingList(company, dateKey) {
+  rsvAssertAllowed_();
+  var ss = SpreadsheetApp.getActive();
+  var rows = rsvPackingRows_().filter(function (r) {
+    return rsvScheduleOpen_(r) && (r.company || r.channel) === company && rsvPackingDateKey(r.ship) === dateKey;
+  });
+  if (!rows.length) throw new Error(company + ' · ' + dateKey + ' 출고 건이 없습니다');
+  var pos = [];
+  rows.forEach(function (r) { if (r.po && pos.indexOf(r.po) < 0) pos.push(r.po); });
+  pos.sort(function (a, b) { var x = rsvNaturalKey_(a), y = rsvNaturalKey_(b); return x < y ? -1 : x > y ? 1 : 0; });
+  var lines = rsvPackingList(rows, rsvPackingMaster_(ss), rsvPackingExp_(ss), rsvPackingPrefix(company, pos, RSV_CONFIG));
+  var md = dateKey === 'none' ? '미정' : dateKey.slice(5).replace('-', '');
+  var fname = [md, company, pos.join('+'), '패킹리스트'].filter(String).join('_').replace(/[\\\/:*?"<>|]/g, '-');
+
+  var tmp = SpreadsheetApp.create(fname);
+  try {
+    var sh = tmp.getSheets()[0];
+    sh.setName('출고 리스트');
+    var head = ['출고일', '제품명', '수량', '박스 수량', '출고 차수', '비고', '제품별 소비기한(EXP)', '박스 사이즈(mm)', '박스 번호\n(' + (lines[0] && lines[0].boxNo ? lines[0].boxNo.split(' ')[0].replace(/\d+$/, '1') : 'B-1') + ' ~)', '1박스 중량(kg)', '박스 총중량(kg)'];
+    var n = lines.length, W = head.length;
+    sh.getRange(1, 1, 1, W).setValues([head]).setFontWeight('bold').setFontSize(11).setBackground('#f2f2f2')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
+    sh.setRowHeight(1, 47);
+    var data = lines.map(function (l) {
+      return [l.date || '미정', l.name, l.qty, l.boxes || '', l.purpose, l.note, l.exp, l.size, l.boxNo, l.weight || '', l.total];
+    });
+    if (n) {
+      sh.getRange(2, 1, n, W).setValues(data).setFontSize(10).setHorizontalAlignment('center').setVerticalAlignment('middle');
+      sh.getRange(2, 1, n, 1).setNumberFormat('yyyy-mm-dd');
+      sh.getRange(2, 3, n, 1).setNumberFormat('#,##0');
+      sh.getRange(2, 10, n, 2).setNumberFormat('0.00');
+      // 소비기한은 재고 데이터 기준이라 실제 출고 로트와 다를 수 있음 → 연노랑으로 '확인' 표시
+      sh.getRange(2, 7, n, 1).setBackground('#fff9e6');
+    }
+    var t = n + 2;
+    sh.getRange(t, 3).setFormula('=SUM(C2:C' + (n + 1) + ')').setNumberFormat('#,##0');
+    sh.getRange(t, 4).setFormula('=SUM(D2:D' + (n + 1) + ')');
+    sh.getRange(t, 10).setValue('합계');
+    sh.getRange(t, 11).setFormula('=ROUND(SUM(K2:K' + (n + 1) + '),2)').setNumberFormat('0.00');
+    sh.getRange(t, 1, 1, W).setFontWeight('bold').setFontSize(11).setHorizontalAlignment('center');
+    sh.getRange(1, 1, n + 1, W).setBorder(true, true, true, true, true, true, '#000000', SpreadsheetApp.BorderStyle.SOLID);
+    sh.getRange(1, 1, n + 1, W).setBorder(true, true, true, true, null, null, '#000000', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    sh.getRange(1, 1, t, W).setFontFamily('Malgun Gothic');
+    [12, 44, 9.5, 10, 44, 14, 19, 16, 15, 13, 15].forEach(function (w, i) { sh.setColumnWidth(i + 1, Math.round(w * 7.5)); });
+    sh.setFrozenRows(1);
+    SpreadsheetApp.flush();
+
+    var res = UrlFetchApp.fetch('https://docs.google.com/spreadsheets/d/' + tmp.getId() + '/export?format=xlsx', {
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) throw new Error('엑셀 변환 실패 (' + res.getResponseCode() + ')');
+    var blob = res.getBlob().setName(fname + '.xlsx');
+    var folder = null;
+    try {
+      var buyer = rsvFindBuyer(rsvReadBuyers_(ss), company, '', RSV_CONFIG.INVOICE_COMPANY_ALIASES);
+      if (buyer) folder = rsvInvoiceFolder_(buyer, company);
+    } catch (e) { folder = null; }
+    var saved = folder ? folder.createFile(blob) : DriveApp.createFile(blob);
+    var boxes = lines.reduce(function (s, l) { return s + (l.boxes || 0); }, 0);
+    var qty = lines.reduce(function (s, l) { return s + l.qty; }, 0);
+    var miss = lines.filter(function (l) { return !l.perBox || !l.exp; }).map(function (l) { return l.name.replace(/^로지킴\s*/, ''); });
+    return {
+      name: fname + '.xlsx', b64: Utilities.base64Encode(blob.getBytes()), driveUrl: saved.getUrl(),
+      summary: n + '종 / ' + rsvFmtNum_(qty) + '개 · ' + boxes + '박스 (' + (folder ? '업체 폴더' : '내 Drive') + '에도 저장)' +
+        '<br>소비기한(EXP)은 이지어드민 재고 기준이에요 — 실제 출고 로트와 맞는지 확인해 주세요' +
+        (miss.length ? '<br>⚠ 입수량/소비기한 정보 없음: ' + miss.join(', ') : ''),
+    };
+  } finally {
+    try { DriveApp.getFileById(tmp.getId()).setTrashed(true); } catch (e) { /* 임시 파일 정리 실패는 무시 */ }
+  }
+}
+
 function rsvReadScheduleRows_() {
   var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
   var last = rsvLastDataRow_(sh);
