@@ -122,7 +122,15 @@ var RSV_CONFIG = {
   INVOICE_ENABLED: true,
   // 패킹리스트 박스 번호 머리글자 (업체명 일부 → 글자). 없으면 PO No. 첫 영문자 (예: LH(TW) → L-1, L-2 …)
   PACKING_BOX_PREFIX: { '리호': 'L' },
-  INVOICE_ROOT_FOLDER_ID: '1gYWMNxOv2M4vZqhy8z2-BEIHTFiPAYQn',     // [00. B2B 발주] — 아래 업체 폴더에 저장
+  INVOICE_ROOT_FOLDER_ID: '1gYWMNxOv2M4vZqhy8z2-BEIHTFiPAYQn',     // [00. B2B 발주] — 07_글로벌에 업체 폴더가 없을 때만 여기 저장
+  // 거래명세서·패킹리스트 저장 위치: [07_글로벌]/<업체 폴더>/03 발주/[거래유형/]YY년 M월(출고월)/[차수 폴더]
+  DOC_ROOT_FOLDER_ID: '1zsQV2vxctKEbWcdMYx4szNQIytXti1md',
+  // 업체명(일부) → 07_글로벌 업체 폴더 이름에 들어 있는 글자
+  DOC_PARTNER_KEYWORDS: {
+    '리호': '리호', '뷰릿지': '뷰릿지', '그리니스트': '그리니스트', '그리스트': '그리니스트', '플루고': 'plugo', 'plugo': 'plugo',
+    '오즈코스': '오즈코스', '청담': '청담', '아이케이브': '아이케이브', '앳코스메': '앳코스메', '글로우데이즈': '앳코스메',
+    '예스': '예스스타일', 'yesstyle': '예스스타일', '위드모어': '위드모어', '홍천': '홍천',
+  },
   INVOICE_TEMPLATE_XLSX_ID: '1WMHRUVfmQwZP8mU5ocbXeJYA6kix2CK0',   // 양식 원본 (261019_뷰릿지코퍼레이션_BG(CN)_261016_11_거래명세서.xlsx)
   INVOICE_BUYER_SHEET: 'B2B 거래업체정보',
   INVOICE_LOG_SHEET: '거래명세서_발급',                           // 숨김 시트: PO 별 단가·SHIP TO·발급 기록
@@ -274,7 +282,8 @@ function rsvOnOpen() {
       .addSeparator()
       .addItem('📑 거래명세서 지금 발급 (사용 예정일 D-2 · 날짜/수량 바뀐 건)', 'rsvIssueInvoicesNow')
       .addItem('📑 선택한 셀의 묶음 거래명세서 발급', 'rsvIssueSelectedInvoices')
-      .addItem('📧 선택한 셀의 거래명세서 메일 보내기', 'rsvMailSelectedInvoices'))
+      .addItem('📧 선택한 셀의 거래명세서 메일 보내기', 'rsvMailSelectedInvoices')
+      .addItem('📁 발급된 거래명세서를 업체 폴더(03 발주/월)로 옮기기', 'rsvMoveIssuedInvoices'))
     .addSubMenu(ui.createMenu('🚚 출고 확인')
       .addItem('슬랙 답글 지금 확인 (출고완료 · 취소 · 변경 승인)', 'rsvCheckSlackNow')
       .addItem('출고일 지난 건 알림 지금 보내기', 'rsvSendOverdueNow')
@@ -1136,9 +1145,14 @@ function rsvSyncInvoices_(opts) {
           try { file = rsvReplaceDriveFile_(g.old.fileId, blob); } catch (e) { file = null; }
           keep = keep.filter(function (x) { return x !== g.old; });
         }
+        // 저장 폴더: 07_글로벌/<업체>/03 발주/YY년 M월(출고월) — 못 찾으면 예전 [00. B2B 발주]
+        var docFolder = null;
+        try { docFolder = rsvDocFolder_(company, buyer.name, inv.date, g.rows[0].purpose + ' ' + poNo, poLabel.replace(/-\d+$/, '')); } catch (e) { docFolder = null; }
         if (!file) {
           if (g.old) { try { DriveApp.getFileById(g.old.fileId).setTrashed(true); } catch (e) { /* 무시 */ } }
-          file = rsvInvoiceFolder_(buyer, company).createFile(blob);
+          file = (docFolder || rsvInvoiceFolder_(buyer, company)).createFile(blob);
+        } else {
+          rsvMoveToFolder_(file, docFolder);
         }
         keep.push({ key: g.key, fileId: file.getId(), url: file.getUrl(), name: file.getName(), sig: g.sig, items: inv.sig, seq: g.seq });
         out.issued++;
@@ -1167,6 +1181,36 @@ function rsvSyncInvoices_(opts) {
 }
 
 /** [거래명세서_발급] F열 → 발급 기록 [{key, fileId, url, name, sig, items}] (예전 버전의 파일 ID 한 개도 읽음) */
+/** 메뉴: 이미 발급된 거래명세서 파일을 07_글로벌/<업체>/03 발주/YY년 M월 로 옮김 (파일명 앞 YYMMDD = 출고일) */
+function rsvMoveIssuedInvoices() {
+  rsvAssertAllowed_();
+  var sh = rsvInvoiceSheet_(), last = sh.getLastRow();
+  if (last < 2) { rsvToast_('발급된 거래명세서가 없습니다'); return; }
+  var vals = sh.getRange(2, 1, last - 1, RSV_INV.msgId).getValues();
+  var moved = 0, same = 0, fail = [];
+  vals.forEach(function (v) {
+    var po = String(v[RSV_INV.po - 1] || ''), company = String(v[RSV_INV.company - 1] || '');
+    rsvInvoiceIssued_(v[RSV_INV.fileId - 1]).forEach(function (x) {
+      if (x.cancelled || !x.fileId) return;
+      try {
+        var file = DriveApp.getFileById(x.fileId);
+        if (file.isTrashed()) return;
+        var m = String(file.getName()).replace(/\.xlsx$/i, '').replace(/_수정$/, '').match(/^(\d{2})(\d{2})(\d{2})_거래명세서_(.+)_[^_]+$/);
+        if (!m) { fail.push(file.getName() + ' (파일명에 날짜 없음)'); return; }
+        var label = m[4].replace(/-\d+$/, '');
+        var folder = rsvDocFolder_(company, '', '20' + m[1] + '-' + m[2] + '-' + m[3], label + ' ' + po, label);
+        if (!folder) { fail.push(file.getName() + ' (07_글로벌에 업체 폴더 없음)'); return; }
+        var ps = file.getParents();
+        while (ps.hasNext()) if (ps.next().getId() === folder.getId()) { same++; return; }
+        file.moveTo(folder);
+        moved++;
+      } catch (e) { fail.push(x.name + ' (' + e.message + ')'); }
+    });
+  });
+  rsvToast_('거래명세서 ' + moved + '건 이동' + (same ? ' · ' + same + '건은 이미 제자리' : '') +
+    (fail.length ? ' · ⚠ ' + fail.join(' / ') : ''));
+}
+
 function rsvInvoiceIssued_(cell) {
   var s = String(cell || '').trim();
   if (!s) return [];
@@ -1546,6 +1590,135 @@ function rsvFindBuyer(buyers, company, vendor, aliases) {
     if (hit) return hit;
   }
   return null;
+}
+
+// ---- 07_글로벌 업체 폴더 (거래명세서·패킹리스트 저장 위치) ----
+
+/** 날짜 → 'YY년 M월' (순수 함수) */
+function rsvDocMonthName(date) {
+  var d = rsvToDate_(date, null);
+  if (!d) return '';
+  var p = Utilities.formatDate(d, Session.getScriptTimeZone(), 'yy-M').split('-');
+  return p[0] + '년 ' + p[1] + '월';
+}
+
+/** 용도/PO 에서 차수 표기 (예: '26-15차') (순수 함수) */
+function rsvDocRound(text) {
+  var m = String(text || '').match(/\d{2}-\d+차/);
+  return m ? m[0] : '';
+}
+
+/** 업체 폴더 이름 목록에서 고르기 (순수 함수). 숫자로 시작하는 정리된 폴더 우선. 반환: index / -1 */
+function rsvPickPartnerFolder(names, company, buyerName, keywords) {
+  var keys = [];
+  var raw = (String(company || '') + ' ' + String(buyerName || '')).toLowerCase();
+  Object.keys(keywords || {}).forEach(function (k) {
+    if (raw.indexOf(k.toLowerCase()) >= 0) keys.push(String(keywords[k]).toLowerCase());
+  });
+  [company, buyerName].forEach(function (x) {
+    var n = rsvCompanyNorm(String(x || '').replace(/인터내셔날/g, ''));
+    if (n.length >= 2) keys.push(n);
+  });
+  var best = -1, bestScore = 0;
+  names.forEach(function (name, i) {
+    var n = rsvCompanyNorm(name);
+    if (!n || !keys.some(function (k) { return n.indexOf(k) >= 0; })) return;
+    var score = /^\d/.test(String(name).trim()) ? 2 : 1;
+    if (score > bestScore) { best = i; bestScore = score; }
+  });
+  return best;
+}
+
+/**
+ * 업체 폴더 안에서 내려갈 하위 폴더 고르기 (순수 함수). step:
+ *  'region' 뷰릿지처럼 지역 폴더가 있을 때 (hint 에 중국/CN · 말레이시아/MY · 홍콩/HK)
+ *  'order'  03 발주 (없으면 '발주서')
+ *  'type'   월 폴더가 바로 없을 때 거래유형 폴더 (플루고 사입/재고 이동, 00 발주, 발주서)
+ *  'month'  YY년 M월
+ *  'round'  월 폴더 안의 차수/PO 폴더 (hint = [차수, PO])
+ * 반환: index / -1
+ */
+function rsvPickDocChild(names, step, hint) {
+  var find = function (re) { for (var i = 0; i < names.length; i++) if (re.test(String(names[i]).trim())) return i; return -1; };
+  var h = String(hint || '');
+  if (step === 'region') {
+    var regions = [[/중국/, /중국|\(CN\)|_CN|CN_/i], [/말레이/, /말레이|\(MY\)|_MY|MY_/i], [/홍콩/, /홍콩|\(HK\)|_HK|HK_/i]];
+    if (!regions.some(function (r) { return find(r[0]) >= 0; })) return -1;
+    for (var r = 0; r < regions.length; r++) if (regions[r][1].test(h)) return find(regions[r][0]);
+    return find(/중국/);
+  }
+  if (step === 'order') { var o = find(/^03\s*발주/); return o >= 0 ? o : find(/^발주서/); }
+  if (step === 'type') {
+    if (names.some(function (n) { return /^\d{2}년\s*\d{1,2}월/.test(String(n).trim()); })) return -1;
+    if (find(/사입/) >= 0 || find(/재고\s*이동/) >= 0) return /재고\s*이동|재고이동/.test(h) ? find(/재고\s*이동/) : find(/사입/);
+    var t = find(/^00\s*발주/);
+    return t >= 0 ? t : find(/^발주서/);
+  }
+  if (step === 'month') {
+    var m = h.match(/^(\d{2})년 (\d{1,2})월$/);
+    return m ? find(new RegExp('^' + m[1] + '년\\s*' + m[2] + '월(?!\\d)')) : -1;
+  }
+  if (step === 'round') {
+    var keys = (Array.isArray(hint) ? hint : [hint]).map(String).filter(function (x) { return x.length >= 4; });
+    for (var k = 0; k < keys.length; k++) {
+      var key = keys[k].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      var i = find(new RegExp(key + '(?![\\d])'));
+      if (i >= 0) return i;
+    }
+    return -1;
+  }
+  return -1;
+}
+
+function rsvDocChildren_(folder) {
+  var list = [], it = folder.getFolders();
+  while (it.hasNext()) list.push(it.next());
+  return list;
+}
+
+/**
+ * 거래명세서·패킹리스트를 저장할 폴더. [07_글로벌]/<업체>/03 발주/[유형/]YY년 M월(출고월)
+ *  월 폴더가 없으면 만들고, 그 안에 차수(예: 26-15차)·PO 이름이 들어간 폴더가 있으면 그 폴더에 넣는다.
+ *  업체 폴더를 못 찾으면 null (호출한 쪽에서 예전 [00. B2B 발주] 폴더로)
+ */
+function rsvDocFolder_(company, buyerName, date, hint, poLabel) {
+  if (!RSV_CONFIG.DOC_ROOT_FOLDER_ID) return null;
+  var month = rsvDocMonthName(date);
+  if (!month) return null;
+  var root = DriveApp.getFolderById(RSV_CONFIG.DOC_ROOT_FOLDER_ID);
+  var kids = rsvDocChildren_(root);
+  var pi = rsvPickPartnerFolder(kids.map(function (f) { return f.getName(); }), company, buyerName, RSV_CONFIG.DOC_PARTNER_KEYWORDS);
+  if (pi < 0) return null;
+  var folder = kids[pi];
+  kids = rsvDocChildren_(folder);
+  var names = kids.map(function (f) { return f.getName(); });
+  if (rsvPickDocChild(names, 'order') < 0) {
+    var ri = rsvPickDocChild(names, 'region', hint);
+    if (ri >= 0) { folder = kids[ri]; kids = rsvDocChildren_(folder); names = kids.map(function (f) { return f.getName(); }); }
+  }
+  var oi = rsvPickDocChild(names, 'order');
+  folder = oi >= 0 ? kids[oi] : folder.createFolder('03 발주');
+  kids = rsvDocChildren_(folder); names = kids.map(function (f) { return f.getName(); });
+  var ti = rsvPickDocChild(names, 'type', hint);
+  if (ti >= 0) { folder = kids[ti]; kids = rsvDocChildren_(folder); names = kids.map(function (f) { return f.getName(); }); }
+  var mi = rsvPickDocChild(names, 'month', month);
+  folder = mi >= 0 ? kids[mi] : folder.createFolder(month);
+  if (mi >= 0) {
+    kids = rsvDocChildren_(folder);
+    var ci = rsvPickDocChild(kids.map(function (f) { return f.getName(); }), 'round', [rsvDocRound(hint), poLabel]);
+    if (ci >= 0) folder = kids[ci];
+  }
+  return folder;
+}
+
+/** 파일이 folder 에 없으면 옮긴다 (실패해도 무시) */
+function rsvMoveToFolder_(file, folder) {
+  if (!file || !folder) return;
+  try {
+    var ps = file.getParents();
+    while (ps.hasNext()) if (ps.next().getId() === folder.getId()) return;
+    file.moveTo(folder);
+  } catch (e) { /* 공유 드라이브 권한 등 — 그대로 둠 */ }
 }
 
 /** 업체 폴더 (00. B2B 발주 아래). 상호 또는 업체명과 비슷한 폴더가 없으면 상호로 새로 만든다 */
@@ -4957,7 +5130,9 @@ function rsvBuildPackingList(company, dateKey) {
     var folder = null;
     try {
       var buyer = rsvFindBuyer(rsvReadBuyers_(ss), company, '', RSV_CONFIG.INVOICE_COMPANY_ALIASES);
-      if (buyer) folder = rsvInvoiceFolder_(buyer, company);
+      var hint = rows.map(function (r) { return r.purpose + ' ' + r.po; }).join(' ');
+      if (dateKey !== 'none') folder = rsvDocFolder_(company, buyer ? buyer.name : '', dateKey, hint, pos.length === 1 ? pos[0] : '');
+      if (!folder && buyer) folder = rsvInvoiceFolder_(buyer, company);
     } catch (e) { folder = null; }
     var saved = folder ? folder.createFile(blob) : DriveApp.createFile(blob);
     var boxes = lines.reduce(function (s, l) { return s + (l.boxes || 0); }, 0);
@@ -4965,7 +5140,7 @@ function rsvBuildPackingList(company, dateKey) {
     var miss = lines.filter(function (l) { return !l.perBox || !l.exp; }).map(function (l) { return l.name.replace(/^로지킴\s*/, ''); });
     return {
       name: fname + '.xlsx', b64: Utilities.base64Encode(blob.getBytes()), driveUrl: saved.getUrl(),
-      summary: n + '종 / ' + rsvFmtNum_(qty) + '개 · ' + boxes + '박스 (' + (folder ? '업체 폴더' : '내 Drive') + '에도 저장)' +
+      summary: n + '종 / ' + rsvFmtNum_(qty) + '개 · ' + boxes + '박스 (' + (folder ? '[' + folder.getName() + '] 폴더' : '내 Drive') + '에도 저장)' +
         '<br>소비기한(EXP)은 이지어드민 재고 기준이에요 — 실제 출고 로트와 맞는지 확인해 주세요' +
         (miss.length ? '<br>⚠ 입수량/소비기한 정보 없음: ' + miss.join(', ') : ''),
     };
