@@ -91,9 +91,9 @@ var RSV_CONFIG = {
   MAIL_QUERY: 'has:attachment newer_than:14d',
   // 이 날짜 이후 받은 메일만 처리 (이전 메일은 이미 수기 등록된 것으로 간주). 'YYYY/MM/DD', 비우면 제한 없음
   MAIL_AFTER: '2026/10/06', // 본 시트 적용일. 이전 PO 는 수기 등록분과 겹치지 않도록 제외
-  // 첨부파일명 정규식: "로지킴" 으로 시작하는 엑셀만 처리 (괄호 종류 무관).
+  // 첨부 엑셀은 파일명과 상관없이 내용이 PURCHASE ORDER 양식이면 등록한다.
+  // 이 정규식(또는 파일명에 '로지킴')에 맞는데 발주서 양식이 아니면 [메일수신로그]에 '건너뜀'으로 남기고, 그 외 엑셀은 조용히 건너뛴다.
   // 예: [로지킴]플루고_PO 26100101_261001.xlsx / (로지킴)_BG(CN)_261007_10_261007.xlsx
-  // 이름이 맞아도 내용이 PURCHASE ORDER 양식이 아니면 건너뛴다.
   ATTACHMENT_NAME_PATTERN: /^\s*[\[(【［（〔<]?\s*로지킴/,
   // 보낸 사람 필터 (비우면 전체). 예: ['@followmecorp.com']
   SENDER_FILTER: [],
@@ -1054,7 +1054,7 @@ function rsvInvoiceRecoverPo_(poNo, created, company) {
       var atts = msgs[m].getAttachments();
       for (var a = 0; a < atts.length; a++) {
         var fname = String(atts[a].getName()).normalize('NFC');
-        if (!RSV_CONFIG.ATTACHMENT_NAME_PATTERN.test(fname) || !/\.(xlsx|xls|xlsm)$/i.test(fname)) continue;
+        if (!/\.(xlsx|xls|xlsm)$/i.test(fname)) continue; // 파일명과 상관없이 PO No. 가 같은 발주서
         var grids = rsvAttachmentToGrids_(atts[a]);
         var po = rsvPickPurchaseOrder(grids);
         if (!po || po.poNo !== poNo) continue;
@@ -2411,13 +2411,20 @@ function rsvImportMail_() {
       msg.getAttachments().forEach(function (att) {
         // 맥에서 보낸 파일은 한글이 자모 분리(NFD)돼 있어 "[로지킴]"과 안 맞음 → NFC 로 정규화
         var fname = String(att.getName()).normalize('NFC');
-        if (!RSV_CONFIG.ATTACHMENT_NAME_PATTERN.test(fname)) return;
         if (!/\.(xlsx|xls|xlsm)$/i.test(fname)) return;
-        touched = true; msgTouched = true;
+        // 파일명이 '로지킴'으로 시작하지 않아도(예: [리호인터내셔날] 26-15차 발주서.xlsx) 내용이 PURCHASE ORDER 양식이면 등록
+        var nameOk = RSV_CONFIG.ATTACHMENT_NAME_PATTERN.test(fname) || /로지킴/.test(fname);
+        msgTouched = true;
+        var po = null;
         try {
           var grids = rsvAttachmentToGrids_(att);
-          var po = rsvPickPurchaseOrder(grids);
-          if (!po) { rsvWriteLog_(msg, fname, '건너뜀: PURCHASE ORDER 양식이 아님 (상단 PURCHASE ORDER / PO No. 확인)'); return; }
+          po = rsvPickPurchaseOrder(grids);
+          if (!po) {
+            // 발주서가 아닌 엑셀: 파일명에 로지킴이 있을 때만 기록 (다른 업무 엑셀은 조용히 건너뜀)
+            if (nameOk) { touched = true; rsvWriteLog_(msg, fname, '건너뜀: PURCHASE ORDER 양식이 아님 (상단 PURCHASE ORDER / PO No. 확인)'); }
+            return;
+          }
+          touched = true;
           if (!po.lines.length) throw new Error('PO ' + po.poNo + ': 품목(품목명 + 총 수량)이 없음');
           rsvTranslateLines(po, rsvPoCatalog(grids));
           var poKey = 'po:' + po.poNo;
@@ -2488,7 +2495,8 @@ function rsvImportMail_() {
             (unmatched ? ' · ⚠ 상품명 매칭 실패 ' + unmatched + '건' : '') +
             (companyNote ? ' · ⚠ 업체명 \'' + po.company + '\' 드롭다운에 없음 → F 비워둠 (COMPANY_ALIASES 에 추가)' : ''));
         } catch (err) {
-          threadOk = false; msgOk = false;
+          if (!po && !nameOk) return; // 발주서인지도 모르는 다른 엑셀의 읽기 오류는 무시
+          threadOk = false; msgOk = false; touched = true;
           rsvWriteLog_(msg, fname, '⚠ 실패: ' + err.message);
         }
       });
