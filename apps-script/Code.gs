@@ -1959,14 +1959,17 @@ function rsvUncheckUnsent_(sh, row) {
 /** 확인 창의 '보내기' → 발송 후 W 체크 · X 제목 · Y 보낸 날짜 */
 function rsvSendInvoiceMail(d) {
   rsvAssertAllowed_();
-  var blob = rsvInvoicePdfBlob_(d.fileId);
-  var opts = { attachments: [blob], name: RSV_CONFIG.INVOICE_MAIL_FROM_NAME || undefined };
+  var step = function (label, fn) { try { return fn(); } catch (e) { throw new Error(label + ' 실패: ' + e.message); } };
+  var blob = step('PDF 변환', function () { return rsvInvoicePdfBlob_(d.fileId); });
+  var opts = { attachments: [blob] };
+  if (RSV_CONFIG.INVOICE_MAIL_FROM_NAME) opts.name = RSV_CONFIG.INVOICE_MAIL_FROM_NAME;
   if (d.msgId) {
     // 답장은 원래 제목(Re: …) 그대로 — 제목을 바꾸면 Gmail 이 다른 대화로 나눔
-    GmailApp.getMessageById(d.msgId).replyAll(d.body, opts);
+    var orig = step('답장할 메일 찾기', function () { return GmailApp.getMessageById(d.msgId); });
+    step('메일 답장', function () { orig.replyAll(d.body, opts); });
   } else {
     if (String(d.cc || '').trim()) opts.cc = d.cc;
-    GmailApp.sendEmail(d.to, d.subject, d.body, opts);
+    step('메일 발송', function () { GmailApp.sendEmail(d.to, d.subject, d.body, opts); });
   }
   // 고른 답장 메일을 기억 (다음에 같은 PO 를 보낼 때 기본값)
   if (d.msgId) {
@@ -1998,11 +2001,16 @@ function rsvInvoicePdfBlob_(fileId) {
   if (res.getResponseCode() >= 300) throw new Error('PDF 변환 실패 (' + res.getResponseCode() + ')');
   var tmpId = JSON.parse(res.getContentText()).id;
   try {
-    var gid = SpreadsheetApp.openById(tmpId).getSheets()[0].getSheetId();
-    var url = 'https://docs.google.com/spreadsheets/d/' + tmpId + '/export?format=pdf&gid=' + gid +
+    // 시트가 하나뿐이라 gid 없이 내보냄 (방금 만든 파일을 SpreadsheetApp 으로 열면 '찾을 수 없음'이 날 수 있음)
+    var url = 'https://docs.google.com/spreadsheets/d/' + tmpId + '/export?format=pdf' +
       '&size=A4&portrait=true&fitw=true&gridlines=false&printtitle=false&sheetnames=false&pagenum=UNDEFINED' +
       '&top_margin=0.5&bottom_margin=0.5&left_margin=0.5&right_margin=0.5&horizontal_alignment=CENTER';
-    var pdf = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+    var pdf = null;
+    for (var tries = 0; tries < 4; tries++) { // 변환 직후에는 잠깐 404 가 날 수 있어 몇 번 다시 시도
+      pdf = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+      if (pdf.getResponseCode() === 200) break;
+      Utilities.sleep(1500);
+    }
     if (pdf.getResponseCode() !== 200) throw new Error('PDF 내보내기 실패 (' + pdf.getResponseCode() + ')');
     return pdf.getBlob().setName(src.getName().replace(/\.xlsx$/i, '') + '.pdf');
   } finally {
