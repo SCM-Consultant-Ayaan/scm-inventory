@@ -160,6 +160,7 @@ var RSV_CONFIG = {
     'plugo': '플루고',
     'beautyridge': '뷰릿지',
     'lihoo': '리호',
+    'liho': '리호',          // LIHOINTERNATIONAL 등 영문 표기
     'oliveyoung': '올리브영',
   },
 
@@ -1381,7 +1382,9 @@ function rsvB2BInfoFromPo(po, fromAddr) {
   var clean = function (s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); };
   var email = clean(po.email);
   if (!/@/.test(email)) email = clean(fromAddr);
-  return { name: clean(po.company), brn: clean(po.brn), person: clean(po.contact), tel: clean(po.tel), email: /@/.test(email) ? email : '' };
+  var brn = clean(po.brn), tel = clean(po.tel);
+  return { name: clean(po.company), brn: brn.replace(/\D/g, '').length >= 10 ? brn : '', person: clean(po.contact),
+    tel: /\d{2,}/.test(tel) ? tel : '', email: /@/.test(email) ? email : '' };
 }
 
 /** 업체 줄 찾기 (순수 함수): 사업자번호(숫자만 비교) → 상호·업체명(F)·별칭. 없으면 -1 */
@@ -2490,7 +2493,7 @@ function rsvImportMail_() {
           pos.push({ poNo: po.poNo, company: company || po.company, purpose: po.purpose, fname: fname,
             from: msg.getFrom(), firstRow: at, count: newRows.length });
           var unmatched = po.lines.filter(function (ln) { return !rsvResolveProduct(ln, products).name; }).length;
-          rsvWriteLog_(msg, fname, '등록 ' + newRows.length + '행 · PO ' + po.poNo + ' · ' + po.purpose +
+          rsvWriteLog_(msg, fname, '등록 ' + newRows.length + '행 · PO ' + po.poNo + (po.poMissing ? ' (⚠ 발주서 PO No. 칸이 비어 임시 번호)' : '') + ' · ' + po.purpose +
             (foc ? ' · FOC ' + foc.name.replace(/^로지킴\s*/, '') + ' ' + rsvFmtNum_(foc.qty) + '개' : '') +
             (unmatched ? ' · ⚠ 상품명 매칭 실패 ' + unmatched + '건' : '') +
             (companyNote ? ' · ⚠ 업체명 \'' + po.company + '\' 드롭다운에 없음 → F 비워둠 (COMPANY_ALIASES 에 추가)' : ''));
@@ -4299,19 +4302,29 @@ function rsvParsePurchaseOrder(grid) {
   if (top.indexOf('purchaseorder') < 0) return null;
 
   // 라벨 오른쪽 첫 값
+  // 칸이 비어 있으면 오른쪽의 다른 라벨(예: '발주 차수', '연락처 (Tel)')을 값으로 읽지 않도록 라벨처럼 생긴 값은 건너뜀
+  var LABELS = ['pono', '발주일', 'podate', '발주차수', '업체명', 'vendor', '사업자', 'brn', '담당자', 'contact', '이메일', 'email',
+    'e-mail', '연락처', 'tel', 'shipto', '회사명', '주소', '유통국가'];
+  var isLabel = function (v) { var t = norm(v); return LABELS.some(function (k) { return t.indexOf(k) === 0; }); };
   var label = function (key) {
     for (var r = 0; r < Math.min(grid.length, 15); r++) {
       for (var c = 0; c < grid[r].length; c++) {
         if (norm(grid[r][c]).indexOf(key) !== 0) continue;
         for (var c2 = c + 1; c2 < grid[r].length; c2++) {
-          if (String(grid[r][c2]).trim() !== '') return grid[r][c2];
+          var val = grid[r][c2];
+          if (String(val).trim() === '') continue;
+          return isLabel(val) ? '' : val;
         }
+        return '';
       }
     }
     return '';
   };
+  // PO No. 칸이 있는지(양식 확인)와 값은 따로 본다: 값이 비었거나 수식 오류(#N/A)면 발주일·차수로 임시 번호
+  var hasPoLabel = grid.slice(0, 15).some(function (r) { return r.some(function (v) { return norm(v).indexOf('pono') === 0; }); });
+  if (!hasPoLabel) return null;
   var poNo = String(label('pono')).trim();
-  if (!poNo) return null;
+  var poMissing = !poNo || /^#/.test(poNo);
   var poDate = rsvToDate_(label('발주일'), new Date());
   var round = String(label('발주차수')).replace(/[^0-9]/g, '');
   var vendor = String(label('업체명')).trim();
@@ -4330,9 +4343,10 @@ function rsvParsePurchaseOrder(grid) {
         price: find('단가'), amount: find('공급가액') };
     }
   }
+  if (poMissing) poNo = 'NOPO_' + rsvFmtYMD_(poDate || new Date()).slice(2).replace(/-/g, '') + (round ? '_' + round : '');
   var yy = poDate ? String(poDate.getFullYear()).slice(2) : (poNo.match(/_(\d{2})\d{4}_/) || [])[1] || '';
   var out = {
-    poNo: poNo, poDate: poDate, round: round, company: company, country: country, lines: [], amount: 0,
+    poNo: poNo, poMissing: poMissing, poDate: poDate, round: round, company: company, country: country, lines: [], amount: 0,
     purpose: [country ? country + ' 수출' : '수출', yy && round ? yy + '-' + Number(round) + '차' : ''].filter(String).join(' '),
     shipTo: rsvParseShipTo(grid),
     brn: String(label('사업자등록번호') || label('사업자번호') || '').trim(),
