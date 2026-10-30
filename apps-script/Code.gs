@@ -122,6 +122,9 @@ var RSV_CONFIG = {
   INVOICE_ENABLED: true,
   // 패킹리스트 박스 번호 머리글자 (업체명 일부 → 글자). 없으면 PO No. 첫 영문자 (예: LH(TW) → L-1, L-2 …)
   PACKING_BOX_PREFIX: { '리호': 'L' },
+  // 패킹리스트 소비기한: 로트(유통기한)별 재고 시트가 있으면 빠른 로트부터 출고 수량만큼 나눠 적음.
+  //  시트 머리글에 상품명(또는 바코드·연동코드) · 유통기한 · 수량(정상재고/재고/수량) 이 있으면 됨 (한 줄 = 한 로트)
+  PACKING_LOT_SHEET: '이지어드민 로트재고',
   INVOICE_ROOT_FOLDER_ID: '1gYWMNxOv2M4vZqhy8z2-BEIHTFiPAYQn',     // [00. B2B 발주] — 07_글로벌에 업체 폴더가 없을 때만 여기 저장
   // 거래명세서·패킹리스트 저장 위치: [07_글로벌]/<업체 폴더>/03 발주/[거래유형/]YY년 M월(출고월)/[차수 폴더]
   DOC_ROOT_FOLDER_ID: '1zsQV2vxctKEbWcdMYx4szNQIytXti1md',
@@ -5040,11 +5043,15 @@ function rsvPackingList(rows, master, exp, prefix) {
     var x = rsvNaturalKey_(a.name), y = rsvNaturalKey_(b.name);
     return x < y ? -1 : x > y ? 1 : 0;
   });
-  var no = 0;
+  var no = 0, usedLots = {};
   lines.forEach(function (l) {
     var m = master[l.code] || master[l.name] || {};
     l.perBox = m.perBox || 0; l.size = m.size || ''; l.weight = m.weight || 0;
-    l.exp = exp[l.code] || exp[l.name] || '';
+    // 소비기한: 빠른 로트부터 출고 수량만큼 (같은 상품 FOC 줄은 본품 다음 로트부터)
+    var lotKey = exp[l.code] ? l.code : l.name;
+    var al = rsvPackingExpAlloc(exp[lotKey], usedLots[lotKey] || 0, l.qty);
+    usedLots[lotKey] = (usedLots[lotKey] || 0) + l.qty;
+    l.exp = al.text; l.expWarn = al.warn;
     l.boxes = l.perBox ? Math.ceil(l.qty / l.perBox) : 0;
     var rem = l.perBox ? l.qty % l.perBox : 0;
     l.note = [l.foc ? 'FOC' : '', l.split, rem ? '낱개 ' + rem + '개 포함' : '', !l.perBox ? '입수량 정보 없음' : ''].filter(String).join(' · ');
@@ -5092,23 +5099,80 @@ function rsvPackingMaster_(ss) {
   return out;
 }
 
-/** [이지어드민 재고_RD] 유통기한 '7186 ( 2029-08-18 )' → {SKU·상품명: '2029.08.18'} */
+/**
+ * 로트 나누기 (순수 함수). lots: [{date:'2029.08.18', qty: 170 | null}] (유통기한 빠른 순), used: 앞 줄에서 이미 쓴 수량
+ *  → {text: '2028.04.13 (170)\n2029.07.22 (1,160)', warn: 다음 로트 날짜를 모름}
+ */
+function rsvPackingExpAlloc(lots, used, qty) {
+  lots = (lots || []).slice().sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+  if (!lots.length) return { text: '', warn: false };
+  var skip = used || 0, need = qty, out = [];
+  for (var i = 0; i < lots.length && need > 0; i++) {
+    var q = lots[i].qty;
+    if (q == null) { out.push({ date: lots[i].date, qty: need, unsure: true }); need = 0; break; }
+    var left = q - Math.min(skip, q);
+    skip = Math.max(0, skip - q);
+    if (left <= 0) continue;
+    var take = Math.min(left, need);
+    out.push({ date: lots[i].date, qty: take });
+    need -= take;
+  }
+  var warn = need > 0 || out.some(function (x) { return x.unsure; });
+  if (out.length === 1 && need <= 0) return { text: out[0].date, warn: !!out[0].unsure };
+  var parts = out.map(function (x) { return x.date + ' (' + rsvFmtNum_(x.qty) + ')'; });
+  if (need > 0) parts.push('다음 로트 확인 필요 (' + rsvFmtNum_(need) + ')');
+  return { text: parts.join('\n'), warn: warn };
+}
+
+/**
+ * 상품별 로트 {SKU·바코드·상품명: [{date, qty}]}.
+ *  [PACKING_LOT_SHEET](로트별 재고)가 있으면 그것, 없는 상품은 [이지어드민 재고_RD] 유통기한 '7186 ( 2029-08-18 )' (그 로트 하나만 — 나머지 날짜는 모름)
+ */
 function rsvPackingExp_(ss) {
-  var sh = ss.getSheetByName('이지어드민 재고_RD');
   var out = {};
+  var add = function (keys, lot) {
+    keys.forEach(function (k) { k = String(k || '').trim(); if (!k) return; (out[k] = out[k] || []).push(lot); });
+  };
+  var ymd = function (x) {
+    if (x instanceof Date && !isNaN(x)) return Utilities.formatDate(x, Session.getScriptTimeZone(), 'yyyy.MM.dd');
+    var m = String(x || '').match(/(\d{4})[-.\/](\d{1,2})[-.\/](\d{1,2})/);
+    return m ? m[1] + '.' + ('0' + m[2]).slice(-2) + '.' + ('0' + m[3]).slice(-2) : '';
+  };
+  var keysOf = function (r, cols) {
+    var ks = [];
+    cols.forEach(function (ci) { if (ci >= 0) ks.push(String(r[ci] || '').trim()); });
+    return ks;
+  };
+  var lotSh = RSV_CONFIG.PACKING_LOT_SHEET ? ss.getSheetByName(RSV_CONFIG.PACKING_LOT_SHEET) : null;
+  if (lotSh && lotSh.getLastRow() > 1) {
+    var lv = lotSh.getRange(1, 1, lotSh.getLastRow(), lotSh.getLastColumn()).getValues();
+    var lh = lv[0].map(function (x) { return String(x).replace(/\s/g, ''); });
+    var f = function (re) { for (var i = 0; i < lh.length; i++) if (re.test(lh[i])) return i; return -1; };
+    var cD = f(/유통기한|소비기한|EXP/i), cQ = f(/^정상재고$|^재고$|^수량$|재고수량|가용재고/);
+    var cN = f(/^상품명$/), cB = f(/바코드/), cK = f(/연동코드/), cO = f(/공급처옵션/);
+    if (cD >= 0 && cQ >= 0) {
+      lv.slice(1).forEach(function (r) {
+        var d = ymd(r[cD]), q = rsvToNum_(r[cQ]);
+        if (!d || !(q > 0)) return;
+        var nm = cN >= 0 ? String(r[cN] || '').trim() : '';
+        add(keysOf(r, [cK, cO, cB]).concat(nm ? [nm, '로지킴 ' + nm] : []), { date: d, qty: q });
+      });
+    }
+  }
+  var sh = ss.getSheetByName('이지어드민 재고_RD');
   if (!sh || sh.getLastRow() < 2) return out;
   var v = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
   var head = v[0].map(function (x) { return String(x).replace(/\s/g, ''); });
   var c = function (k) { return head.indexOf(k); };
-  var cK = c('연동코드'), cO = c('공급처옵션'), cB = c('바코드'), cN = c('상품명'), cE = c('유통기한');
+  var cK2 = c('연동코드'), cO2 = c('공급처옵션'), cB2 = c('바코드'), cN2 = c('상품명'), cE = c('유통기한');
   if (cE < 0) return out;
   v.slice(1).forEach(function (r) {
-    var m = String(r[cE] || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+    var m = String(r[cE] || '').match(/^\s*([\d,]+)?\s*\(\s*(\d{4})-(\d{2})-(\d{2})\s*\)/);
     if (!m) return;
-    var d = m[1] + '.' + m[2] + '.' + m[3];
-    [cK, cO, cB].forEach(function (ci) { var k = ci >= 0 ? String(r[ci] || '').trim() : ''; if (k && !out[k]) out[k] = d; });
-    var nm = cN >= 0 ? String(r[cN] || '').trim() : '';
-    if (nm) { if (!out[nm]) out[nm] = d; if (!out['로지킴 ' + nm]) out['로지킴 ' + nm] = d; }
+    var nm = cN2 >= 0 ? String(r[cN2] || '').trim() : '';
+    var keys = keysOf(r, [cK2, cO2, cB2]).concat(nm ? [nm, '로지킴 ' + nm] : []);
+    if (keys.some(function (k) { return k && out[k]; })) return; // 로트 시트에 있는 상품은 그것만
+    add(keys, { date: m[2] + '.' + m[3] + '.' + m[4], qty: m[1] ? rsvToNum_(m[1]) : null });
   });
   return out;
 }
@@ -5154,8 +5218,9 @@ function rsvBuildPackingList(company, dateKey) {
       sh.getRange(2, 1, n, 1).setNumberFormat('yyyy-mm-dd');
       sh.getRange(2, 3, n, 1).setNumberFormat('#,##0');
       sh.getRange(2, 10, n, 2).setNumberFormat('0.00');
-      // 소비기한은 재고 데이터 기준이라 실제 출고 로트와 다를 수 있음 → 연노랑으로 '확인' 표시
-      sh.getRange(2, 7, n, 1).setBackground('#fff9e6');
+      // 소비기한은 재고 데이터 기준이라 실제 출고 로트와 다를 수 있음 → 연노랑으로 '확인' 표시, 다음 로트를 모르면 빨간 글씨
+      sh.getRange(2, 7, n, 1).setBackground('#fff9e6').setWrap(true);
+      lines.forEach(function (l, i) { if (l.expWarn) sh.getRange(2 + i, 7).setFontColor('#cc0000').setFontWeight('bold'); });
     }
     var t = n + 2;
     sh.getRange(t, 3).setFormula('=SUM(C2:C' + (n + 1) + ')').setNumberFormat('#,##0');
@@ -5186,10 +5251,12 @@ function rsvBuildPackingList(company, dateKey) {
     var boxes = lines.reduce(function (s, l) { return s + (l.boxes || 0); }, 0);
     var qty = lines.reduce(function (s, l) { return s + l.qty; }, 0);
     var miss = lines.filter(function (l) { return !l.perBox || !l.exp; }).map(function (l) { return l.name.replace(/^로지킴\s*/, ''); });
+    var warnLot = lines.filter(function (l) { return l.expWarn; }).map(function (l) { return l.name.replace(/^로지킴\s*/, ''); });
     return {
       name: fname + '.xlsx', b64: Utilities.base64Encode(blob.getBytes()), driveUrl: saved.getUrl(),
       summary: n + '종 / ' + rsvFmtNum_(qty) + '개 · ' + boxes + '박스 (' + (folder ? '[' + folder.getName() + '] 폴더' : '내 Drive') + '에도 저장)' +
-        '<br>소비기한(EXP)은 이지어드민 재고 기준이에요 — 실제 출고 로트와 맞는지 확인해 주세요' +
+        '<br>소비기한(EXP)은 이지어드민 재고 기준 · 유통기한 빠른 로트부터 출고 수량만큼 나눠 적었어요' +
+        (warnLot.length ? '<br>⚠ 다음 로트 소비기한을 몰라 빨간 글씨: ' + warnLot.join(', ') + ' — [' + RSV_CONFIG.PACKING_LOT_SHEET + '] 시트(로트별 재고)를 넣으면 자동으로 채워져요' : '') +
         (miss.length ? '<br>⚠ 입수량/소비기한 정보 없음: ' + miss.join(', ') : ''),
     };
   } finally {
