@@ -1956,7 +1956,9 @@ function rsvInvoiceTargets(values) {
 function rsvInvoiceGroupRows_(values, t) {
   var out = [];
   rsvInvoiceTargets(values).forEach(function (x, i) {
-    if (x && !x.excluded && x.id === t.id && x.key === t.key) out.push(RSV_CONFIG.FIRST_ROW + i);
+    // 발주취소 행은 거래명세서에도 안 들어가므로 메일 본문 종·수량에서도 뺀다
+    if (x && !x.excluded && x.id === t.id && x.key === t.key &&
+      String(values[i][RSV_COL.status - 1]).trim() !== RSV_CONFIG.STATUS_CANCEL) out.push(RSV_CONFIG.FIRST_ROW + i);
   });
   return out;
 }
@@ -2046,7 +2048,7 @@ function rsvShowInvoiceMailDialog_(t, queue) {
   // 답장할 메일 찾기 기본 검색어: 거래처 메일 주소 → 없으면 업체명
   var query = (buyer && buyer.emails.length ? 'from:(' + buyer.emails.join(' OR ') + ')' : '"' + info.company + '"') + ' newer_than:120d';
   var cur = thread ? { id: msgId, label: '📌 발주 메일 · ' + origSubject, to: to, cc: cc, subject: rsvReplySubject(origSubject) } : null;
-  var label = String(f.entry.name || file.getName()).replace(/\.xlsx$/, '');
+  var label = String(file.getName() || f.entry.name).replace(/\.xlsx$/, ''); // 실제 파일 이름 (첨부 이름과 같게)
   var parts = label.split('_거래명세서_');
   var poLabel = (parts[1] || label).replace(/_[^_]*$/, '');
   var sentBefore = rows.map(function (r) { return values[r - RSV_CONFIG.FIRST_ROW][RSV_COL.mailSentAt - 1]; }).filter(Boolean)[0];
@@ -2107,6 +2109,29 @@ function rsvShowInvoiceMailDialog_(t, queue) {
 /**
  * 같은 대화(스레드)에 받는 사람·참조를 지정해 답장 (Gmail API). In-Reply-To / References 로 스레드를 잇는다.
  */
+/**
+ * 메일 주소 목록 헤더용 (순수 함수). 한글 이름은 =?UTF-8?B?..?= 로 바꿔야 받는 쪽에서 안 깨짐.
+ *  '"유지웅" <a@b.com>, J Kim <c@d.com>' → '=?UTF-8?B?...?= <a@b.com>, "J Kim" <c@d.com>'
+ */
+function rsvEncodeAddrList(list, enc) {
+  var parts = [], cur = '', q = false;
+  String(list || '').split('').forEach(function (ch) {
+    if (ch === '"') q = !q;
+    if ((ch === ',' || ch === ';') && !q) { parts.push(cur); cur = ''; return; }
+    cur += ch;
+  });
+  parts.push(cur);
+  return parts.map(function (p) {
+    p = p.trim();
+    if (!p) return '';
+    var m = p.match(/^(.*?)\s*<([^>]+)>$/);
+    if (!m) return p;
+    var name = m[1].trim().replace(/^"(.*)"$/, '$1').replace(/\\"/g, '"').trim();
+    if (!name) return '<' + m[2] + '>';
+    return (/[^\x20-\x7e]/.test(name) ? enc(name) : '"' + name.replace(/"/g, '') + '"') + ' <' + m[2] + '>';
+  }).filter(String).join(', ');
+}
+
 function rsvGmailReply_(orig, to, cc, subject, body, blob) {
   if (!String(to || '').trim()) throw new Error('받는 사람이 비어 있음');
   var b64 = function (str) { return Utilities.base64Encode(Utilities.newBlob(str).getBytes()); };
@@ -2116,8 +2141,8 @@ function rsvGmailReply_(orig, to, cc, subject, body, blob) {
   var refs = (orig.getHeader('References') || '') + (msgId ? ' ' + msgId : '');
   var bd = 'rsv' + Date.now();
   var lines = [
-    'To: ' + to,
-    cc && String(cc).trim() ? 'Cc: ' + cc : '',
+    'To: ' + rsvEncodeAddrList(to, enc),
+    cc && String(cc).trim() ? 'Cc: ' + rsvEncodeAddrList(cc, enc) : '',
     'Subject: ' + enc(subject),
     msgId ? 'In-Reply-To: ' + msgId : '',
     refs.trim() ? 'References: ' + refs.trim() : '',
