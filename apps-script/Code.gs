@@ -1115,7 +1115,7 @@ function rsvSyncInvoices_(opts) {
       rows.push({ row: RSV_CONFIG.FIRST_ROW + i, name: String(v[RSV_COL.name - 1]).trim(), qty: rsvToNum_(v[RSV_COL.qty - 1]),
         foc: t.foc, shipDate: v[RSV_COL.shipDate - 1], useDate: v[RSV_COL.useDate - 1],
         company: String(v[RSV_COL.company - 1] || '').trim(), purpose: String(v[RSV_COL.purpose - 1] || '').trim(),
-        level: t.level });
+        memo: String(v[RSV_COL.memo - 1] || ''), level: t.level });
     });
     prices = rsvApplyPriceList(prices, rows, String(rec[RSV_INV.company - 1] || ''), RSV_CONFIG.INVOICE_PRICE_LIST);
     prices = rsvFillMissingPrices(prices, rows, (rows[0] && rows[0].company) || String(rec[RSV_INV.company - 1] || ''), priceSheet);
@@ -1307,7 +1307,8 @@ function rsvReadPriceSheet_() {
   if (!sh || sh.getLastRow() < 2) return out;
   sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues().forEach(function (r) {
     var c = String(r[0] || '').trim(), n = String(r[1] || '').trim(), p = rsvToNum_(r[2]);
-    if (c && n && p > 0) (out[c] = out[c] || {})[n] = p;
+    // 0 을 직접 적은 상품은 무상(0원)으로
+    if (c && n && (p > 0 || (String(r[2]).trim() !== '' && p === 0))) (out[c] = out[c] || {})[n] = p;
   });
   return out;
 }
@@ -1319,7 +1320,9 @@ function rsvFillMissingPrices(prices, rows, company, sheetMap) {
   var list = (sheetMap || {})[company] || {};
   rows.forEach(function (r) {
     var p = out[r.name];
-    if ((p == null || p < 100 || p % 1) && list[r.name] > 0) out[r.name] = list[r.name];
+    if (!(p == null || p < 100 || p % 1) || list[r.name] == null) return;
+    out[r.name] = list[r.name];
+    if (list[r.name] === 0) { out.__free__ = (out.__free__ || []).slice(); if (out.__free__.indexOf(r.name) < 0) out.__free__.push(r.name); }
   });
   return out;
 }
@@ -1340,11 +1343,11 @@ function rsvShowPriceDialog_(miss, next, rest) {
     '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:14px;color:#222}table{width:100%;border-collapse:collapse}' +
     'td{padding:5px 4px;border-bottom:1px solid #eee}input[type=number]{width:110px;padding:5px;font-size:13px}.g{color:#777;font-size:12px}' +
     'button{border:0;border-radius:4px;padding:9px 16px;font-size:13px;cursor:pointer;margin-right:6px}#s{background:#1a73e8;color:#fff}#c{background:#e8eaed}</style>' +
-    '<div><b>' + esc(miss.company) + ' · ' + esc(miss.po) + '</b> 발주서에 원화 단가가 없어요. 단가(원, 부가세 별도)를 입력하면 거래명세서에 넣어요.</div>' +
+    '<div><b>' + esc(miss.company) + ' · ' + esc(miss.po) + '</b> 발주서에 원화 단가가 없어요. 단가(원, 부가세 별도)를 입력하면 거래명세서에 넣어요. <span class="g">무상(재고이동 등)은 0</span></div>' +
     '<table>' + rowsHtml + '</table>' +
     '<label style="display:block;margin-top:10px"><input type="checkbox" id="sv" checked> [' + RSV_PRICE_SHEET + '] 시트에도 저장 — 다음에 이 업체 발주서에 단가가 없으면 자동으로 사용</label>' +
     '<div style="margin-top:12px"><button id="s" onclick="go()">저장하고 계속</button><button id="c" onclick="google.script.host.close()">취소</button><span id="m"></span></div>' +
-    '<script>var P=' + payload + ';function go(){var pr={},miss=[];P.miss.names.forEach(function(n,i){var v=+document.getElementById("p"+i).value;if(v>0)pr[n]=v;else miss.push(n);});' +
+    '<script>var P=' + payload + ';function go(){var pr={},miss=[];P.miss.names.forEach(function(n,i){var s=document.getElementById("p"+i).value.trim();if(s!==""&&+s>=0)pr[n]=+s;else miss.push(n);});' +
     'var m=document.getElementById("m");if(miss.length){m.textContent=" 단가를 모두 입력하세요 ("+miss.length+"개 남음)";return;}' +
     'document.getElementById("s").disabled=true;m.textContent=" 저장 중…";' +
     'google.script.run.withSuccessHandler(function(r){m.textContent=" "+r;if(!/다음 PO/.test(r))setTimeout(function(){google.script.host.close()},1200);}).withFailureHandler(function(e){document.getElementById("s").disabled=false;m.textContent=" ⚠ "+e.message;})' +
@@ -1362,7 +1365,12 @@ function rsvSavePricesAndContinue(p) {
       if (String(v[0]) !== p.po) return;
       var cell = log.getRange(i + 2, RSV_INV.prices), cur = {};
       try { cur = JSON.parse(cell.getValue() || '{}'); } catch (e) { cur = {}; }
-      Object.keys(p.prices).forEach(function (n) { cur[n] = p.prices[n]; });
+      var free = (cur.__free__ || []).filter(function (n) { return !(p.prices[n] > 0); });
+      Object.keys(p.prices).forEach(function (n) {
+        cur[n] = p.prices[n];
+        if (p.prices[n] === 0 && free.indexOf(n) < 0) free.push(n); // 0원 확인한 상품 (발주서 0 과 구분)
+      });
+      if (free.length) cur.__free__ = free; else delete cur.__free__;
       cell.setValue(JSON.stringify(cur));
     });
   }
@@ -1431,9 +1439,11 @@ function rsvInvoiceContent(rows, prices, now, datePick) {
   var lines = [], byKey = {}, missing = [], dates = [], missingNames = [], missingKnown = {};
   rows.forEach(function (r) {
     if (!(r.qty > 0)) return;
-    var price = r.foc ? 0 : prices[r.name];
+    // 재고이동(무상) 건이거나 단가 입력 창·[업체별 단가]에서 0원으로 확인한 상품은 0원
+    var free = r.foc || /재고\s*이동/.test((r.purpose || '') + ' ' + (r.memo || '')) || ((prices.__free__ || []).indexOf(r.name) >= 0 && !prices[r.name]);
+    var price = free ? 0 : prices[r.name];
     // 단가가 없거나 원화로 보기 어려운 값(소수·100원 미만 — 외화 PO)이면 발급 보류
-    if (price == null || (!r.foc && (price < 100 || price % 1))) {
+    if (price == null || (!free && (price < 100 || price % 1))) {
       var tag = r.name + (price != null ? ' (단가 ' + price + ' — 외화?)' : '');
       if (missing.indexOf(tag) < 0) { missing.push(tag); missingNames.push(r.name); missingKnown[r.name] = price; }
       price = price || 0;
