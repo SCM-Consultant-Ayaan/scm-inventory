@@ -5020,16 +5020,25 @@ function rsvPackingDates(company) {
  */
 function rsvPackingList(rows, master, exp, prefix) {
   var lines = [], byKey = {};
+  // 상품 단위로 합침 (차수가 달라도 한 줄) — 출고 차수 칸에 차수를 모아서 표기
   rows.forEach(function (r) {
-    var k = r.name + '|' + r.purpose + '|' + (r.foc ? 'f' : '');
-    if (!byKey[k]) { byKey[k] = { name: r.name, code: r.code, qty: 0, purpose: r.purpose, foc: r.foc, date: rsvToDate_(r.ship, null) }; lines.push(byKey[k]); }
-    byKey[k].qty += r.qty;
-    if (!byKey[k].code && r.code) byKey[k].code = r.code;
+    var k = r.name + '|' + (r.foc ? 'f' : '');
+    if (!byKey[k]) { byKey[k] = { name: r.name, code: r.code, qty: 0, parts: [], foc: r.foc, date: rsvToDate_(r.ship, null) }; lines.push(byKey[k]); }
+    var l = byKey[k];
+    l.qty += r.qty;
+    if (!l.code && r.code) l.code = r.code;
+    var p = l.parts.filter(function (x) { return x.purpose === r.purpose; })[0];
+    if (p) p.qty += r.qty; else l.parts.push({ purpose: r.purpose, qty: r.qty });
+  });
+  lines.forEach(function (l) {
+    l.parts.sort(function (a, b) { var x = rsvNaturalKey_(a.purpose), y = rsvNaturalKey_(b.purpose); return x < y ? -1 : x > y ? 1 : 0; });
+    l.purpose = rsvJoinPurposes(l.parts.map(function (x) { return x.purpose; }));
+    l.split = l.parts.length > 1 ? l.parts.map(function (x) { return (rsvDocRound(x.purpose) || x.purpose) + ' ' + rsvFmtNum_(x.qty); }).join(' + ') : '';
   });
   lines.sort(function (a, b) {
     if (a.foc !== b.foc) return a.foc ? 1 : -1;
     var x = rsvNaturalKey_(a.name), y = rsvNaturalKey_(b.name);
-    return x < y ? -1 : x > y ? 1 : (a.purpose < b.purpose ? -1 : 1);
+    return x < y ? -1 : x > y ? 1 : 0;
   });
   var no = 0;
   lines.forEach(function (l) {
@@ -5038,7 +5047,7 @@ function rsvPackingList(rows, master, exp, prefix) {
     l.exp = exp[l.code] || exp[l.name] || '';
     l.boxes = l.perBox ? Math.ceil(l.qty / l.perBox) : 0;
     var rem = l.perBox ? l.qty % l.perBox : 0;
-    l.note = [l.foc ? 'FOC' : '', rem ? '낱개 ' + rem + '개 포함' : '', !l.perBox ? '입수량 정보 없음' : ''].filter(String).join(' · ');
+    l.note = [l.foc ? 'FOC' : '', l.split, rem ? '낱개 ' + rem + '개 포함' : '', !l.perBox ? '입수량 정보 없음' : ''].filter(String).join(' · ');
     if (l.boxes) {
       var a = no + 1, b = no + l.boxes;
       l.boxNo = prefix + '-' + a + (b > a ? ' ~ ' + prefix + '-' + b : '');
@@ -5047,6 +5056,16 @@ function rsvPackingList(rows, master, exp, prefix) {
     l.total = l.boxes && l.weight ? Math.round(l.boxes * l.weight * 100) / 100 : '';
   });
   return lines;
+}
+
+/** 여러 용도를 한 칸에 (순수 함수). '중국 수출 26-8차' + '중국 수출 26-12차' → '중국 수출 26-8차 · 26-12차' */
+function rsvJoinPurposes(list) {
+  var uniq = [];
+  list.forEach(function (x) { x = String(x || '').trim(); if (x && uniq.indexOf(x) < 0) uniq.push(x); });
+  if (uniq.length < 2) return uniq[0] || '';
+  var ms = uniq.map(function (x) { return x.match(/^(.*?)(\d{2}-\d+차.*)$/); });
+  if (ms.every(function (m) { return m && m[1] === ms[0][1]; })) return ms[0][1] + ms.map(function (m) { return m[2]; }).join(' · ');
+  return uniq.join(' / ');
 }
 
 /** [상품 마스터 시트] → {SKU·상품명: {perBox, size, weight}} (헤더 이름으로 열을 찾음) */
