@@ -1130,7 +1130,7 @@ function rsvSyncInvoices_(opts) {
         out.errors.push(poNo + ' 단가 없음: ' + inv.missingPrice.join(', '));
         if (!out.missing.some(function (x) { return x.po === poNo; })) {
           out.missing.push({ po: poNo, company: (g.rows[0] && g.rows[0].company) || String(rec[RSV_INV.company - 1] || ''),
-            names: inv.missingNames, known: inv.missingKnown });
+            names: inv.missingNames, known: inv.missingKnown, why: inv.missingWhy || {} });
         }
         rsvWarnOnce_('거래명세서 보류 ' + poNo + ' — 단가를 모르는 품목: ' + inv.missingPrice.join(', ') + ' (셀 선택 발급·메일 체크 때 단가 입력 창이 뜸)');
         return;
@@ -1334,14 +1334,15 @@ function rsvFillMissingPrices(prices, rows, company, sheetMap) {
 function rsvShowPriceDialog_(miss, next, rest) {
   var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); };
   var rowsHtml = miss.names.map(function (n, i) {
-    var k = miss.known[n];
-    return '<tr><td>' + esc(n.replace(/^로지킴\s*/, '')) + (k != null && k !== '' ? ' <span class="g">(발주서: ' + esc(k) + ')</span>' : '') + '</td>' +
-      '<td><input type="number" min="0" step="1" id="p' + i + '" placeholder="원"></td></tr>';
+    var k = miss.known[n], why = (miss.why || {})[n];
+    return '<tr><td>' + esc(n.replace(/^로지킴\s*/, '')) + (why ? ' <span class="w">' + esc(why) + ' → 0원 맞는지 확인</span>' : '') +
+      (k != null && k !== '' ? ' <span class="g">(발주서: ' + esc(k) + ')</span>' : '') + '</td>' +
+      '<td><input type="number" min="0" step="1" id="p' + i + '" placeholder="원"' + (why ? ' value="0"' : '') + '></td></tr>';
   }).join('');
   var payload = JSON.stringify({ miss: miss, next: next, rest: rest || [] }).replace(/</g, '\\u003c');
   var html =
     '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:14px;color:#222}table{width:100%;border-collapse:collapse}' +
-    'td{padding:5px 4px;border-bottom:1px solid #eee}input[type=number]{width:110px;padding:5px;font-size:13px}.g{color:#777;font-size:12px}' +
+    'td{padding:5px 4px;border-bottom:1px solid #eee}input[type=number]{width:110px;padding:5px;font-size:13px}.g{color:#777;font-size:12px}.w{color:#c5221f;font-size:12px;font-weight:bold}' +
     'button{border:0;border-radius:4px;padding:9px 16px;font-size:13px;cursor:pointer;margin-right:6px}#s{background:#1a73e8;color:#fff}#c{background:#e8eaed}</style>' +
     '<div><b>' + esc(miss.company) + ' · ' + esc(miss.po) + '</b> 발주서에 원화 단가가 없어요. 단가(원, 부가세 별도)를 입력하면 거래명세서에 넣어요. <span class="g">무상(재고이동 등)은 0</span></div>' +
     '<table>' + rowsHtml + '</table>' +
@@ -1349,6 +1350,8 @@ function rsvShowPriceDialog_(miss, next, rest) {
     '<div style="margin-top:12px"><button id="s" onclick="go()">저장하고 계속</button><button id="c" onclick="google.script.host.close()">취소</button><span id="m"></span></div>' +
     '<script>var P=' + payload + ';function go(){var pr={},miss=[];P.miss.names.forEach(function(n,i){var s=document.getElementById("p"+i).value.trim();if(s!==""&&+s>=0)pr[n]=+s;else miss.push(n);});' +
     'var m=document.getElementById("m");if(miss.length){m.textContent=" 단가를 모두 입력하세요 ("+miss.length+"개 남음)";return;}' +
+    'var z=P.miss.names.filter(function(n){return pr[n]===0;});' +
+    'if(z.length&&!confirm("⚠ 아래 "+z.length+"개 상품을 0원(무상)으로 거래명세서에 넣습니다. 맞나요?\\n\\n- "+z.map(function(n){return n.replace(/^로지킴\\s*/,"");}).join("\\n- ")))return;' +
     'document.getElementById("s").disabled=true;m.textContent=" 저장 중…";' +
     'google.script.run.withSuccessHandler(function(r){m.textContent=" "+r;if(!/다음 PO/.test(r))setTimeout(function(){google.script.host.close()},1200);}).withFailureHandler(function(e){document.getElementById("s").disabled=false;m.textContent=" ⚠ "+e.message;})' +
     '.rsvSavePricesAndContinue({po:P.miss.po,company:P.miss.company,prices:pr,save:document.getElementById("sv").checked,next:P.next,rest:P.rest});}</script>';
@@ -1436,16 +1439,23 @@ function rsvReplaceDriveFile_(fileId, blob) {
  *  같은 상품·단가는 합침 (일부 출고로 나뉜 행). FOC 는 단가 0. 발급일 = 출고예정일 (datePick 'last': 가장 늦은 날 / 'first')
  */
 function rsvInvoiceContent(rows, prices, now, datePick) {
-  var lines = [], byKey = {}, missing = [], dates = [], missingNames = [], missingKnown = {};
+  var lines = [], byKey = {}, missing = [], dates = [], missingNames = [], missingKnown = {}, missingWhy = {};
   rows.forEach(function (r) {
     if (!(r.qty > 0)) return;
-    // 재고이동(무상) 건이거나 단가 입력 창·[업체별 단가]에서 0원으로 확인한 상품은 0원
-    var free = r.foc || /재고\s*이동/.test((r.purpose || '') + ' ' + (r.memo || '')) || ((prices.__free__ || []).indexOf(r.name) >= 0 && !prices[r.name]);
-    var price = free ? 0 : prices[r.name];
+    // FOC 와, 단가 입력 창·[업체별 단가]에서 0원으로 확인한 상품만 0원.
+    // 재고이동 건도 0원이지만 그냥 나가면 안 되므로 단가 입력 창에서 한 번 확인받는다 (0 이 미리 채워짐)
+    var confirmed0 = (prices.__free__ || []).indexOf(r.name) >= 0 && !prices[r.name];
+    var free = r.foc || confirmed0;
+    var move = !free && /재고\s*이동/.test((r.purpose || '') + ' ' + (r.memo || ''));
+    var price = free ? 0 : move ? null : prices[r.name];
     // 단가가 없거나 원화로 보기 어려운 값(소수·100원 미만 — 외화 PO)이면 발급 보류
     if (price == null || (!free && (price < 100 || price % 1))) {
-      var tag = r.name + (price != null ? ' (단가 ' + price + ' — 외화?)' : '');
-      if (missing.indexOf(tag) < 0) { missing.push(tag); missingNames.push(r.name); missingKnown[r.name] = price; }
+      var tag = r.name + (move ? ' (재고이동 — 0원 확인 필요)' : price != null ? ' (단가 ' + price + ' — 외화?)' : '');
+      if (missing.indexOf(tag) < 0) {
+        missing.push(tag); missingNames.push(r.name);
+        missingKnown[r.name] = move ? prices[r.name] : price;
+        if (move) missingWhy[r.name] = '재고이동';
+      }
       price = price || 0;
     }
     var k = r.name + '|' + price + '|' + (r.foc ? 'f' : '');
@@ -1457,7 +1467,7 @@ function rsvInvoiceContent(rows, prices, now, datePick) {
   lines.sort(function (a, b) { return (a.foc ? 1 : 0) - (b.foc ? 1 : 0); });
   var date = dates.length ? new Date(datePick === 'first' ? Math.min.apply(null, dates) : Math.max.apply(null, dates)) : rsvStartOfDay_(now);
   var sig = lines.map(function (l) { return l.name + ':' + l.qty + ':' + l.price + (l.foc ? ':f' : ''); }).sort().join(';');
-  return { lines: lines, date: date, sig: sig, missingPrice: missing, missingNames: missingNames, missingKnown: missingKnown };
+  return { lines: lines, date: date, sig: sig, missingPrice: missing, missingNames: missingNames, missingKnown: missingKnown, missingWhy: missingWhy };
 }
 
 /** 품목명 → 명세서 표기 {name, spec} (순수 함수). '로지킴 PDRN 틴티드 립 앰플 10ml_01 새틴' → 'PDRN 틴티드 립 앰플 01 새틴' / '10ml' */
@@ -2067,10 +2077,12 @@ function rsvShowInvoiceMailDialog_(t, queue) {
   var sentBefore = rows.map(function (r) { return values[r - RSV_CONFIG.FIRST_ROW][RSV_COL.mailSentAt - 1]; }).filter(Boolean)[0];
   var subject = RSV_CONFIG.INVOICE_MAIL_SUBJECT.replace('{po}', poLabel).replace('{company}', info.company);
   var qty = rows.reduce(function (s, r) { return s + rsvToNum_(values[r - RSV_CONFIG.FIRST_ROW][RSV_COL.qty - 1]); }, 0);
+  // 0원(무상) 품목은 보내기 전에 한 번 더 확인 (FOC 제외)
+  var zero = rsvInvoiceZeroItems(f.entry.items || f.entry.sig || '');
   var body = RSV_CONFIG.INVOICE_MAIL_BODY.replace('{po}', poLabel).replace('{company}', info.company)
     .replace('{date}', (parts[0] || '').replace(/^(\d\d)(\d\d)(\d\d)$/, '20$1-$2-$3')).replace('{count}', rows.length).replace('{qty}', rsvFmtNum_(qty));
   var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); };
-  var payload = JSON.stringify({ t: t, fileId: file.getId(), cur: cur, newTo: newTo, queue: queue }).replace(/</g, '\\u003c');
+  var payload = JSON.stringify({ t: t, fileId: file.getId(), cur: cur, newTo: newTo, queue: queue, zero: zero }).replace(/</g, '\\u003c');
   var html =
     '<style>body{font-family:Arial,"Malgun Gothic",sans-serif;font-size:13px;margin:14px;color:#222}label{display:block;margin:8px 0 3px;font-weight:bold}' +
     'input[type=text],textarea{width:100%;box-sizing:border-box;padding:6px;font-size:13px;border:1px solid #ccc;border-radius:4px}' +
@@ -2080,6 +2092,7 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     '<div class="box">📎 <b>' + esc(file.getName().replace(/\.xlsx$/i, '.pdf')) + '</b> <span class="g">(PDF로 바꿔 첨부 · 원본 <a href="' + esc(file.getUrl()) + '" target="_blank">xlsx</a>)</span><br>' +
     esc(info.company) + ' · ' + esc(info.purpose) + ' · ' + rows.length + '행 / ' + rsvFmtNum_(qty) + '개 <span class="g">(' + rows.join(', ') + '행)</span><br>' +
     '보내는 계정: <b>' + esc(me || '(트리거 설치한 계정)') + '</b>' +
+    (zero.length ? '<br><span class="warn">⚠ 0원(무상) 품목 ' + zero.length + '개: ' + esc(zero.join(', ')) + ' — 맞는지 확인하세요</span>' : '') +
     (sentBefore ? '<br><span class="warn">⚠ 이미 ' + esc(rsvFmtDateTime_(new Date(sentBefore))) + '에 보낸 거래명세서예요. 다시 보내면 한 번 더 발송됩니다.</span>' : '') +
     (queue.length ? '<br><span class="g">이어서 ' + queue.length + '건 더 확인합니다</span>' : '') + '</div>' +
     '<label>답장할 메일 <span class="g" style="font-weight:normal">(고르면 그 대화에 답장 · 제목은 Re: 원래 제목 · 받는 사람·참조는 아래 칸 그대로)</span></label>' +
@@ -2108,6 +2121,7 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     'var d={t:P.t,fileId:P.fileId,msgId:$("mm").value,to:document.getElementById("to").value,cc:document.getElementById("cc").value,' +
     'subject:document.getElementById("su").value,body:document.getElementById("bo").value,queue:P.queue};' +
     'if(!d.msgId&&!d.to.trim()){m.textContent="받는 사람을 입력하세요";return;}' +
+    'if(P.zero.length&&!confirm("⚠ 0원(무상) 품목이 있어요. 그대로 보낼까요?\\n\\n- "+P.zero.join("\\n- ")))return;' +
     'if(!confirm("이 내용으로 보낼까요?\\n"+(d.msgId?"선택한 메일에 전체 답장\\n받는 사람: "+d.to:"받는 사람: "+d.to)+"\\n제목: "+d.subject))return;' +
     'document.getElementById("s").disabled=true;m.textContent="보내는 중…";' +
     'google.script.run.withSuccessHandler(function(r){m.textContent=r;if(!P.queue.length)setTimeout(function(){google.script.host.close()},1500);})' +
@@ -2117,6 +2131,14 @@ function rsvShowInvoiceMailDialog_(t, queue) {
     '</script>';
   SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(640).setHeight(620),
     '📧 거래명세서 메일 보내기 — ' + info.company);
+}
+
+/** 거래명세서 내용 서명('상품:수량:단가[:f];…')에서 0원 품목 (FOC 제외) (순수 함수) */
+function rsvInvoiceZeroItems(sig) {
+  var s = String(sig || '').replace(/^\d{4}-\d{2}-\d{2}#\d+#/, '');
+  return s ? s.split(';').map(function (x) { return x.split(':'); })
+    .filter(function (p) { return p.length >= 3 && Number(p[2]) === 0 && p[3] !== 'f'; })
+    .map(function (p) { return p[0].replace(/^로지킴\s*/, ''); }) : [];
 }
 
 /**
