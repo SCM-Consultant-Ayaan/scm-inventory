@@ -941,19 +941,23 @@ function rsvIssueSelectedInvoices() {
   // 기억된 단가가 없는 PO 는 메일에서 발주서를 다시 찾는다
   var known = {}, log = rsvInvoiceSheet_();
   if (log.getLastRow() > 1) log.getRange(2, 1, log.getLastRow() - 1, 1).getValues().forEach(function (v) { known[String(v[0])] = true; });
-  var errors = [];
+  var errors = [], notes = [];
   pos.forEach(function (po) {
     try {
       if (po.indexOf('mn:') === 0) { rsvInvoiceRememberManual_(po, rowsByPo[po], !!known[po], targets[po]); return; }
       if (known[po]) return;
-      if (!rsvInvoiceRecoverPo_(po, rowsByPo[po].created, rowsByPo[po].company)) errors.push(po + ': 메일에서 발주서를 못 찾음');
+      if (rsvInvoiceRecoverPo_(po, rowsByPo[po].created, rowsByPo[po].company)) return;
+      // 발주서 메일을 못 찾은 예전 PO: 수기 건처럼 같은 업체 최근 발주서 단가·SHIP TO 로 (없는 단가는 입력 창)
+      rsvInvoiceRememberManual_(po, rowsByPo[po], false, targets[po]);
+      notes.push(po);
     } catch (e) { errors.push((po.indexOf('mn:') === 0 ? rowsByPo[po].purpose : po) + ': ' + e.message); }
   });
   var r = rsvSyncInvoices_({ targets: targets, regen: true });
   if (r.missing.length) { rsvShowPriceDialog_(r.missing[0], { type: 'issue', targets: targets }, r.missing.slice(1)); return; }
   errors = errors.concat(r.errors);
   var msg = (r.issued ? '거래명세서 ' + r.issued + '건 발급: ' + r.names.join(', ') : '발급된 거래명세서 없음') +
-    (skipped ? ' · 업체명·용도가 비어 있는 행 ' + skipped + '개 제외' : '') + (excluded ? ' · 발급 제외 업체(' + RSV_CONFIG.INVOICE_EXCLUDE.join('·') + ') ' + excluded + '행' : '') + (errors.length ? ' · ⚠ ' + errors.join(' / ') : '');
+    (skipped ? ' · 업체명·용도가 비어 있는 행 ' + skipped + '개 제외' : '') + (excluded ? ' · 발급 제외 업체(' + RSV_CONFIG.INVOICE_EXCLUDE.join('·') + ') ' + excluded + '행' : '') +
+    (notes.length ? ' · ℹ 발주서 메일 없음 → 같은 업체 최근 발주 단가·SHIP TO 로 발급: ' + notes.join(', ') : '') + (errors.length ? ' · ⚠ ' + errors.join(' / ') : '');
   try { SpreadsheetApp.getUi().alert('📑 거래명세서 발급', msg.replace(/ · /g, '\n'), SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) { rsvToast_(msg); }
 }
 
@@ -1975,7 +1979,7 @@ function rsvInvoiceForMail_(t, rowsInfo) {
     // 아직 발급 전: 셀 선택 발급과 같은 방법으로 지금 발급
     if (!f) {
       if (t.id.indexOf('mn:') === 0) rsvInvoiceRememberManual_(t.id, rowsInfo, false, [t.key]);
-      else if (!rsvInvoiceRecoverPo_(t.id, rowsInfo.created, rowsInfo.company)) throw new Error('메일에서 발주서를 못 찾아 거래명세서를 만들 수 없음');
+      else if (!rsvInvoiceRecoverPo_(t.id, rowsInfo.created, rowsInfo.company)) rsvInvoiceRememberManual_(t.id, rowsInfo, false, [t.key]); // 발주서 메일 없음 → 최근 발주 단가
     }
     var targets = {};
     targets[t.id] = [t.key];
