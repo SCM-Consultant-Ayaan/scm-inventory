@@ -137,8 +137,8 @@ var RSV_CONFIG = {
   INVOICE_TEMPLATE_XLSX_ID: '1WMHRUVfmQwZP8mU5ocbXeJYA6kix2CK0',   // 양식 원본 (261019_뷰릿지코퍼레이션_BG(CN)_261016_11_거래명세서.xlsx)
   INVOICE_BUYER_SHEET: 'B2B 거래업체정보',
   INVOICE_LOG_SHEET: '거래명세서_발급',                           // 숨김 시트: PO 별 단가·SHIP TO·발급 기록
-  INVOICE_DATE_PICK: 'last',
-  INVOICE_DAYS_BEFORE: 2,                                          // 사용 예정일(C) D-2 부터 발급 (사용 예정일별로 따로)                                       // 발급일 = 출고예정일 (PO 안에 여러 날이면 'last' 가장 늦은 날 / 'first')
+  INVOICE_DATE_PICK: 'last',                                       // 출고예정일(폴더 월 기준): PO 안에 여러 날이면 'last' 가장 늦은 날 / 'first'
+  INVOICE_DAYS_BEFORE: 2,                                          // 사용 예정일(C) D-2 부터 발급 (사용 예정일별로 따로). 발급일 = 실제 발급한 날
   // 업체명(F) → [B2B 거래업체정보] 상호 일부 (이름이 달라 자동으로 안 맞는 업체만)
   INVOICE_COMPANY_ALIASES: { '예스스타일': '예스아시아', '그리니스트': '그리스트' },
   // 거래명세서 발급·메일 대상에서 빼는 업체 (업체명(F)·입고처(E) 일부)
@@ -1154,7 +1154,7 @@ function rsvSyncInvoices_(opts) {
         }
         // 저장 폴더: 07_글로벌/<업체>/03 발주/YY년 M월(출고월) — 못 찾으면 예전 [00. B2B 발주]
         var docFolder = null;
-        try { docFolder = rsvDocFolder_(company, buyer.name, inv.date, g.rows[0].purpose + ' ' + poNo, poLabel.replace(/-\d+$/, '')); } catch (e) { docFolder = null; }
+        try { docFolder = rsvDocFolder_(company, buyer.name, inv.shipDate, g.rows[0].purpose + ' ' + poNo, poLabel.replace(/-\d+$/, '')); } catch (e) { docFolder = null; }
         if (!file) {
           if (g.old) { try { DriveApp.getFileById(g.old.fileId).setTrashed(true); } catch (e) { /* 무시 */ } }
           file = (docFolder || rsvInvoiceFolder_(buyer, company)).createFile(blob);
@@ -1188,7 +1188,7 @@ function rsvSyncInvoices_(opts) {
 }
 
 /** [거래명세서_발급] F열 → 발급 기록 [{key, fileId, url, name, sig, items}] (예전 버전의 파일 ID 한 개도 읽음) */
-/** 메뉴: 이미 발급된 거래명세서 파일을 07_글로벌/<업체>/03 발주/YY년 M월 로 옮김 (파일명 앞 YYMMDD = 출고일) */
+/** 메뉴: 이미 발급된 거래명세서 파일을 07_글로벌/<업체>/03 발주/YY년 M월(출고월) 로 옮김 */
 function rsvMoveIssuedInvoices() {
   rsvAssertAllowed_();
   var sh = rsvInvoiceSheet_(), last = sh.getLastRow();
@@ -1205,7 +1205,9 @@ function rsvMoveIssuedInvoices() {
         var m = String(file.getName()).replace(/\.xlsx$/i, '').replace(/_수정$/, '').match(/^(\d{2})(\d{2})(\d{2})_거래명세서_(.+)_[^_]+$/);
         if (!m) { fail.push(file.getName() + ' (파일명에 날짜 없음)'); return; }
         var label = m[4].replace(/-\d+$/, '');
-        var folder = rsvDocFolder_(company, '', '20' + m[1] + '-' + m[2] + '-' + m[3], label + ' ' + po, label);
+        // 폴더 월 = 출고월: 묶음 키(사용 예정일)가 날짜면 그것, 아니면 파일명 앞 날짜
+        var day = /^\d{4}-\d{2}-\d{2}/.test(String(x.key)) ? String(x.key).slice(0, 10) : '20' + m[1] + '-' + m[2] + '-' + m[3];
+        var folder = rsvDocFolder_(company, '', day, label + ' ' + po, label);
         if (!folder) { fail.push(file.getName() + ' (07_글로벌에 업체 폴더 없음)'); return; }
         var ps = file.getParents();
         while (ps.hasNext()) if (ps.next().getId() === folder.getId()) { same++; return; }
@@ -1271,7 +1273,7 @@ function rsvInvoicePlan(rows, issued, prices, now, cfg, force, onlyKeys) {
       if (!due && !force) return;
     }
     var inv = rsvInvoiceContent(g.rows, prices, now, cfg.INVOICE_DATE_PICK);
-    var sig = rsvFmtYMD_(inv.date) + '#' + (g.seq || 0) + '#' + inv.sig;
+    var sig = rsvFmtYMD_(inv.shipDate) + '#' + (g.seq || 0) + '#' + inv.sig; // 발급일(오늘)은 빼고 출고예정일·품목으로 비교
     var old = byKey[k] || null;
     if (old && old.cancelled && !onlyKeys) return; // 메일 발송 취소로 지운 묶음은 자동으로 다시 만들지 않음
     if (old && old.sig === sig && !force) return;
@@ -1436,7 +1438,7 @@ function rsvReplaceDriveFile_(fileId, blob) {
 
 /**
  * 거래명세서 내용 (순수 함수). rows: [{name, qty, foc, shipDate, useDate}], prices: {상품명: 단가}
- *  같은 상품·단가는 합침 (일부 출고로 나뉜 행). FOC 는 단가 0. 발급일 = 출고예정일 (datePick 'last': 가장 늦은 날 / 'first')
+ *  같은 상품·단가는 합침 (일부 출고로 나뉜 행). FOC 는 단가 0. 발급일(date) = 오늘(now), 출고예정일(shipDate): datePick 'last' 가장 늦은 날 / 'first'
  */
 function rsvInvoiceContent(rows, prices, now, datePick) {
   var lines = [], byKey = {}, missing = [], dates = [], missingNames = [], missingKnown = {}, missingWhy = {};
@@ -1465,9 +1467,11 @@ function rsvInvoiceContent(rows, prices, now, datePick) {
     if (d) dates.push(d.getTime());
   });
   lines.sort(function (a, b) { return (a.foc ? 1 : 0) - (b.foc ? 1 : 0); });
-  var date = dates.length ? new Date(datePick === 'first' ? Math.min.apply(null, dates) : Math.max.apply(null, dates)) : rsvStartOfDay_(now);
+  // 발급일 = 실제로 발급한 날 (자동 발급·발급 버튼). 출고예정일은 shipDate (폴더 월·다시 발급 판단용)
+  var shipDate = dates.length ? new Date(datePick === 'first' ? Math.min.apply(null, dates) : Math.max.apply(null, dates)) : rsvStartOfDay_(now);
+  var date = rsvStartOfDay_(now);
   var sig = lines.map(function (l) { return l.name + ':' + l.qty + ':' + l.price + (l.foc ? ':f' : ''); }).sort().join(';');
-  return { lines: lines, date: date, sig: sig, missingPrice: missing, missingNames: missingNames, missingKnown: missingKnown, missingWhy: missingWhy };
+  return { lines: lines, date: date, shipDate: shipDate, sig: sig, missingPrice: missing, missingNames: missingNames, missingKnown: missingKnown, missingWhy: missingWhy };
 }
 
 /** 품목명 → 명세서 표기 {name, spec} (순수 함수). '로지킴 PDRN 틴티드 립 앰플 10ml_01 새틴' → 'PDRN 틴티드 립 앰플 01 새틴' / '10ml' */
