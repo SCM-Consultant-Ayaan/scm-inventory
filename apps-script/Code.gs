@@ -1153,6 +1153,8 @@ function rsvSyncInvoices_(opts) {
     });
     prices = rsvApplyPriceList(prices, rows, String(rec[RSV_INV.company - 1] || ''), RSV_CONFIG.INVOICE_PRICE_LIST);
     prices = rsvFillMissingPrices(prices, rows, (rows[0] && rows[0].company) || String(rec[RSV_INV.company - 1] || ''), priceSheet);
+    // 그래도 없는 상품: 같은 업체·같은 라인(쉐이드만 다른 상품)의 단가 — 이 PO 먼저, 그다음 이 업체의 최근 발주서·[업체별 단가]
+    prices = rsvFillByLine(prices, rows, [prices].concat(rsvCompanyPricePools_(recs, (rows[0] && rows[0].company) || String(rec[RSV_INV.company - 1] || ''), priceSheet)));
     var plan = rsvInvoicePlan(rows, issued, prices, now, RSV_CONFIG, !!opts.regen, opts.targets ? opts.targets[poNo] : null);
     if (!plan.make.length && !plan.drop.length) return;
     var keep = issued.filter(function (x) { return plan.drop.indexOf(x) < 0; });
@@ -1359,6 +1361,54 @@ function rsvFillMissingPrices(prices, rows, company, sheetMap) {
     if (list[r.name] === 0) { out.__free__ = (out.__free__ || []).slice(); if (out.__free__.indexOf(r.name) < 0) out.__free__.push(r.name); }
   });
   return out;
+}
+
+/** 상품 라인 (쉐이드 뺀 이름, 순수 함수): '로지킴 PDRN 틴티드 립 앰플 10ml_11 심리스' → '로지킴 PDRN 틴티드 립 앰플 10ml' */
+function rsvProductLine(name) {
+  var s = String(name || '').trim();
+  return s.indexOf('_') > 0 ? s.replace(/\s*_[^_]*$/, '').trim() : '';
+}
+
+/**
+ * 단가가 없거나 외화로 보이는 상품을 같은 라인의 단가로 채움 (순수 함수).
+ * pools: [{상품명: 단가}, …] 앞쪽이 우선. 같은 라인의 단가가 여러 개면 그 풀에서 가장 많이 쓰인 값.
+ */
+function rsvFillByLine(prices, rows, pools) {
+  var out = {};
+  Object.keys(prices || {}).forEach(function (k) { out[k] = prices[k]; });
+  var ok = function (p) { return typeof p === 'number' && p >= 100 && p % 1 === 0; };
+  rows.forEach(function (r) {
+    if (r.foc || ok(out[r.name]) || ((out.__free__ || []).indexOf(r.name) >= 0)) return;
+    var line = rsvProductLine(r.name);
+    if (!line) return;
+    for (var i = 0; i < pools.length; i++) {
+      var cnt = {};
+      Object.keys(pools[i] || {}).forEach(function (n) {
+        var p = pools[i][n];
+        if (n !== r.name && ok(p) && rsvProductLine(n) === line) cnt[p] = (cnt[p] || 0) + 1;
+      });
+      var best = Object.keys(cnt).sort(function (a, b) { return cnt[b] - cnt[a]; })[0];
+      if (best) { out[r.name] = Number(best); return; }
+    }
+  });
+  return out;
+}
+
+/** 업체의 단가 풀 (최근 발주서 먼저): [거래명세서_발급] 단가·발급된 명세서 단가, 마지막에 [업체별 단가] */
+function rsvCompanyPricePools_(recs, company, priceSheet) {
+  var cn = rsvCompanyNorm(company), pools = [];
+  for (var i = recs.length - 1; i >= 0; i--) {
+    var n = rsvCompanyNorm(recs[i][RSV_INV.company - 1]);
+    if (!n || !cn || (n.indexOf(cn) < 0 && cn.indexOf(n) < 0)) continue;
+    var p = {};
+    try { p = JSON.parse(recs[i][RSV_INV.prices - 1] || '{}'); } catch (e) { p = {}; }
+    rsvInvoiceIssued_(recs[i][RSV_INV.fileId - 1]).forEach(function (x) {
+      String(x.items || '').split(';').forEach(function (it) { var q = it.split(':'); if (q[0] && !(p[q[0]] >= 100) && Number(q[2]) >= 100) p[q[0]] = Number(q[2]); });
+    });
+    pools.push(p);
+  }
+  pools.push((priceSheet || {})[company] || {});
+  return pools;
 }
 
 /**
