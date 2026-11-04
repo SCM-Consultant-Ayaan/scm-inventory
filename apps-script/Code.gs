@@ -124,7 +124,7 @@ var RSV_CONFIG = {
   PACKING_BOX_PREFIX: { '리호': 'L' },
   // 패킹리스트 소비기한: 로트(유통기한)별 재고 시트가 있으면 빠른 로트부터 출고 수량만큼 나눠 적음.
   //  시트 머리글에 상품명(또는 바코드·연동코드) · 유통기한 · 수량(정상재고/재고/수량) 이 있으면 됨 (한 줄 = 한 로트)
-  PACKING_LOT_SHEET: '이지어드민 로트재고',
+  PACKING_LOT_SHEET: '상품별 소비기한',
   INVOICE_ROOT_FOLDER_ID: '1gYWMNxOv2M4vZqhy8z2-BEIHTFiPAYQn',     // [00. B2B 발주] — 07_글로벌에 업체 폴더가 없을 때만 여기 저장
   // 거래명세서·패킹리스트 저장 위치: [07_글로벌]/<업체 폴더>/03 발주/[거래유형/]YY년 M월(출고월)/[차수 폴더]
   DOC_ROOT_FOLDER_ID: '1zsQV2vxctKEbWcdMYx4szNQIytXti1md',
