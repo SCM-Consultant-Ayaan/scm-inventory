@@ -5333,11 +5333,14 @@ function rsvPackingMaster_(ss) {
   var c = function (k, from) { for (var i = from || 0; i < head.length; i++) if (head[i].indexOf(k) === 0) return i; return -1; };
   var cSku = c('SKU'), cName = c('내부상품명'), cPer = c('아웃박스입수량');
   var cSize = cPer >= 0 ? c('사이즈', cPer) : -1, cW = cPer >= 0 ? c('아웃박스무게', cPer) : -1;
+  // 사이즈가 가로·세로·높이 세 칸으로 나뉜 경우
+  var cX = cPer >= 0 ? c('아웃박스가로', cPer) : -1, cY = cPer >= 0 ? c('아웃박스세로', cPer) : -1, cZ = cPer >= 0 ? c('아웃박스높이', cPer) : -1;
   if (cPer < 0) return out;
   v.slice(2).forEach(function (r) {
     var per = rsvToNum_(r[cPer]);
     if (!(per > 0)) return;
-    var size = String(cSize >= 0 ? r[cSize] : '').replace(/mm/i, '').replace(/\s+/g, '');
+    var dims = [cX, cY, cZ].map(function (ci) { return ci >= 0 ? String(r[ci] || '').replace(/mm/i, '').trim() : ''; });
+    var size = dims.every(String) ? dims.join('*') : String(cSize >= 0 ? r[cSize] : '').replace(/mm/i, '').replace(/\s+/g, '');
     var w = parseFloat(String(cW >= 0 ? r[cW] : '').replace(/[^\d.]/g, '')) || 0;
     var m = { perBox: per, size: size, weight: w };
     var sku = String(r[cSku] || '').trim(), nm = String(cName >= 0 ? r[cName] : '').trim();
