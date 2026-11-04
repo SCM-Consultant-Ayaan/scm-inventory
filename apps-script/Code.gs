@@ -4348,8 +4348,13 @@ function rsvTaxRequestText_(values, idx) {
     var memo = String(v[RSV_COL.memo - 1] || '');
     var free = t.foc || /재고\s*이동/.test(purpose + ' ' + memo) || ((inf.prices.__free__ || []).indexOf(name) >= 0 && !inf.prices[name]);
     var price = free ? 0 : inf.prices[name];
+    if (!free && !(price >= 100)) { // 발급된 거래명세서에 들어간 단가 (단가 입력 창으로 넣은 값)
+      inf.issued.forEach(function (x) {
+        String(x.items || '').split(';').forEach(function (it) { var p = it.split(':'); if (p[0] === name && Number(p[2]) >= 100) price = Number(p[2]); });
+      });
+    }
     if (!free && !(price >= 100)) price = ((priceSheet[c] || {})[name]);
-    if (!free && !(price >= 100)) { if (g.missing.indexOf(name) < 0) g.missing.push(name.replace(/^로지킴\s*/, '')); }
+    if (!free && !(price >= 100)) { var short = name.replace(/^로지킴\s*/, ''); if (g.missing.indexOf(short) < 0) g.missing.push(short); }
     else g.amount += qty * price;
     inf.issued.forEach(function (x) {
       if (!x.cancelled && x.url && x.key === t.key && !g.links.some(function (l) { return l.url === x.url; })) g.links.push({ url: x.url, name: x.name });
