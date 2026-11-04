@@ -428,7 +428,26 @@ function rsvLayoutState_(sh) {
   return 'unknown';
 }
 
-function rsvLayoutOk_(sh) { return rsvLayoutState_(sh) === 'final'; }
+function rsvLayoutOk_(sh) {
+  if (rsvLayoutState_(sh) === 'final') return true;
+  // 머리글만 잘못 고쳐진 경우 (데이터는 최신 구조): 머리글을 되돌리고 계속
+  if (rsvLooksFinalData_(sh)) { rsvRepairHeaders_(sh); return true; }
+  return false;
+}
+
+/** 데이터가 이미 최신 구조인지: V열(메일키)에 'po:' / 'mn:' 값이 있으면 최신 구조 (예전 구조에는 이 열이 없음) */
+function rsvLooksFinalData_(sh) {
+  var last = Math.min(sh.getLastRow(), RSV_CONFIG.FIRST_ROW + 400);
+  if (last < RSV_CONFIG.FIRST_ROW || sh.getMaxColumns() < RSV_COL.mailKey) return false;
+  return sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.mailKey, last - RSV_CONFIG.FIRST_ROW + 1, 1).getValues()
+    .some(function (r) { return /^(po|mn):/.test(String(r[0])); });
+}
+
+/** 2행 머리글 D~G 를 최신 구조 이름으로 되돌림 (데이터는 건드리지 않음) */
+function rsvRepairHeaders_(sh) {
+  sh.getRange(RSV_CONFIG.HEADER_ROW, RSV_COL.shipDate, 1, 4).setValues([[RSV_NEW_HEADERS[4], '입고처', '업체명', '용도']]);
+  rsvToast_('2행 머리글(D~G)이 바뀌어 있어 "출고 예정일 / 입고처 / 업체명 / 용도"로 되돌렸어요 (데이터는 그대로)');
+}
 
 function rsvSetup() {
   rsvAssertAllowed_();
@@ -442,7 +461,15 @@ function rsvSetup() {
   lock.waitLock(30000);
   try {
     var state = rsvLayoutState_(sh);
+    // 안전장치: 머리글만 바뀌고 데이터는 최신 구조면 열을 옮기지 않는다 (옮기면 시트가 깨짐)
+    if (state !== 'final' && rsvLooksFinalData_(sh)) { rsvRepairHeaders_(sh); state = 'final'; }
     if (state === 'unknown') throw new Error('[예약 재고 관리] 2행 헤더를 인식하지 못했습니다 (E2/F2 가 용도·업체명이어야 함).');
+    if (state !== 'final') {
+      var ui = SpreadsheetApp.getUi();
+      if (ui.alert('⚠ 열 구조 변경', '2행 머리글이 예전 구조(' + state + ')로 보여 열을 옮기려고 합니다.\n' +
+        '머리글을 실수로 고친 거라면 [취소]를 누르고 2행 D~G 를 "출고 예정일 / 입고처 / 업체명 / 용도"로 고쳐 주세요.\n\n정말 열을 옮길까요?',
+        ui.ButtonSet.OK_CANCEL) !== ui.Button.OK) { rsvToast_('초기 설정을 취소했어요 (시트는 그대로)'); return; }
+    }
     var maxRows = sh.getMaxRows();
 
     // 열 이동은 모두 시트의 열 삽입/삭제로 한다 → 다른 시트 수식의 참조가 자동으로 따라온다
