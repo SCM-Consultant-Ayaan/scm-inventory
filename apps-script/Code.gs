@@ -5294,14 +5294,15 @@ function rsvPackingList(rows, master, exp, prefix, usedLots) {
   lines.forEach(function (l) {
     var m = master[l.code] || master[l.name] || {};
     l.perBox = m.perBox || 0; l.size = m.size || ''; l.weight = m.weight || 0;
-    // 소비기한: 빠른 로트부터 출고 수량만큼 (같은 상품 FOC 줄은 본품 다음 로트부터)
+    // 소비기한: 한 로트로 되면 하나, 안 되면 박스 단위로 (같은 상품 FOC 줄은 본품이 쓰고 남은 로트에서)
     var lotKey = exp[l.code] ? l.code : l.name;
-    var al = rsvPackingExpAlloc(exp[lotKey], usedLots[lotKey] || 0, l.qty);
-    usedLots[lotKey] = (usedLots[lotKey] || 0) + l.qty;
-    l.exp = al.text; l.expWarn = al.warn;
+    usedLots[lotKey] = usedLots[lotKey] || {};
+    var al = rsvPackingExpAlloc(exp[lotKey], usedLots[lotKey], l.qty, l.perBox);
+    l.expWarn = al.warn;
     l.boxes = l.perBox ? Math.ceil(l.qty / l.perBox) : 0;
     var rem = l.perBox ? l.qty % l.perBox : 0;
     l.note = [l.foc ? 'FOC' : '', l.split, rem ? '낱개 ' + rem + '개 포함' : '', !l.perBox ? '입수량 정보 없음' : ''].filter(String).join(' · ');
+    l.exp = rsvPackingExpText(al, no + 1, prefix);
     if (l.boxes) {
       var a = no + 1, b = no + l.boxes;
       l.boxNo = prefix + '-' + a + (b > a ? ' ~ ' + prefix + '-' + b : '');
@@ -5347,28 +5348,71 @@ function rsvPackingMaster_(ss) {
 }
 
 /**
- * 로트 나누기 (순수 함수). lots: [{date:'2029.08.18', qty: 170 | null}] (유통기한 빠른 순), used: 앞 줄에서 이미 쓴 수량
- *  → {text: '2028.04.13 (170)\n2029.07.22 (1,160)', warn: 다음 로트 날짜를 모름}
+ * 로트 나누기 (순수 함수). lots: [{date:'2029.08.18', qty: 170 | null}], used: {날짜: 앞 줄에서 이미 쓴 수량} (이 함수가 늘림),
+ * perBox: 아웃박스 입수량.
+ *  1) 한 로트(같은 유통기한은 합침)로 다 되면 그 로트 하나 — 유통기한 빠른 것부터
+ *  2) 안 되면 박스 단위: 박스 하나엔 한 로트만 (빠른 로트부터 꽉 찬 박스, 낱개 박스는 남은 수량이 되는 로트)
+ *  3) 그래도 안 되면 섞어서 채우고 표시 (warn)
+ * 반환: {segs: [{date, qty, boxes}], warn, single}
  */
-function rsvPackingExpAlloc(lots, used, qty) {
-  lots = (lots || []).slice().sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
-  if (!lots.length) return { text: '', warn: false };
-  var skip = used || 0, need = qty, out = [];
-  for (var i = 0; i < lots.length && need > 0; i++) {
-    var q = lots[i].qty;
-    if (q == null) { out.push({ date: lots[i].date, qty: need, unsure: true }); need = 0; break; }
-    var left = q - Math.min(skip, q);
-    skip = Math.max(0, skip - q);
-    if (left <= 0) continue;
-    var take = Math.min(left, need);
-    out.push({ date: lots[i].date, qty: take });
-    need -= take;
+function rsvPackingExpAlloc(lots, used, qty, perBox) {
+  used = used || {};
+  var byDate = {}, dates = [], unknown = null;
+  (lots || []).forEach(function (l) {
+    if (l.qty == null) { if (!unknown || l.date < unknown) unknown = l.date; return; }
+    if (byDate[l.date] == null) { byDate[l.date] = 0; dates.push(l.date); }
+    byDate[l.date] += l.qty;
+  });
+  dates.sort();
+  var avail = {};
+  dates.forEach(function (d) { avail[d] = Math.max(0, byDate[d] - (used[d] || 0)); });
+  var take = function (segs) { segs.forEach(function (x) { if (x.date) used[x.date] = (used[x.date] || 0) + x.qty; }); return segs; };
+  if (!dates.length) {
+    return unknown ? { segs: [{ date: unknown, qty: qty, boxes: 0 }], warn: true, single: true } : { segs: [], warn: false, single: true };
   }
-  var warn = need > 0 || out.some(function (x) { return x.unsure; });
-  if (out.length === 1 && need <= 0) return { text: out[0].date, warn: !!out[0].unsure };
-  var parts = out.map(function (x) { return x.date + ' (' + rsvFmtNum_(x.qty) + ')'; });
-  if (need > 0) parts.push('다음 로트 확인 필요 (' + rsvFmtNum_(need) + ')');
-  return { text: parts.join('\n'), warn: warn };
+  // 1) 한 로트로
+  for (var i = 0; i < dates.length; i++) {
+    if (avail[dates[i]] >= qty) return { segs: take([{ date: dates[i], qty: qty, boxes: perBox ? Math.ceil(qty / perBox) : 0 }]), warn: false, single: true };
+  }
+  // 2) 박스 단위
+  if (perBox > 0) {
+    var full = Math.floor(qty / perBox), rem = qty % perBox, segs = [], left = {};
+    dates.forEach(function (d) { left[d] = avail[d]; });
+    dates.forEach(function (d) {
+      var b = Math.min(full, Math.floor(left[d] / perBox));
+      if (b > 0) { segs.push({ date: d, qty: b * perBox, boxes: b }); left[d] -= b * perBox; full -= b; }
+    });
+    var remOk = !rem;
+    if (rem) {
+      for (var j = 0; j < dates.length; j++) {
+        if (left[dates[j]] >= rem) {
+          segs.push({ date: dates[j], qty: rem, boxes: 1 }); // 낱개 박스는 마지막 번호
+          left[dates[j]] -= rem; remOk = true; break;
+        }
+      }
+    }
+    if (!full && remOk) return { segs: take(segs), warn: false, single: false };
+  }
+  // 3) 섞어서
+  var need = qty, mixed = [];
+  dates.forEach(function (d) { if (need > 0 && avail[d] > 0) { var t = Math.min(avail[d], need); mixed.push({ date: d, qty: t, boxes: 0, mixed: true }); need -= t; } });
+  if (need > 0) mixed.push({ date: unknown || '', qty: need, boxes: 0, mixed: true });
+  return { segs: take(mixed), warn: true, single: false };
+}
+
+/** 로트 나눈 결과 → 소비기한 칸 글자 (순수 함수). start: 이 줄의 첫 박스 번호, prefix: 박스 머리글자 */
+function rsvPackingExpText(al, start, prefix) {
+  if (!al.segs.length) return '';
+  if (al.single) return al.segs[0].date;
+  var no = start;
+  return al.segs.map(function (x) {
+    var where = '';
+    if (x.boxes && !x.mixed) {
+      where = prefix + '-' + no + (x.boxes > 1 ? '~' + prefix + '-' + (no + x.boxes - 1) : '') + ' · ';
+      no += x.boxes;
+    }
+    return (x.date || '다음 로트 확인 필요') + ' (' + where + rsvFmtNum_(x.qty) + ')';
+  }).join('\n') + (al.warn ? '\n⚠ 박스 안 로트 섞임' : '');
 }
 
 /**
@@ -5524,8 +5568,8 @@ function rsvBuildPackingList(company, dateKey) {
     return {
       name: fname + '.xlsx', b64: Utilities.base64Encode(blob.getBytes()), driveUrl: saved.getUrl(),
       summary: (single ? '' : list.length + '건 출고 (업체·출고일별 시트 + 요약) · ') + lines.length + '줄 / ' + rsvFmtNum_(qty) + '개 · ' + boxes + '박스 (' + (folder ? '[' + folder.getName() + '] 폴더' : '내 Drive') + '에도 저장)' +
-        '<br>소비기한(EXP)은 이지어드민 재고 기준 · 유통기한 빠른 로트부터 출고 수량만큼 나눠 적었어요' + (single ? '' : ' (출고일 순서대로 이어서)') +
-        (warnLot.length ? '<br>⚠ 다음 로트 소비기한을 몰라 빨간 글씨: ' + warnLot.join(', ') + ' — [' + RSV_CONFIG.PACKING_LOT_SHEET + '] 시트(로트별 재고)를 넣으면 자동으로 채워져요' : '') +
+        '<br>소비기한(EXP)은 [' + RSV_CONFIG.PACKING_LOT_SHEET + '] 기준 · 한 로트로 되면 하나, 안 되면 박스 단위로 나눠 적었어요' + (single ? '' : ' (출고일 순서대로 이어서)') +
+        (warnLot.length ? '<br>⚠ 박스 단위로 로트를 못 나눠 빨간 글씨(박스 안에 로트가 섞이거나 로트 정보 부족): ' + warnLot.join(', ') + ' — [' + RSV_CONFIG.PACKING_LOT_SHEET + '] 확인' : '') +
         (miss.length ? '<br>⚠ 입수량/소비기한 정보 없음: ' + miss.join(', ') : ''),
     };
   } finally {
