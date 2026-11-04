@@ -184,6 +184,11 @@ var RSV_CONFIG = {
   // 메일 PO 로 신규 예약 건이 등록되면 이 채널로 보낸다.
   // 토큰은 코드에 넣지 말고 [프로젝트 설정 → 스크립트 속성]에 SLACK_BOT_TOKEN(xoxb-…) 또는 SLACK_WEBHOOK_URL 로 저장.
   SLACK_CHANNEL: 'C08MB21A4DD',
+  // 세금계산서 발행 요청: 이 업체 행이 '출고 완료'가 되면 (마지막 변경 후 TAX_REQUEST_QUIET_MIN 분 뒤) 차수별로 묶어 슬랙에 요청
+  TAX_REQUEST_COMPANIES: ['뷰릿지'],
+  TAX_REQUEST_CHANNEL: '',                                   // 비우면 SLACK_CHANNEL
+  TAX_REQUEST_MENTIONS: ['U07MZUZRLH5', 'U0C1HDSU5NJ', 'U0C348KV24E'], // J Kim · [SCM] 신동현 · 추가 1명
+  TAX_REQUEST_QUIET_MIN: 5,
   // true 면 홀딩→예약 자동 전환도 알림
   SLACK_NOTIFY_CONVERSIONS: false,
   // true 면 [예약 재고 관리]에 직접(수기) 입력한 신규 건도 알림 (업체+용도 단위로 묶어서 한 번).
@@ -286,7 +291,8 @@ function rsvOnOpen() {
       .addItem('📑 거래명세서 지금 발급 (사용 예정일 D-2 · 날짜/수량 바뀐 건)', 'rsvIssueInvoicesNow')
       .addItem('📑 선택한 셀의 묶음 거래명세서 발급', 'rsvIssueSelectedInvoices')
       .addItem('📧 선택한 셀의 거래명세서 메일 보내기', 'rsvMailSelectedInvoices')
-      .addItem('📁 발급된 거래명세서를 업체 폴더(03 발주/월)로 옮기기', 'rsvMoveIssuedInvoices'))
+      .addItem('📁 발급된 거래명세서를 업체 폴더(03 발주/월)로 옮기기', 'rsvMoveIssuedInvoices')
+      .addItem('🧾 선택한 행 세금계산서 발행 요청 (슬랙)', 'rsvTaxRequestSelected'))
     .addSubMenu(ui.createMenu('🚚 출고 확인')
       .addItem('슬랙 답글 지금 확인 (출고완료 · 취소 · 변경 승인)', 'rsvCheckSlackNow')
       .addItem('출고일 지난 건 알림 지금 보내기', 'rsvSendOverdueNow')
@@ -373,6 +379,7 @@ function rsvRunScheduled() {
   var idle = Date.now() - lastEdit >= RSV_CONFIG.SORT_IDLE_MINUTES * 60000;
   rsvNotifySlack_(res.pos, rsvRunAllocation({ sort: idle }).conversions);
   try { rsvSyncInvoices_({}); } catch (err) { console.error('거래명세서 발급 오류', err); }
+  try { rsvTaxRequestCheck_(); } catch (err) { console.error('세금계산서 발행 요청 오류', err); }
   if (idle && RSV_CONFIG.SLACK_NOTIFY_MANUAL) {
     try { rsvNotifyManual_(); } catch (err) { console.error('수기 등록 알림 오류', err); }
   }
@@ -4215,16 +4222,179 @@ function rsvPostSlackThreaded_(head, detail) {
   return sent;
 }
 
+// =====================================================================
+// 세금계산서 발행 요청 (출고 완료 → 슬랙)
+// =====================================================================
+
+/** 행 식별 키 (메일키가 없으면 업체·용도·상품·수량·작성일) → 짧은 해시 */
+function rsvTaxRowKey_(v) {
+  var k = String(v[RSV_COL.mailKey - 1] || '') || [v[RSV_COL.company - 1], v[RSV_COL.purpose - 1], v[RSV_COL.name - 1], v[RSV_COL.qty - 1], v[RSV_COL.created - 1]].join('|');
+  var h = 0;
+  for (var i = 0; i < k.length; i++) h = (h * 31 + k.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+function rsvTaxTarget_(v) {
+  var c = String(v[RSV_COL.company - 1] || '').trim();
+  if (!c || !String(v[RSV_COL.name - 1] || '').trim() || !(rsvToNum_(v[RSV_COL.qty - 1]) > 0)) return false;
+  if (!(RSV_CONFIG.TAX_REQUEST_COMPANIES || []).some(function (k) { return c.indexOf(k) >= 0; })) return false;
+  var st = String(v[RSV_COL.status - 1]).trim();
+  return st === RSV_CONFIG.STATUS_DONE || /^o$/i.test(String(v[RSV_COL.shipped - 1]).trim());
+}
+
+/**
+ * 10분마다: 대상 업체 행 중 새로 '출고 완료'가 된 행을 모아, 마지막 변경 후 TAX_REQUEST_QUIET_MIN 분이 지나면 한 번에 요청.
+ * 처음 실행 때는 지금까지 출고 완료된 행을 '이미 요청함'으로 기억만 한다.
+ */
+function rsvTaxRequestCheck_() {
+  if (!(RSV_CONFIG.TAX_REQUEST_COMPANIES || []).length) return;
+  var props = PropertiesService.getScriptProperties();
+  var st = JSON.parse(props.getProperty('RSV_TAX_REQ') || '{}');
+  st.sent = st.sent || []; st.pending = st.pending || {};
+  var sh = SpreadsheetApp.getActive().getSheetByName(RSV_CONFIG.RES_SHEET);
+  var last = rsvLastDataRow_(sh);
+  if (last < RSV_CONFIG.FIRST_ROW) return;
+  var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
+  var sent = {}; st.sent.forEach(function (k) { sent[k] = true; });
+  var now = Date.now(), changed = false, done = {};
+  values.forEach(function (v) {
+    if (!rsvTaxTarget_(v)) return;
+    var k = rsvTaxRowKey_(v);
+    done[k] = true;
+    if (!st.init) { if (!sent[k]) { st.sent.push(k); sent[k] = true; } return; }
+    if (!sent[k] && !st.pending[k]) { st.pending[k] = now; changed = true; }
+  });
+  if (!st.init) { st.init = true; rsvTaxSave_(props, st); return; }
+  // 다시 출고 완료가 풀린 행은 대기에서 뺌
+  Object.keys(st.pending).forEach(function (k) { if (!done[k]) { delete st.pending[k]; changed = true; } });
+  var keys = Object.keys(st.pending);
+  var latest = keys.reduce(function (m, k) { return Math.max(m, st.pending[k]); }, 0);
+  if (keys.length && now - latest >= RSV_CONFIG.TAX_REQUEST_QUIET_MIN * 60000) {
+    var rows = [];
+    values.forEach(function (v, i) { if (rsvTaxTarget_(v) && st.pending[rsvTaxRowKey_(v)]) rows.push(i); });
+    rsvTaxRequestSend_(values, rows);
+    keys.forEach(function (k) { st.sent.push(k); });
+    st.pending = {};
+    changed = true;
+  }
+  if (changed) rsvTaxSave_(props, st);
+}
+
+function rsvTaxSave_(props, st) {
+  if (st.sent.length > 1500) st.sent = st.sent.slice(st.sent.length - 1500); // 스크립트 속성 크기 제한
+  props.setProperty('RSV_TAX_REQ', JSON.stringify(st));
+}
+
+/** 메뉴: 선택한 행(대상 업체가 아니어도)으로 지금 세금계산서 발행 요청 */
+function rsvTaxRequestSelected() {
+  rsvAssertAllowed_();
+  var ss = SpreadsheetApp.getActive(), sh = ss.getActiveSheet();
+  if (sh.getName() !== RSV_CONFIG.RES_SHEET) { rsvToast_('[' + RSV_CONFIG.RES_SHEET + ']에서 행을 선택하세요'); return; }
+  var last = rsvLastDataRow_(sh);
+  var values = sh.getRange(RSV_CONFIG.FIRST_ROW, 1, last - RSV_CONFIG.FIRST_ROW + 1, RSV_LAST_COL).getValues();
+  var idx = [];
+  ss.getActiveRangeList().getRanges().forEach(function (rg) {
+    for (var r = Math.max(rg.getRow(), RSV_CONFIG.FIRST_ROW); r <= Math.min(rg.getLastRow(), last); r++) {
+      var i = r - RSV_CONFIG.FIRST_ROW, v = values[i];
+      if (idx.indexOf(i) < 0 && String(v[RSV_COL.name - 1] || '').trim() && String(v[RSV_COL.status - 1]).trim() !== RSV_CONFIG.STATUS_CANCEL) idx.push(i);
+    }
+  });
+  if (!idx.length) { rsvToast_('요청할 행이 없습니다'); return; }
+  var ui = SpreadsheetApp.getUi();
+  var preview = rsvTaxRequestText_(values, idx);
+  if (ui.alert('🧾 세금계산서 발행 요청', preview.plain + '\n\n슬랙에 보낼까요?', ui.ButtonSet.OK_CANCEL) !== ui.Button.OK) return;
+  rsvTaxRequestSend_(values, idx);
+  // 자동 요청이 같은 행을 다시 보내지 않게 기억
+  var props = PropertiesService.getScriptProperties();
+  var st = JSON.parse(props.getProperty('RSV_TAX_REQ') || '{}');
+  st.sent = st.sent || []; st.pending = st.pending || {};
+  idx.forEach(function (i) { var k = rsvTaxRowKey_(values[i]); st.sent.push(k); delete st.pending[k]; });
+  rsvTaxSave_(props, st);
+  rsvToast_('🧾 세금계산서 발행 요청을 보냈어요');
+}
+
+function rsvTaxRequestSend_(values, idx) {
+  var byCompany = {};
+  idx.forEach(function (i) { var c = String(values[i][RSV_COL.company - 1] || '').trim(); (byCompany[c] = byCompany[c] || []).push(i); });
+  Object.keys(byCompany).forEach(function (c) {
+    var t = rsvTaxRequestText_(values, byCompany[c]);
+    rsvPostSlack_(t.slack, null, null, RSV_CONFIG.TAX_REQUEST_CHANNEL || RSV_CONFIG.SLACK_CHANNEL);
+  });
+}
+
+/** 요청 문구 {slack, plain}: 차수(용도)별 품목 수 · 수량 · 금액 (단가는 [거래명세서_발급] 기록) + 거래명세서 링크 */
+function rsvTaxRequestText_(values, idx) {
+  var ss = SpreadsheetApp.getActive();
+  var targets = rsvInvoiceTargets(values);
+  var log = rsvInvoiceSheet_(), recs = log.getLastRow() > 1 ? log.getRange(2, 1, log.getLastRow() - 1, RSV_INV.msgId).getValues() : [];
+  var info = {};
+  recs.forEach(function (r) {
+    var po = String(r[RSV_INV.po - 1]);
+    if (!po || info[po]) return;
+    var p = {}; try { p = JSON.parse(r[RSV_INV.prices - 1] || '{}'); } catch (e) { p = {}; }
+    info[po] = { prices: p, issued: rsvInvoiceIssued_(r[RSV_INV.fileId - 1]) };
+  });
+  var priceSheet = rsvReadPriceSheet_();
+  var groups = [];
+  idx.forEach(function (i) {
+    var v = values[i], t = targets[i] || {};
+    var c = String(v[RSV_COL.company - 1] || '').trim(), purpose = String(v[RSV_COL.purpose - 1] || '').trim();
+    var g = groups.filter(function (x) { return x.company === c && x.purpose === purpose; })[0];
+    if (!g) { g = { company: c, purpose: purpose, names: [], qty: 0, amount: 0, missing: [], links: [] }; groups.push(g); }
+    var name = String(v[RSV_COL.name - 1]).trim(), qty = rsvToNum_(v[RSV_COL.qty - 1]);
+    if (g.names.indexOf(name) < 0) g.names.push(name);
+    g.qty += qty;
+    var inf = info[t.id] || { prices: {}, issued: [] };
+    var memo = String(v[RSV_COL.memo - 1] || '');
+    var free = t.foc || /재고\s*이동/.test(purpose + ' ' + memo) || ((inf.prices.__free__ || []).indexOf(name) >= 0 && !inf.prices[name]);
+    var price = free ? 0 : inf.prices[name];
+    if (!free && !(price >= 100)) price = ((priceSheet[c] || {})[name]);
+    if (!free && !(price >= 100)) { if (g.missing.indexOf(name) < 0) g.missing.push(name.replace(/^로지킴\s*/, '')); }
+    else g.amount += qty * price;
+    inf.issued.forEach(function (x) {
+      if (!x.cancelled && x.url && x.key === t.key && !g.links.some(function (l) { return l.url === x.url; })) g.links.push({ url: x.url, name: x.name });
+    });
+  });
+  groups.sort(function (a, b) { var x = rsvNaturalKey_(a.purpose), y = rsvNaturalKey_(b.purpose); return x < y ? -1 : x > y ? 1 : 0; });
+  var company = groups[0].company;
+  var roundOf = function (p) { var r = rsvDocRound(p); return r ? r.replace(/^\d{2}-/, '') : p; };
+  var nums = groups.map(function (g) { var m = rsvDocRound(g.purpose).match(/-(\d+)차/); return m ? +m[1] : null; });
+  var title;
+  if (nums.every(function (n) { return n != null; })) {
+    var sorted = nums.slice().sort(function (a, b) { return a - b; });
+    var consec = sorted.every(function (n, i) { return !i || n === sorted[i - 1] + 1; });
+    title = sorted.length === 1 ? sorted[0] + '차' : consec ? sorted[0] + '~' + sorted[sorted.length - 1] + '차' : sorted.join('·') + '차';
+  } else title = groups.map(function (g) { return roundOf(g.purpose); }).join('·');
+  var buyer = null;
+  try { buyer = rsvFindBuyer(rsvReadBuyers_(ss), company, '', RSV_CONFIG.INVOICE_COMPANY_ALIASES); } catch (e) { buyer = null; }
+  var taxed = buyer && buyer.taxed != null ? buyer.taxed : RSV_CONFIG.INVOICE_TAXED.some(function (k) { return company.indexOf(k) >= 0; });
+  var won = function (n) { return rsvFmtNum_(n) + '원'; };
+  var line = function (g, slack) {
+    var label = roundOf(g.purpose);
+    var head = slack && g.links.length ? g.links.map(function (l, i) { return '<' + l.url + '|' + label + (g.links.length > 1 ? ' (' + (i + 1) + ')' : '') + '>'; }).join(' ') : label + (g.links.length ? '' : ' (거래명세서 없음)');
+    return '• ' + head + ' - ' + g.names.length + '종 / ' + rsvFmtNum_(g.qty) + '개 / ' + won(g.amount) + (g.missing.length ? ' ⚠ 단가 없음: ' + g.missing.join(', ') : '');
+  };
+  var supply = groups.reduce(function (s, g) { return s + g.amount; }, 0);
+  var vat = taxed ? Math.round(supply * 0.1) : 0;
+  var total = taxed ? '공급가액 ' + won(supply) + ' + 부가세 ' + won(vat) + ' = *' + won(supply + vat) + '*' : '*' + won(supply) + '* (영세율)';
+  var mentions = (RSV_CONFIG.TAX_REQUEST_MENTIONS || []).map(function (u) { return '<@' + u + '>'; }).join(' ');
+  var heading = company + '_' + title + ' 발주 세금계산서 발행 요청';
+  var slack = ':rotating_light: *세금계산서 발행 요청*' + (mentions ? '  ' + mentions : '') + '\n*' + heading + '*\n\n' +
+    groups.map(function (g) { return line(g, true); }).join('\n') + '\n\n*총액* ' + total;
+  var plain = heading + '\n' + groups.map(function (g) { return line(g, false); }).join('\n') + '\n총액 ' + total.replace(/\*/g, '');
+  return { slack: slack, plain: plain };
+}
+
 /**
  * 스크립트 속성의 SLACK_BOT_TOKEN(chat.postMessage) 또는 SLACK_WEBHOOK_URL 로 전송.
  * threadTs 를 주면 그 스레드에 답글로 보낸다. 봇 토큰이면 응답(ts 포함)을 반환.
  */
-function rsvPostSlack_(text, threadTs, blocks) {
+function rsvPostSlack_(text, threadTs, blocks, channel) {
   var props = PropertiesService.getScriptProperties();
   var token = props.getProperty('SLACK_BOT_TOKEN');
   var hook = props.getProperty('SLACK_WEBHOOK_URL');
   if (token) {
-    var payload = { channel: RSV_CONFIG.SLACK_CHANNEL, text: text, unfurl_links: false };
+    var payload = { channel: channel || RSV_CONFIG.SLACK_CHANNEL, text: text, unfurl_links: false };
     if (threadTs) payload.thread_ts = threadTs;
     if (blocks) payload.blocks = blocks;
     var res = UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
