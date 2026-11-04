@@ -188,7 +188,7 @@ var RSV_CONFIG = {
   TAX_REQUEST_COMPANIES: ['뷰릿지'],
   TAX_REQUEST_CHANNEL: '',                                   // 비우면 SLACK_CHANNEL
   TAX_REQUEST_MENTIONS: ['U07MZUZRLH5', 'U0C1HDSU5NJ', 'U0C348KV24E'], // J Kim · [SCM] 신동현 · 추가 1명
-  TAX_REQUEST_QUIET_MIN: 5,
+  TAX_REQUEST_QUIET_MIN: 30,
   // true 면 홀딩→예약 자동 전환도 알림
   SLACK_NOTIFY_CONVERSIONS: false,
   // true 면 [예약 재고 관리]에 직접(수기) 입력한 신규 건도 알림 (업체+용도 단위로 묶어서 한 번).
