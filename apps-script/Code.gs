@@ -4974,7 +4974,8 @@ function rsvShipScheduleDialog() {
   var companies = rsvScheduleCompanies(rsvReadScheduleRows_());
   if (!companies.length) { rsvToast_('출고 전 예약/홀딩 건이 없습니다'); return; }
   var esc = function (s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); };
-  var opts = companies.map(function (c) {
+  var all = companies.reduce(function (a, c) { return { count: a.count + c.count, qty: a.qty + c.qty }; }, { count: 0, qty: 0 });
+  var opts = '<option value="*">📋 전체 업체  (' + all.count + '건 · ' + rsvFmtNum_(all.qty) + '개)</option>' + companies.map(function (c) {
     return '<option value="' + esc(c.name) + '">' + esc(c.name) + '  (' + c.count + '건 · ' + rsvFmtNum_(c.qty) + '개)</option>';
   }).join('');
   var html =
@@ -4982,16 +4983,18 @@ function rsvShipScheduleDialog() {
     'select{width:100%;padding:8px;font-size:14px;margin:6px 0 4px}' +
     'button{background:#1a73e8;color:#fff;border:0;border-radius:4px;padding:9px 18px;font-size:14px;cursor:pointer;margin-top:12px}' +
     'button:disabled{background:#9bbcf0}#msg{margin-top:14px;line-height:1.6}a{color:#1a73e8}.g{color:#777;font-size:12px}</style>' +
-    '<div>업체와 출고일을 고르면 그날 나가는 품목의 <b>패킹리스트</b>(수량·박스 수량·소비기한·박스 사이즈·박스 번호·중량)를 엑셀로 내려받습니다.</div>' +
+    '<div>업체와 출고일을 고르면 그날 나가는 품목의 <b>패킹리스트</b>(수량·박스 수량·소비기한·박스 사이즈·박스 번호·중량)를 엑셀로 내려받습니다. ' +
+    '<span class="g">전체를 고르면 업체·출고일별로 시트를 나눠 한 파일로 만들어요.</span></div>' +
     '<label>업체</label><select id="c" onchange="dates()">' + opts + '</select>' +
     '<label>출고일 <span class="g">(출고 예정일 D 기준)</span></label><select id="d"><option>불러오는 중…</option></select>' +
     '<button id="b" onclick="go()">엑셀 만들기</button><div id="msg"></div>' +
     '<script>' +
     'function $(i){return document.getElementById(i);}' +
-    'function dates(){var s=$("d");s.innerHTML="<option>불러오는 중…</option>";google.script.run.withSuccessHandler(function(list){s.innerHTML="";' +
+    // 업체를 빨리 바꾸면 늦게 온 이전 업체 목록이 덮어쓰지 않게 요청 번호로 확인
+    'var seq=0;function dates(){var s=$("d"),my=++seq,c=$("c").value;s.innerHTML="<option>불러오는 중…</option>";$("b").disabled=true;google.script.run.withSuccessHandler(function(list){if(my!==seq)return;s.innerHTML="";$("b").disabled=false;' +
     'list.forEach(function(x){var o=document.createElement("option");o.value=x.key;o.textContent=x.label;s.appendChild(o);});})' +
-    '.withFailureHandler(function(e){s.innerHTML="<option>⚠ "+e.message+"</option>";}).rsvPackingDates($("c").value);}dates();' +
-    'function go(){var b=$("b"),m=$("msg");b.disabled=true;m.textContent="만드는 중… (10초 정도)";' +
+    '.withFailureHandler(function(e){if(my!==seq)return;s.innerHTML="<option>⚠ "+e.message+"</option>";}).rsvPackingDates(c);}dates();' +
+    'function go(){var b=$("b"),m=$("msg");b.disabled=true;m.textContent=($("c").value==="*"||$("d").value==="*")?"만드는 중… (출고 건이 많으면 1분 정도)":"만드는 중… (10초 정도)";' +
     'google.script.run.withSuccessHandler(function(r){b.disabled=false;' +
     'var bin=atob(r.b64),arr=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);' +
     'var url=URL.createObjectURL(new Blob([arr],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}));' +
@@ -5037,15 +5040,24 @@ function rsvPackingDates(company) {
   rsvAssertAllowed_();
   var map = {}, list = [];
   rsvPackingRows_().forEach(function (r) {
-    if (!rsvScheduleOpen_(r) || (r.company || r.channel) !== company) return;
+    if (!rsvScheduleOpen_(r) || (company !== '*' && (r.company || r.channel) !== company)) return;
     var k = rsvPackingDateKey(r.ship);
     if (!map[k]) { map[k] = { key: k, n: 0, qty: 0, pos: [] }; list.push(map[k]); }
     map[k].n++; map[k].qty += r.qty;
-    if (r.po && map[k].pos.indexOf(r.po) < 0) map[k].pos.push(r.po);
+    var tag = company === '*' ? (r.company || r.channel) : r.po;
+    if (tag && map[k].pos.indexOf(tag) < 0) map[k].pos.push(tag);
   });
-  return list.sort(function (a, b) { return a.key < b.key ? -1 : 1; }).map(function (x) {
+  list.sort(function (a, b) { return a.key < b.key ? -1 : 1; });
+  var out = list.map(function (x) {
     return { key: x.key, label: (x.key === 'none' ? '출고일 미정' : x.key) + '  ·  ' + x.n + '건 / ' + rsvFmtNum_(x.qty) + '개  ·  ' + x.pos.join(', ') };
   });
+  // 날짜가 둘 이상이면 맨 위에 '전체 출고일' (미정 제외)
+  var dated = list.filter(function (x) { return x.key !== 'none'; });
+  if (dated.length > 1) {
+    var dq = dated.reduce(function (s, x) { return s + x.qty; }, 0), dn = dated.reduce(function (s, x) { return s + x.n; }, 0);
+    out.unshift({ key: '*', label: '📋 전체 출고일 (' + dated[0].key.slice(5) + ' ~ ' + dated[dated.length - 1].key.slice(5) + ')  ·  ' + dn + '건 / ' + rsvFmtNum_(dq) + '개' });
+  }
+  return out;
 }
 
 /**
@@ -5053,7 +5065,7 @@ function rsvPackingDates(company) {
  *  rows: 그 업체·출고일 행, master: {SKU/상품명: {perBox, size, weight}}, exp: {SKU/상품명: 'yyyy.mm.dd'}, prefix: 박스 번호 머리글자
  *  같은 제품·같은 차수는 한 줄. 박스 수량 = 수량 ÷ 아웃박스 입수량 (올림), 박스 번호는 줄 순서대로 이어서.
  */
-function rsvPackingList(rows, master, exp, prefix) {
+function rsvPackingList(rows, master, exp, prefix, usedLots) {
   var lines = [], byKey = {};
   // 상품 단위로 합침 (차수가 달라도 한 줄) — 출고 차수 칸에 차수를 모아서 표기
   rows.forEach(function (r) {
@@ -5075,7 +5087,8 @@ function rsvPackingList(rows, master, exp, prefix) {
     var x = rsvNaturalKey_(a.name), y = rsvNaturalKey_(b.name);
     return x < y ? -1 : x > y ? 1 : 0;
   });
-  var no = 0, usedLots = {};
+  var no = 0;
+  usedLots = usedLots || {}; // 여러 출고를 한 번에 뽑을 때 앞 출고가 쓴 로트를 이어서 씀
   lines.forEach(function (l) {
     var m = master[l.code] || master[l.name] || {};
     l.perBox = m.perBox || 0; l.size = m.size || ''; l.weight = m.weight || 0;
@@ -5222,49 +5235,65 @@ function rsvPackingPrefix(company, pos, cfg) {
 function rsvBuildPackingList(company, dateKey) {
   rsvAssertAllowed_();
   var ss = SpreadsheetApp.getActive();
-  var rows = rsvPackingRows_().filter(function (r) {
-    return rsvScheduleOpen_(r) && (r.company || r.channel) === company && rsvPackingDateKey(r.ship) === dateKey;
+  // 전체('*'): 업체·출고일별로 묶어 시트를 나눈다 (전체 출고일은 미정 제외)
+  var groups = {}, order = [];
+  rsvPackingRows_().forEach(function (r) {
+    if (!rsvScheduleOpen_(r)) return;
+    var c = r.company || r.channel, k = rsvPackingDateKey(r.ship);
+    if (company !== '*' && c !== company) return;
+    if (dateKey === '*' ? k === 'none' : k !== dateKey) return;
+    var gk = k + '|' + c;
+    if (!groups[gk]) { groups[gk] = { company: c, dateKey: k, rows: [] }; order.push(gk); }
+    groups[gk].rows.push(r);
   });
-  if (!rows.length) throw new Error(company + ' · ' + dateKey + ' 출고 건이 없습니다');
-  var pos = [];
-  rows.forEach(function (r) { if (r.po && pos.indexOf(r.po) < 0) pos.push(r.po); });
-  pos.sort(function (a, b) { var x = rsvNaturalKey_(a), y = rsvNaturalKey_(b); return x < y ? -1 : x > y ? 1 : 0; });
-  var lines = rsvPackingList(rows, rsvPackingMaster_(ss), rsvPackingExp_(ss), rsvPackingPrefix(company, pos, RSV_CONFIG));
-  var md = dateKey === 'none' ? '미정' : dateKey.slice(5).replace('-', '');
-  var fname = [md, company, pos.join('+'), '패킹리스트'].filter(String).join('_').replace(/[\\\/:*?"<>|]/g, '-');
+  if (!order.length) throw new Error((company === '*' ? '전체 업체' : company) + ' · ' + (dateKey === '*' ? '전체 출고일' : dateKey) + ' 출고 건이 없습니다');
+  order.sort();
+  var master = rsvPackingMaster_(ss), exp = rsvPackingExp_(ss), used = {};
+  var list = order.map(function (gk) {
+    var g = groups[gk], pos = [];
+    g.rows.forEach(function (r) { if (r.po && pos.indexOf(r.po) < 0) pos.push(r.po); });
+    pos.sort(function (a, b) { var x = rsvNaturalKey_(a), y = rsvNaturalKey_(b); return x < y ? -1 : x > y ? 1 : 0; });
+    g.pos = pos;
+    g.md = g.dateKey === 'none' ? '미정' : g.dateKey.slice(5).replace('-', '');
+    g.lines = rsvPackingList(g.rows, master, exp, rsvPackingPrefix(g.company, pos, RSV_CONFIG), used);
+    return g;
+  });
+  var single = list.length === 1;
+  var clean = function (x) { return x.replace(/[\\\/:*?"<>|]/g, '-'); };
+  var fname = single ? clean([list[0].md, list[0].company, list[0].pos.join('+'), '패킹리스트'].filter(String).join('_'))
+    : clean([dateKey === '*' ? list[0].md + '-' + list[list.length - 1].md : list[0].md, company === '*' ? '전체' : company, '패킹리스트'].join('_'));
 
   var tmp = SpreadsheetApp.create(fname);
   try {
-    var sh = tmp.getSheets()[0];
-    sh.setName('출고 리스트');
-    var head = ['출고일', '제품명', '수량', '박스 수량', '출고 차수', '비고', '제품별 소비기한(EXP)', '박스 사이즈(mm)', '박스 번호\n(' + (lines[0] && lines[0].boxNo ? lines[0].boxNo.split(' ')[0].replace(/\d+$/, '1') : 'B-1') + ' ~)', '1박스 중량(kg)', '박스 총중량(kg)'];
-    var n = lines.length, W = head.length;
-    sh.getRange(1, 1, 1, W).setValues([head]).setFontWeight('bold').setFontSize(11).setBackground('#f2f2f2')
-      .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
-    sh.setRowHeight(1, 47);
-    var data = lines.map(function (l) {
-      return [l.date || '미정', l.name, l.qty, l.boxes || '', l.purpose, l.note, l.exp, l.size, l.boxNo, l.weight || '', l.total];
-    });
-    if (n) {
-      sh.getRange(2, 1, n, W).setValues(data).setFontSize(10).setHorizontalAlignment('center').setVerticalAlignment('middle');
-      sh.getRange(2, 1, n, 1).setNumberFormat('yyyy-mm-dd');
-      sh.getRange(2, 3, n, 1).setNumberFormat('#,##0');
-      sh.getRange(2, 10, n, 2).setNumberFormat('0.00');
-      // 소비기한은 재고 데이터 기준이라 실제 출고 로트와 다를 수 있음 → 연노랑으로 '확인' 표시, 다음 로트를 모르면 빨간 글씨
-      sh.getRange(2, 7, n, 1).setBackground('#fff9e6').setWrap(true);
-      lines.forEach(function (l, i) { if (l.expWarn) sh.getRange(2 + i, 7).setFontColor('#cc0000').setFontWeight('bold'); });
+    var first = tmp.getSheets()[0];
+    if (!single) {
+      // 요약 시트: 출고일 · 업체 · PO · 종 · 수량 · 박스
+      first.setName('요약');
+      var sum = [['출고일', '업체', 'PO / 차수', '종', '수량', '박스', '시트']];
+      list.forEach(function (g) {
+        sum.push([g.dateKey === 'none' ? '미정' : g.dateKey, g.company, g.pos.join(', '), g.lines.length,
+          g.lines.reduce(function (s, l) { return s + l.qty; }, 0), g.lines.reduce(function (s, l) { return s + (l.boxes || 0); }, 0), '']);
+      });
+      first.getRange(1, 1, sum.length, 7).setValues(sum).setFontFamily('Malgun Gothic').setVerticalAlignment('middle');
+      first.getRange(1, 1, 1, 7).setFontWeight('bold').setBackground('#f2f2f2').setHorizontalAlignment('center');
+      first.getRange(2, 5, sum.length - 1, 1).setNumberFormat('#,##0');
+      first.getRange(1, 1, sum.length, 7).setBorder(true, true, true, true, true, true, '#000000', SpreadsheetApp.BorderStyle.SOLID);
+      [12, 16, 40, 6, 10, 8, 22].forEach(function (w, i) { first.setColumnWidth(i + 1, Math.round(w * 7.5)); });
+      first.setFrozenRows(1);
     }
-    var t = n + 2;
-    sh.getRange(t, 3).setFormula('=SUM(C2:C' + (n + 1) + ')').setNumberFormat('#,##0');
-    sh.getRange(t, 4).setFormula('=SUM(D2:D' + (n + 1) + ')');
-    sh.getRange(t, 10).setValue('합계');
-    sh.getRange(t, 11).setFormula('=ROUND(SUM(K2:K' + (n + 1) + '),2)').setNumberFormat('0.00');
-    sh.getRange(t, 1, 1, W).setFontWeight('bold').setFontSize(11).setHorizontalAlignment('center');
-    sh.getRange(1, 1, n + 1, W).setBorder(true, true, true, true, true, true, '#000000', SpreadsheetApp.BorderStyle.SOLID);
-    sh.getRange(1, 1, n + 1, W).setBorder(true, true, true, true, null, null, '#000000', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
-    sh.getRange(1, 1, t, W).setFontFamily('Malgun Gothic');
-    [12, 44, 9.5, 10, 44, 14, 19, 16, 15, 13, 15].forEach(function (w, i) { sh.setColumnWidth(i + 1, Math.round(w * 7.5)); });
-    sh.setFrozenRows(1);
+    var names = {};
+    list.forEach(function (g, i) {
+      var sh;
+      if (single) { sh = first; sh.setName('출고 리스트'); }
+      else {
+        var nm = (g.md + '_' + g.company).replace(/[\[\]\*\?\/\\:]/g, '-').slice(0, 90), base = nm, n2 = 2;
+        while (names[nm]) nm = base + '(' + (n2++) + ')';
+        names[nm] = true;
+        sh = tmp.insertSheet(nm);
+        first.getRange(i + 2, 7).setValue(nm);
+      }
+      rsvWritePackingSheet_(sh, g.lines);
+    });
     SpreadsheetApp.flush();
 
     var res = UrlFetchApp.fetch('https://docs.google.com/spreadsheets/d/' + tmp.getId() + '/export?format=xlsx', {
@@ -5272,28 +5301,66 @@ function rsvBuildPackingList(company, dateKey) {
     });
     if (res.getResponseCode() !== 200) throw new Error('엑셀 변환 실패 (' + res.getResponseCode() + ')');
     var blob = res.getBlob().setName(fname + '.xlsx');
+    // 저장: 한 업체·한 출고일이면 업체 폴더(03 발주/출고월), 여러 건이면 내 Drive
     var folder = null;
-    try {
-      var buyer = rsvFindBuyer(rsvReadBuyers_(ss), company, '', RSV_CONFIG.INVOICE_COMPANY_ALIASES);
-      var hint = rows.map(function (r) { return r.purpose + ' ' + r.po; }).join(' ');
-      if (dateKey !== 'none') folder = rsvDocFolder_(company, buyer ? buyer.name : '', dateKey, hint, pos.length === 1 ? pos[0] : '');
-      if (!folder && buyer) folder = rsvInvoiceFolder_(buyer, company);
-    } catch (e) { folder = null; }
+    if (single) {
+      var g0 = list[0];
+      try {
+        var buyer = rsvFindBuyer(rsvReadBuyers_(ss), g0.company, '', RSV_CONFIG.INVOICE_COMPANY_ALIASES);
+        var hint = g0.rows.map(function (r) { return r.purpose + ' ' + r.po; }).join(' ');
+        if (g0.dateKey !== 'none') folder = rsvDocFolder_(g0.company, buyer ? buyer.name : '', g0.dateKey, hint, g0.pos.length === 1 ? g0.pos[0] : '');
+        if (!folder && buyer) folder = rsvInvoiceFolder_(buyer, g0.company);
+      } catch (e) { folder = null; }
+    }
     var saved = folder ? folder.createFile(blob) : DriveApp.createFile(blob);
+    var lines = [].concat.apply([], list.map(function (g) { return g.lines; }));
     var boxes = lines.reduce(function (s, l) { return s + (l.boxes || 0); }, 0);
     var qty = lines.reduce(function (s, l) { return s + l.qty; }, 0);
-    var miss = lines.filter(function (l) { return !l.perBox || !l.exp; }).map(function (l) { return l.name.replace(/^로지킴\s*/, ''); });
-    var warnLot = lines.filter(function (l) { return l.expWarn; }).map(function (l) { return l.name.replace(/^로지킴\s*/, ''); });
+    var uniq = function (a) { return a.filter(function (x, i) { return a.indexOf(x) === i; }); };
+    var miss = uniq(lines.filter(function (l) { return !l.perBox || !l.exp; }).map(function (l) { return l.name.replace(/^로지킴\s*/, ''); }));
+    var warnLot = uniq(lines.filter(function (l) { return l.expWarn; }).map(function (l) { return l.name.replace(/^로지킴\s*/, ''); }));
     return {
       name: fname + '.xlsx', b64: Utilities.base64Encode(blob.getBytes()), driveUrl: saved.getUrl(),
-      summary: n + '종 / ' + rsvFmtNum_(qty) + '개 · ' + boxes + '박스 (' + (folder ? '[' + folder.getName() + '] 폴더' : '내 Drive') + '에도 저장)' +
-        '<br>소비기한(EXP)은 이지어드민 재고 기준 · 유통기한 빠른 로트부터 출고 수량만큼 나눠 적었어요' +
+      summary: (single ? '' : list.length + '건 출고 (업체·출고일별 시트 + 요약) · ') + lines.length + '줄 / ' + rsvFmtNum_(qty) + '개 · ' + boxes + '박스 (' + (folder ? '[' + folder.getName() + '] 폴더' : '내 Drive') + '에도 저장)' +
+        '<br>소비기한(EXP)은 이지어드민 재고 기준 · 유통기한 빠른 로트부터 출고 수량만큼 나눠 적었어요' + (single ? '' : ' (출고일 순서대로 이어서)') +
         (warnLot.length ? '<br>⚠ 다음 로트 소비기한을 몰라 빨간 글씨: ' + warnLot.join(', ') + ' — [' + RSV_CONFIG.PACKING_LOT_SHEET + '] 시트(로트별 재고)를 넣으면 자동으로 채워져요' : '') +
         (miss.length ? '<br>⚠ 입수량/소비기한 정보 없음: ' + miss.join(', ') : ''),
     };
   } finally {
     try { DriveApp.getFileById(tmp.getId()).setTrashed(true); } catch (e) { /* 임시 파일 정리 실패는 무시 */ }
   }
+}
+
+/** 패킹리스트 한 장 (출고 리스트 양식) */
+function rsvWritePackingSheet_(sh, lines) {
+  var head = ['출고일', '제품명', '수량', '박스 수량', '출고 차수', '비고', '제품별 소비기한(EXP)', '박스 사이즈(mm)', '박스 번호\n(' + (lines[0] && lines[0].boxNo ? lines[0].boxNo.split(' ')[0].replace(/\d+$/, '1') : 'B-1') + ' ~)', '1박스 중량(kg)', '박스 총중량(kg)'];
+  var n = lines.length, W = head.length;
+  sh.getRange(1, 1, 1, W).setValues([head]).setFontWeight('bold').setFontSize(11).setBackground('#f2f2f2')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
+  sh.setRowHeight(1, 47);
+  var data = lines.map(function (l) {
+    return [l.date || '미정', l.name, l.qty, l.boxes || '', l.purpose, l.note, l.exp, l.size, l.boxNo, l.weight || '', l.total];
+  });
+  if (n) {
+    sh.getRange(2, 1, n, W).setValues(data).setFontSize(10).setHorizontalAlignment('center').setVerticalAlignment('middle');
+    sh.getRange(2, 1, n, 1).setNumberFormat('yyyy-mm-dd');
+    sh.getRange(2, 3, n, 1).setNumberFormat('#,##0');
+    sh.getRange(2, 10, n, 2).setNumberFormat('0.00');
+    // 소비기한은 재고 데이터 기준이라 실제 출고 로트와 다를 수 있음 → 연노랑으로 '확인' 표시, 다음 로트를 모르면 빨간 글씨
+    sh.getRange(2, 7, n, 1).setBackground('#fff9e6').setWrap(true);
+    lines.forEach(function (l, i) { if (l.expWarn) sh.getRange(2 + i, 7).setFontColor('#cc0000').setFontWeight('bold'); });
+  }
+  var t = n + 2;
+  sh.getRange(t, 3).setFormula('=SUM(C2:C' + (n + 1) + ')').setNumberFormat('#,##0');
+  sh.getRange(t, 4).setFormula('=SUM(D2:D' + (n + 1) + ')');
+  sh.getRange(t, 10).setValue('합계');
+  sh.getRange(t, 11).setFormula('=ROUND(SUM(K2:K' + (n + 1) + '),2)').setNumberFormat('0.00');
+  sh.getRange(t, 1, 1, W).setFontWeight('bold').setFontSize(11).setHorizontalAlignment('center');
+  sh.getRange(1, 1, n + 1, W).setBorder(true, true, true, true, true, true, '#000000', SpreadsheetApp.BorderStyle.SOLID);
+  sh.getRange(1, 1, n + 1, W).setBorder(true, true, true, true, null, null, '#000000', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  sh.getRange(1, 1, t, W).setFontFamily('Malgun Gothic');
+  [12, 44, 9.5, 10, 44, 14, 19, 16, 15, 13, 15].forEach(function (w, i) { sh.setColumnWidth(i + 1, Math.round(w * 7.5)); });
+  sh.setFrozenRows(1);
 }
 
 function rsvReadScheduleRows_() {
