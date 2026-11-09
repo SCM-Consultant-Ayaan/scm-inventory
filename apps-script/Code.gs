@@ -2983,6 +2983,10 @@ function rsvImportMail_(opts) {
             rsvWriteLog_(msg, fname, '변경요청 ' + req.id + ' · ' + diff.length + '건 · PO ' + po.poNo + ' · ' + po.purpose + ' → 승인 대기');
             return;
           }
+          // 상품명을 못 찾은 품목이 있으면 등록하지 않음 (상품명 드롭다운 규칙에 걸려 행이 반쯤만 써지는 것 방지)
+          var miss = po.lines.filter(function (ln) { return !rsvResolveProduct(ln, products).name; });
+          if (miss.length) throw new Error('상품명 매칭 실패 ' + miss.length + '건 (등록 안 함): ' + miss.map(function (ln) { return ln.name + (ln.code ? ' [' + ln.code + ']' : ''); }).join(', ') +
+            ' — [상품 마스터 시트] 한글명·영문명·바코드 확인');
           var company = rsvMatchCompany(po.company, companyList, RSV_CONFIG.COMPANY_ALIASES);
           var companyNote = (company === null && companyList) ? '업체: ' + po.company + ' (업체명 드롭다운에 없음)' : '';
           if (company === null) company = companyList ? '' : po.company;
