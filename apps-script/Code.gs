@@ -5137,9 +5137,18 @@ function rsvReadProducts_(ss) {
     if (r[4]) list.push({ barcode: String(r[0]).trim(), name: String(r[4]).trim() });
   });
   var ms = ss.getSheetByName(RSV_CONFIG.MASTER_SHEET);
-  if (ms) {
-    ms.getRange(3, 5, Math.max(ms.getLastRow() - 2, 1), 2).getValues().forEach(function (r) {
-      if (r[0] && r[1]) list.push({ barcode: String(r[0]).trim(), name: String(r[1]).trim() });
+  if (ms && ms.getLastRow() >= 3) {
+    // 2행 머리글로 열 찾기: SKU CODE · 내부 상품명(한글) · 정식 상품명(영문) · 바코드
+    var mv = ms.getRange(2, 1, ms.getLastRow() - 1, ms.getLastColumn()).getValues();
+    var mh = mv[0].map(function (x) { return String(x).replace(/\s/g, ''); });
+    var col = function (re, d) { for (var i = 0; i < mh.length; i++) if (re.test(mh[i])) return i; return d; };
+    var cSku = col(/^SKU/i, 4), cKo = col(/한글/, 5), cEn = col(/영문/, -1), cBar = col(/^바코드/, -1);
+    mv.slice(1).forEach(function (r) {
+      var sku = String(r[cSku] || '').trim(), ko = String(r[cKo] || '').trim();
+      if (!ko || /^#/.test(ko)) return;
+      var bar = cBar >= 0 ? String(r[cBar] || '').trim() : '';
+      // 발주서가 영문명·바코드로 와도 한글 상품명으로 찾게
+      list.push({ barcode: sku, name: ko, en: cEn >= 0 ? String(r[cEn] || '').trim() : '', ean: /^\d{8,14}$/.test(bar) ? bar : '' });
     });
   }
   return list;
@@ -5147,14 +5156,27 @@ function rsvReadProducts_(ss) {
 
 /** 바코드 우선, 없으면 상품명(공백 무시 일치 → 포함)으로 [재고관리] 상품명 찾기 */
 function rsvResolveProduct(line, products) {
-  var n = function (s) { return String(s || '').replace(/\s/g, '').toLowerCase(); };
+  // 맥에서 만든 엑셀은 한글이 자모 분리(NFD)돼 있어 글자가 같아도 안 맞음 → NFC
+  var n = function (s) { return String(s || '').normalize('NFC').replace(/\s/g, '').toLowerCase(); };
+  // 한글 상품명으로 돌려줌 (마스터 영문·바코드로 찾은 경우 [재고관리] 행이 있으면 그 코드)
+  var ko = function (p) {
+    var inv = products.filter(function (q) { return !q.en && !q.ean && n(q.name) === n(p.name); })[0];
+    return { barcode: (inv && inv.barcode) || p.barcode, name: p.name };
+  };
   if (line.barcode) {
     var b = products.filter(function (p) { return p.barcode === line.barcode; })[0];
     if (b) return b;
   }
+  var ean = String(line.code || line.barcode || '').replace(/\D/g, '');
+  if (ean.length >= 8) {
+    var e = products.filter(function (p) { return p.ean === ean; })[0];
+    if (e) return ko(e);
+  }
   if (line.name) {
     var exact = products.filter(function (p) { return n(p.name) === n(line.name); })[0];
     if (exact) return exact;
+    var en = products.filter(function (p) { return p.en && n(p.en) === n(line.name); })[0];
+    if (en) return ko(en);
     var part = products.filter(function (p) { return n(p.name).indexOf(n(line.name)) >= 0 || n(line.name).indexOf(n(p.name)) >= 0; });
     if (part.length === 1) return part[0];
   }
