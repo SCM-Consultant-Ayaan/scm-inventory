@@ -22,7 +22,7 @@ var RSV_CONFIG = {
 
   RES_SHEET: '예약 재고 관리',
   INV_SHEET: '재고관리',
-  MASTER_SHEET: '상품 마스터 시트(수기)',
+  MASTER_SHEET: '상품 마스터 시트(수기)',          // 없으면 '상품 마스터 시트'
   LOG_SHEET: '메일수신로그',
   CHANGE_SHEET: '변경요청',
   MEMO_SHEET: '예약관리_참고메모',
@@ -5140,7 +5140,7 @@ function rsvReadProducts_(ss) {
   inv.getRange(4, 1, Math.max(inv.getLastRow() - 3, 1), 5).getValues().forEach(function (r) {
     if (r[4]) list.push({ barcode: String(r[0]).trim(), name: String(r[4]).trim() });
   });
-  var ms = ss.getSheetByName(RSV_CONFIG.MASTER_SHEET);
+  var ms = ss.getSheetByName(RSV_CONFIG.MASTER_SHEET) || ss.getSheetByName('상품 마스터 시트');
   if (ms && ms.getLastRow() >= 3) {
     // 2행 머리글로 열 찾기: SKU CODE · 내부 상품명(한글) · 정식 상품명(영문) · 바코드
     var mv = ms.getRange(2, 1, ms.getLastRow() - 1, ms.getLastColumn()).getValues();
