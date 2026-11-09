@@ -285,6 +285,7 @@ function rsvOnOpen() {
       .addItem('업체별 정렬 (업체 → 출고일 → 차수)', 'rsvSortByCompany'))
     .addSubMenu(ui.createMenu('✉️ 메일 발주')
       .addItem('메일 발주서 지금 가져오기', 'rsvRunMailImport')
+      .addItem('메일 제목으로 발주서 다시 가져오기', 'rsvImportBySubject')
       .addItem('실패한 메일 다시 시도', 'rsvRetryFailedMail')
       .addItem('변경요청 승인/반려 지금 반영', 'rsvProcessChangesNow')
       .addSeparator()
@@ -399,6 +400,40 @@ function rsvRetryFailedMail() {
   var res = rsvImportMail_();
   rsvNotifySlack_(res.pos, rsvRunAllocation().conversions);
   rsvToast_('실패 메일 ' + n + '건 재시도 → ' + res.added + '행 등록');
+}
+
+/**
+ * 메뉴: 메일 제목(일부)을 입력하면 그 제목의 가장 최근 메일(엑셀 첨부가 있는)에서 발주서를 다시 가져온다.
+ *  이미 처리한 메일이어도 다시 읽음. 이미 시트에 있는 PO 면 평소처럼 수량 비교 → 변경요청(승인 대기) / 변경 없음.
+ */
+function rsvImportBySubject() {
+  rsvAssertAllowed_();
+  var ui = SpreadsheetApp.getUi();
+  var r = ui.prompt('📥 메일 제목으로 발주서 다시 가져오기', '메일 제목(일부만 써도 됨)을 입력하세요.\n그 제목의 가장 최근 메일·첨부 파일로 가져옵니다.', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  var title = String(r.getResponseText() || '').trim().replace(/"/g, '');
+  if (!title) { rsvToast_('제목을 입력하세요'); return; }
+  var threads = GmailApp.search('subject:"' + title + '" has:attachment', 0, 20);
+  var best = null, bestThread = null;
+  threads.forEach(function (th) {
+    th.getMessages().forEach(function (m) {
+      var files = m.getAttachments().map(function (a) { return String(a.getName()).normalize('NFC'); })
+        .filter(function (n) { return /\.(xlsx|xls|xlsm)$/i.test(n); });
+      if (!files.length) return;
+      if (!best || m.getDate() > best.msg.getDate()) { best = { msg: m, files: files }; bestThread = th; }
+    });
+  });
+  if (!best) { ui.alert('📥 다시 가져오기', '제목에 "' + title + '" 이(가) 들어간 메일 중 엑셀 첨부가 있는 메일을 못 찾았어요.', ui.ButtonSet.OK); return; }
+  var m = best.msg;
+  if (ui.alert('📥 이 메일로 가져올까요?', '제목: ' + m.getSubject() + '\n보낸 사람: ' + m.getFrom() + '\n날짜: ' + rsvFmtDateTime_(m.getDate()) +
+    '\n첨부: ' + best.files.join(', ') + '\n\n이미 등록된 PO 면 수량을 비교해 바뀐 것만 변경요청(승인 대기)으로 올립니다.', ui.ButtonSet.OK_CANCEL) !== ui.Button.OK) return;
+  RSV_IMPORT_NOTES = [];
+  var res;
+  try { res = rsvImportMail_({ threads: [bestThread], msgIds: [m.getId()], force: true }); }
+  finally { var notes = RSV_IMPORT_NOTES; RSV_IMPORT_NOTES = null; }
+  rsvNotifySlack_(res.pos, rsvRunAllocation().conversions);
+  ui.alert('📥 다시 가져오기 결과', (notes.length ? notes.join('\n') : '처리한 발주서가 없어요') +
+    '\n\n등록 ' + res.added + '행' + (res.changes ? ' · 변경요청 ' + res.changes + '건(승인 대기)' : ''), ui.ButtonSet.OK);
 }
 
 function rsvRunMailImport() {
@@ -2879,7 +2914,8 @@ function rsvCompanyKey_(r) { return r.company || r.channel || ''; }
 // 메일 발주서 자동 등록
 // =====================================================================
 
-function rsvImportMail_() {
+function rsvImportMail_(opts) {
+  opts = opts || {}; // {threads, msgIds, force}: 메뉴 '메일 제목으로 다시 가져오기' — 그 메일만, 처리 기록 무시
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(RSV_CONFIG.RES_SHEET);
   var none = { added: 0, pos: [] };
@@ -2892,7 +2928,7 @@ function rsvImportMail_() {
   // 이미 처리한 메일(메시지)은 RSV_MAIL_SEEN 에 기억해 건너뛴다.
   var q = RSV_CONFIG.MAIL_QUERY + (after ? ' after:' + Math.floor(after.getTime() / 1000) : '');
   var seen = rsvMailSeen_();
-  var threads = GmailApp.search(q, 0, 50);
+  var threads = opts.threads || GmailApp.search(q, 0, 50);
   if (!threads.length) return none;
 
   var processed = {}; // 이번 실행에서 이미 처리한 PO (같은 첨부가 답장 메일에 또 붙은 경우)
@@ -2903,8 +2939,9 @@ function rsvImportMail_() {
   threads.forEach(function (th) {
     var threadOk = true, touched = false;
     th.getMessages().forEach(function (msg) {
-      if (seen[msg.getId()]) return;
-      if (!rsvSenderAllowed_(msg.getFrom())) return;
+      if (opts.msgIds && opts.msgIds.indexOf(msg.getId()) < 0) return;
+      if (!opts.force && seen[msg.getId()]) return;
+      if (!opts.force && !rsvSenderAllowed_(msg.getFrom())) return;
       var msgTouched = false, msgOk = true;
       msg.getAttachments().forEach(function (att) {
         // 맥에서 보낸 파일은 한글이 자모 분리(NFD)돼 있어 "[로지킴]"과 안 맞음 → NFC 로 정규화
@@ -5136,7 +5173,9 @@ function rsvLogSheet_() {
   return sh;
 }
 
+var RSV_IMPORT_NOTES = null; // 메뉴로 다시 가져올 때 결과를 모아 보여주려고
 function rsvWriteLog_(msg, fname, result) {
+  if (RSV_IMPORT_NOTES) RSV_IMPORT_NOTES.push(fname + ' → ' + result);
   rsvLogSheet_().appendRow([new Date(), msg.getDate(), msg.getFrom(), msg.getSubject(), fname, result]);
 }
 
