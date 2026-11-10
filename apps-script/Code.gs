@@ -2986,7 +2986,10 @@ function rsvImportMail_(opts) {
           }
           // 상품명을 못 찾은 품목이 있으면 등록하지 않음 (상품명 드롭다운 규칙에 걸려 행이 반쯤만 써지는 것 방지)
           var miss = po.lines.filter(function (ln) { return !rsvResolveProduct(ln, products).name; });
-          if (miss.length) throw new Error('상품명 매칭 실패 ' + miss.length + '건 (등록 안 함): ' + miss.map(function (ln) { return ln.name + (ln.code ? ' [' + ln.code + ']' : ''); }).join(', ') +
+          if (miss.length) throw new Error('상품명 매칭 실패 ' + miss.length + '건 (등록 안 함): ' + miss.map(function (ln) {
+            var r = rsvResolveProduct(ln, products);
+            return ln.name + (ln.code ? ' [' + ln.code + ']' : '') + (r.notInInv ? ' → 마스터 「' + r.notInInv + '」가 [재고관리]에 없음' : '');
+          }).join(', ') +
             ' — [상품 마스터 시트] 한글명·영문명·바코드 확인');
           var company = rsvMatchCompany(po.company, companyList, RSV_CONFIG.COMPANY_ALIASES);
           var companyNote = (company === null && companyList) ? '업체: ' + po.company + ' (업체명 드롭다운에 없음)' : '';
@@ -5153,7 +5156,7 @@ function rsvReadProducts_(ss) {
       if (!ko || /^#/.test(ko)) return;
       var bar = cBar >= 0 ? String(r[cBar] || '').trim() : '';
       // 발주서가 영문명·바코드로 와도 한글 상품명으로 찾게
-      list.push({ barcode: sku, name: ko, en: cEn >= 0 ? String(r[cEn] || '').trim() : '', ean: /^\d{8,14}$/.test(bar) ? bar : '' });
+      list.push({ barcode: sku, name: ko, en: cEn >= 0 ? String(r[cEn] || '').trim() : '', ean: /^\d{8,14}$/.test(bar) ? bar : '', master: true });
     });
   }
   return list;
@@ -5164,9 +5167,19 @@ function rsvResolveProduct(line, products) {
   // 맥에서 만든 엑셀은 한글이 자모 분리(NFD)돼 있어 글자가 같아도 안 맞음 → NFC
   var n = function (s) { return String(s || '').normalize('NFC').replace(/\s/g, '').toLowerCase(); };
   // 한글 상품명으로 돌려줌 (마스터 영문·바코드로 찾은 경우 [재고관리] 행이 있으면 그 코드)
+  //  [재고관리]에 없는 상품(상품명 드롭다운에 없음)이면 괄호 부분만 다른 [재고관리] 상품이 하나뿐일 때 그것으로
+  //  (예: 마스터 '벨벳 립 파우치 (바코드 O)' → 재고관리 '벨벳 립 파우치 (바코드 X)'), 그것도 없으면 name 비움(매칭 실패)
+  var isInv = function (q) { return !q.en && !q.ean && !q.master; };
+  var bare = function (s) { return n(s).replace(/\([^)]*\)/g, ''); };
   var ko = function (p) {
-    var inv = products.filter(function (q) { return !q.en && !q.ean && n(q.name) === n(p.name); })[0];
-    return { barcode: (inv && inv.barcode) || p.barcode, name: p.name };
+    var inv = products.filter(function (q) { return isInv(q) && n(q.name) === n(p.name); })[0];
+    if (!inv) {
+      var near = products.filter(function (q) { return isInv(q) && bare(q.name) === bare(p.name); });
+      var uniq = near.filter(function (q, i) { return near.map(function (x) { return n(x.name); }).indexOf(n(q.name)) === i; });
+      if (uniq.length === 1) inv = uniq[0];
+    }
+    if (!inv && products.some(isInv)) return { barcode: p.barcode, name: '', notInInv: p.name };
+    return { barcode: (inv && inv.barcode) || p.barcode, name: inv ? inv.name : p.name };
   };
   if (line.barcode) {
     var b = products.filter(function (p) { return p.barcode === line.barcode; })[0];
@@ -5185,7 +5198,7 @@ function rsvResolveProduct(line, products) {
   }
   if (line.name) {
     var exact = products.filter(function (p) { return n(p.name) === n(line.name); })[0];
-    if (exact) return exact;
+    if (exact) return isInv(exact) ? exact : ko(exact);
     var en = products.filter(function (p) { return p.en && n(p.en) === n(line.name); })[0];
     if (en) return ko(en);
     var part = products.filter(function (p) { return n(p.name).indexOf(n(line.name)) >= 0 || n(line.name).indexOf(n(p.name)) >= 0; });
