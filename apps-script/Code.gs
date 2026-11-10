@@ -5172,6 +5172,12 @@ function rsvResolveProduct(line, products) {
     var b = products.filter(function (p) { return p.barcode === line.barcode; })[0];
     if (b) return b;
   }
+  // 품목코드가 SKU 코드(예: GD-PC-G-04-01-KR)면 SKU 로
+  var sku = String(line.code || '').trim().toUpperCase();
+  if (/^[A-Z]{2}-/.test(sku)) {
+    var k = products.filter(function (p) { return String(p.barcode).toUpperCase() === sku; })[0];
+    if (k) return ko(k);
+  }
   var ean = String(line.code || line.barcode || '').replace(/\D/g, '');
   if (ean.length >= 8) {
     var e = products.filter(function (p) { return p.ean === ean; })[0];
