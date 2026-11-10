@@ -2089,7 +2089,8 @@ function rsvInvoiceTargets(values) {
     if (!id) return null;
     return {
       id: id, level: level, key: rsvInvoiceGroupKey({ useDate: v[RSV_COL.useDate - 1], level: level }),
-      foc: /\|foc/.test(key) || (!m && /FOC/i.test(memo + String(v[RSV_COL.purpose - 1] || ''))),
+      // FOC: 메일키 |foc · 제품코드(H)가 'FOC' · 수기 행의 비고/용도에 FOC → 명세서 맨 아래 0원
+      foc: /\|foc/.test(key) || /^\s*FOC\s*$/i.test(String(v[RSV_COL.code - 1] || '')) || (!m && /FOC/i.test(memo + String(v[RSV_COL.purpose - 1] || ''))),
     };
   });
 }
