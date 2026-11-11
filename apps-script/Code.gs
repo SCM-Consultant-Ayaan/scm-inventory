@@ -5644,7 +5644,13 @@ function rsvBuildPackingList(company, dateKey) {
   });
   var single = list.length === 1;
   var clean = function (x) { return x.replace(/[\\\/:*?"<>|]/g, '-'); };
-  var fname = single ? clean([list[0].md, list[0].company, list[0].pos.join('+'), '패킹리스트'].filter(String).join('_'))
+  // 파일명은 짧게: PO 앞머리만 (LH(TW)_261028_15 → LH(TW)), 차수 글자(대만 수출 26-11차 등)는 뺌
+  var poTag = function (pos) {
+    var t = [];
+    pos.forEach(function (p) { var m = String(p).match(/^([A-Za-z]+(?:\([A-Za-z]+\))?)_/); if (m && t.indexOf(m[1]) < 0) t.push(m[1]); });
+    return t.join('+');
+  };
+  var fname = single ? clean([list[0].md, list[0].company, poTag(list[0].pos), '패킹리스트'].filter(String).join('_'))
     : clean([dateKey === '*' ? list[0].md + '-' + list[list.length - 1].md : list[0].md, company === '*' ? '전체' : company, '패킹리스트'].join('_'));
 
   var tmp = SpreadsheetApp.create(fname);
