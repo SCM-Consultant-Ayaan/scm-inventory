@@ -2090,7 +2090,7 @@ function rsvInvoiceTargets(values) {
     return {
       id: id, level: level, key: rsvInvoiceGroupKey({ useDate: v[RSV_COL.useDate - 1], level: level }),
       // FOC: 메일키 |foc · 제품코드(H)가 'FOC' · 수기 행의 비고/용도에 FOC → 명세서 맨 아래 0원
-      foc: /\|foc/.test(key) || /^\s*FOC\s*$/i.test(String(v[RSV_COL.code - 1] || '')) || (!m && /FOC/i.test(memo + String(v[RSV_COL.purpose - 1] || ''))),
+      foc: /\|foc/.test(key) || /^\s*(FOC|GWP)\s*$/i.test(String(v[RSV_COL.code - 1] || '')) || (!m && /FOC/i.test(memo + String(v[RSV_COL.purpose - 1] || ''))),
     };
   });
 }
@@ -3003,8 +3003,8 @@ function rsvImportMail_(opts) {
             row[RSV_COL.channel - 1] = RSV_CONFIG.PO_CHANNEL;
             row[RSV_COL.company - 1] = company;
             row[RSV_COL.purpose - 1] = po.purpose;
-            // 발주서 비고가 FOC 면 제품코드(H)에 'FOC' → 거래명세서 맨 아래 0원 줄
-            row[RSV_COL.code - 1] = /(^|[\s\/·,])FOC($|[\s\/·,(])/i.test(String(ln.memo || '')) ? 'FOC' : (prod.barcode || '');
+            // 발주서 비고가 FOC·GWP 면 제품코드(H)에 'FOC' → 거래명세서 맨 아래 0원 줄
+            row[RSV_COL.code - 1] = /(^|[\s\/·,])(FOC|GWP)($|[\s\/·,(])/i.test(String(ln.memo || '')) ? 'FOC' : (prod.barcode || '');
             row[RSV_COL.name - 1] = prod.name || ln.name;
             row[RSV_COL.qty - 1] = ln.qty;
             row[RSV_COL.memo - 1] = ['PO ' + po.poNo, companyNote, ln.memo].filter(String).join(' / ');
