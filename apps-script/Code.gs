@@ -1918,6 +1918,14 @@ function rsvBuildInvoiceBlob_(inv, buyer, shipTo, poNo, fname) {
     }
     var lastLine = L.lastLine + extra, totalRow = L.totalRow + extra;
     sh.getRange(first, 1, lastLine - first + 1, 21).clearContent();
+    // 품목 줄 병합을 모든 줄에 다시 (양식 마지막 줄 다음에 행을 끼우면 병합이 풀리는 줄이 생김)
+    for (var mr = first; mr <= lastLine; mr++) {
+      L.merges.forEach(function (m) {
+        var g = sh.getRange(m[0] + mr + ':' + m[1] + mr);
+        try { g.breakApart(); g.merge(); } catch (x) { /* 무시 */ }
+      });
+    }
+    sh.getRange(first, 1, lastLine - first + 1, 1).setHorizontalAlignment('center');
     var supply = 0, tax = 0;
     inv.lines.forEach(function (l, i) {
       var r = first + i, nm = rsvInvoiceItemName(l.name);
@@ -2083,8 +2091,11 @@ function rsvInvoiceTargets(values) {
     if (m) {
       id = m[1];
       level = (key.match(/r+$/) || [''])[0].length;
+      // 비고(N)에 다른 PO 를 적어 두었고 그 PO 가 시트에 있으면 비고를 따른다 (사람이 고친 값 우선)
+      var memoPo = memo.match(/PO\s*(?:No\.?)?\s*[:：]?\s*([^\s\/,]+)/i);
+      if (memoPo && poSet[memoPo[1]] && memoPo[1] !== id) id = memoPo[1];
       // 수정 발주서 변경요청으로 '추가'된 행은 새 PO 번호 키를 갖지만, 같은 업체·용도의 원래 PO 가 하나면 그 명세서에 넣는다
-      if (/변경\s*추가/.test(memo)) {
+      else if (/변경\s*추가/.test(memo)) {
         var orig = Object.keys(byCP[cpKey(v)] || {}).filter(function (x) { return x !== id && !addOnly[x]; });
         if (orig.length === 1) id = orig[0];
       }
