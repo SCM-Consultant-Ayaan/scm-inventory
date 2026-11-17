@@ -2065,13 +2065,15 @@ function rsvStartInvoiceMail_(rowNums) {
  *  상품명 없는 행 → null, 발급 제외 업체 → {excluded: true}
  */
 function rsvInvoiceTargets(values) {
-  var poSet = {}, byCP = {};
+  var poSet = {}, byCP = {}, addOnly = {}, plain = {};
   var cpKey = function (v) { return String(v[RSV_COL.company - 1] || '').trim() + '|' + String(v[RSV_COL.purpose - 1] || '').trim(); };
   values.forEach(function (v) {
     var m = String(v[RSV_COL.mailKey - 1] || '').match(/^po:(.+?)\|/);
     if (!m) return;
     poSet[m[1]] = true;
     (byCP[cpKey(v)] = byCP[cpKey(v)] || {})[m[1]] = true;
+    if (/변경\s*추가/.test(String(v[RSV_COL.memo - 1] || ''))) { if (!plain[m[1]]) addOnly[m[1]] = true; }
+    else { plain[m[1]] = true; delete addOnly[m[1]]; }
   });
   return values.map(function (v) {
     if (!String(v[RSV_COL.name - 1] || '').trim()) return null;
@@ -2081,6 +2083,11 @@ function rsvInvoiceTargets(values) {
     if (m) {
       id = m[1];
       level = (key.match(/r+$/) || [''])[0].length;
+      // 수정 발주서 변경요청으로 '추가'된 행은 새 PO 번호 키를 갖지만, 같은 업체·용도의 원래 PO 가 하나면 그 명세서에 넣는다
+      if (/변경\s*추가/.test(memo)) {
+        var orig = Object.keys(byCP[cpKey(v)] || {}).filter(function (x) { return x !== id && !addOnly[x]; });
+        if (orig.length === 1) id = orig[0];
+      }
     } else {
       var hint = memo.match(/PO\s*(?:No\.?)?\s*[:：]?\s*([^\s\/,]+)/i);
       var same = Object.keys(byCP[cpKey(v)] || {});
@@ -2552,10 +2559,10 @@ function rsvSortPlan(rows, results, cfg, mode) {
       var d = dateKey(results[i] && results[i].shipDate);
       var purpose = r.purpose ? rsvNaturalKey_(r.purpose) : LAST;
       if (mode === 'company') {
-        key.push(first[who(r)], str(who(r)), d, purpose, st, str(r.name));
+        key.push(first[who(r)], str(who(r)), d, purpose, r.foc ? 1 : 0, st, str(r.name));
         group[i] = 'c:' + who(r);
       } else {
-        key.push(d, str(who(r)), purpose, st, str(r.name));
+        key.push(d, str(who(r)), purpose, r.foc ? 1 : 0, st, str(r.name));
         group[i] = 's:' + d + '|' + who(r);
       }
     }
@@ -2687,6 +2694,8 @@ function rsvRowFromValues_(v, rowNum) {
     company: String(v[RSV_COL.company - 1] || '').trim(),
     purpose: String(v[RSV_COL.purpose - 1] || '').trim(),
     priority: String(v[RSV_COL.priority - 1] || '').trim(),
+    // 정렬 때 같은 묶음 안에서 FOC·GWP 를 맨 아래로
+    foc: /^\s*(FOC|GWP)\s*$/i.test(String(v[RSV_COL.code - 1] || '')) || /\|foc/.test(String(v[RSV_COL.mailKey - 1] || '')),
   };
 }
 
