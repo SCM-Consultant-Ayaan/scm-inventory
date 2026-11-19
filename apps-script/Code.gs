@@ -759,11 +759,12 @@ function rsvRunAllocation_(opts) {
       return [r.order, r.verdict + (r.bundle ? ' · 📦 ' + r.bundle : '')];
     }));
     // U 자동 처리 이력 (값)
+    //  한 줄로 (최근 것이 앞, ' │ ' 로 구분) — 줄바꿈이 쌓이면 행 높이가 제각각이 됨
     sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.log, n, 1).setValues(values.map(function (v, i) {
       var log = String(v[RSV_COL.log - 1] || '');
       if (result[i].logAppend) log = (log ? log + '\n' : '') + result[i].logAppend;
-      return [log];
-    }));
+      return [rsvLogOneLine(log)];
+    })).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
     // D 출고 예정일: 출고 전 건만 갱신 (출고 완료 건은 마지막 값을 기록으로 남김)
     sh.getRange(RSV_CONFIG.FIRST_ROW, RSV_COL.shipDate, n, 1).setValues(values.map(function (v, i) {
       var r = result[i];
@@ -2708,6 +2709,16 @@ function rsvRowFromValues_(v, rowNum) {
     // 정렬 때 같은 묶음 안에서 FOC·GWP 를 맨 아래로
     foc: /^\s*(FOC|GWP)\s*$/i.test(String(v[RSV_COL.code - 1] || '')) || /\|foc/.test(String(v[RSV_COL.mailKey - 1] || '')),
   };
+}
+
+/**
+ * 자동 처리 이력을 한 줄로 (순수 함수). 줄바꿈으로 덧붙인 기록(예전 것이 위)은 최근 것이 앞으로 오게 ' │ ' 로 잇는다.
+ *  'A\nB\nC' → 'C │ B │ A',  'B │ A\nC' → 'C │ B │ A'
+ */
+function rsvLogOneLine(s) {
+  s = String(s || '');
+  if (s.indexOf('\n') < 0) return s;
+  return s.split('\n').map(function (x) { return x.trim(); }).filter(String).reverse().join(' │ ');
 }
 
 /** [재고관리] → { 상품명: {barcode, stock, inbound:[{date, qty}]} } */
